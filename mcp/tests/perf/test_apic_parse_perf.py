@@ -16,6 +16,7 @@ Thresholds:
 """
 
 import asyncio
+import gc
 import time
 
 import httpx
@@ -65,6 +66,33 @@ def _client_with_static_response(body: dict) -> ApicClient:
     return client
 
 
+async def _best_of(call, repeats: int = 5) -> tuple[object, float]:
+    """Run ``call`` ``repeats`` times; return the last result and the fastest time.
+
+    These budgets measure the parser, not the machine. A single wall-clock sample
+    taken after 1,800 other tests also measures whatever the interpreter does
+    at that moment, and on a shared CI runner a cyclic-GC pass over a large heap
+    is enough to move one sample from 0.3 ms to 180 ms (seen on the release
+    runner). The collector is paused for the timed section and the best of
+    several samples is kept, which is the standard way to time a deterministic
+    piece of code.
+    """
+    best = float("inf")
+    result = None
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            result = await call()
+            best = min(best, time.perf_counter() - t0)
+    finally:
+        if was_enabled:
+            gc.enable()
+    return result, best
+
+
 # ── Flat object parsing ───────────────────────────────────────────────────────
 
 
@@ -73,9 +101,7 @@ async def test_parse_1000_flat_objects_under_50ms(large_imdata):
     body = apic_response(large_imdata)
     client = _client_with_static_response(body)
 
-    t0 = time.perf_counter()
-    result = await client.query_class("fvBD", {})
-    elapsed = time.perf_counter() - t0
+    result, elapsed = await _best_of(lambda: client.query_class("fvBD", {}))
 
     assert len(result.objects) == 1_000
     assert all(r["_class"] == "fvBD" for r in result.objects)
@@ -109,9 +135,9 @@ async def test_parse_200_objects_with_5_children_each():
     body = apic_response(objects)
     client = _client_with_static_response(body)
 
-    t0 = time.perf_counter()
-    result = await client.query_class("fvBD", {}, include_children=["fvSubnet"])
-    elapsed = time.perf_counter() - t0
+    result, elapsed = await _best_of(
+        lambda: client.query_class("fvBD", {}, include_children=["fvSubnet"])
+    )
 
     assert len(result.objects) == 200
     assert all(len(r["_children"]) == 5 for r in result.objects)
