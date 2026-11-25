@@ -13,13 +13,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   asked for.** A class carries ~40 attributes per object and `fetch_all` can
   hold 5,000 objects; an agent that needed a name and a state still received
   everything, and the answer is what fills its context. `fields=["name",
-  "arpFlood"]` reduces each result — and each `_children` entry — to those, plus
-  `dn`, `_class` and `_children`, which are always kept: an object that cannot be
-  addressed or identified is no use to the next call. Names are validated
-  against the queried class or any `include_children` class, because a
-  misspelled field would return objects that merely lack the key, which reads as
-  "the attribute is empty". `fields=[]` keeps only the three fixed keys and the
-  `note` says so; it is not the same request as omitting `fields`.
+  "arpFlood"]` reduces each result — and each `_children` entry of a class named
+  in `include_children` — to those, plus `dn`, `_class` and `_children`, which
+  are always kept: an object that cannot be addressed or identified is no use to
+  the next call. Names are validated against the queried class or any
+  `include_children` class, because a misspelled field would return objects that
+  merely lack the key, which reads as "the attribute is empty". `fields=[]`
+  keeps only the three fixed keys and the `note` says so; it is not the same
+  request as omitting `fields`.
+
+  Children that arrive another way — `rsp_subtree_include="faults"` brings
+  `faultInst` children — are returned whole: `fields` was never checked against
+  them, and reducing them anyway turned each fault into its `dn` and `_class`
+  with no note, deleting the severity the caller had asked the APIC for. A name
+  that exists only on such a child is therefore refused, since there is nothing
+  for it to select. An `include_children` item may be comma-joined
+  (`["fvSubnet,fvRsCtx"]`, two classes on the wire); every check reads it that
+  way.
 
   Projection happens after the APIC answers, so it saves the response, not the
   APIC's work, and changes neither `total_available`, `truncated` nor paging.
@@ -51,7 +61,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   `complete` is `false`, `groups` and `ungrouped` are `null`, `count` stays the
   true total, and `note` says how to narrow. A partial list of groups reads as a
   finding ("only two tenants have faults") when it is only where the fetch
-  stopped.
+  stopped. The note names both ways a fetch stops short — the cap, or the APIC
+  ending its pages early — as `query`'s does. A set the plain count already
+  shows to be larger than one `fetch_all` can hold is withheld without fetching
+  it, rather than after walking 5,000 objects to reach the same answer, and a
+  set of zero is answered (`groups: {}`) without a fetch.
 
 - **The fabric's APIC release is compared with the catalogue's at startup.**
   The log named only the release the catalogue was built from, which says
@@ -197,6 +211,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   real properties, so this validation passes them, and the premise a dedicated
   guard would rest on was not measured for this change.
 
+- **`get_by_dn` now refuses an unknown class in `include_children` — a
+  behaviour change.** It used to send the request and return the object with no
+  `_children` and no warning, which reads as "this object has none": the APIC
+  embeds nothing for a class it does not know. The classes are checked, as
+  `query` checks them, before the request is built — `UnknownClassError`,
+  nothing sent — and with `NIWASHI_MCP_STRICT_ATTRIBUTES=false` the request goes
+  out and the object carries a `_note` saying which class was not recognised
+  (added to, never replacing, the note a `fields` warning writes). A
+  comma-joined item is read as the classes it is.
+
+- **`verify_catalogue()` refuses startup on two more kinds of damage.** It now
+  also fails when the catalogue's `inherits` table is missing or its columns
+  have moved, and when the abstract-class probe — `fvABD`, whose union with its
+  concrete subclasses must be wider than its own properties — comes back no
+  wider. Both are quiet failures: every query still runs, but an abstract
+  class's accepted attributes collapse to its own and valid names start being
+  refused as unknown.
+
 - **Every `query` envelope has a new key, `fields`, and `query` and `count`
   advertise a typed `outputSchema`.** `fields` echoes the projection and is
   `null` when none was asked for, so it is present on every result — the one
@@ -292,6 +324,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   with a logged warning, and the `note` covers both ways a walk can stop short,
   the cap and the APIC's pages ending first. With no `totalCount` at all a short
   page is still trusted as the end, as before.
+
+  **An object that arrives twice is kept once and counted once.** The set is not
+  frozen while it is walked: an object created or deleted early in it shifts
+  every later page by one, so the object on a page boundary can arrive twice and
+  another be skipped. Counting the repeat toward `totalCount` made the walk reach
+  the count one object short and report `complete: true` with a duplicate in the
+  answer (and `count(group_by=...)`, which tallies the same objects, would have
+  counted it twice). The walk now keeps the first copy of each `dn` — objects
+  with no `dn` are all kept — compares the distinct count with `totalCount`, and
+  logs how many it dropped. A short page is still judged on what the APIC sent,
+  not on what was kept.
 
 ### Security
 

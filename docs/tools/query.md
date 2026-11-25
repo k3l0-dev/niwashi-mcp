@@ -72,7 +72,7 @@ query(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `config_only` | `bool` | `False` | When `True`, return only user-configurable attributes (APIC `rsp-prop-include=config-only`) instead of the full ~40-attribute set. Ideal for comparison, drift detection, and backup — drops runtime state, timestamps, and monitoring counters. |
-| `fields` | `list[str]` | — | Attribute names to keep, e.g. `["name", "arpFlood"]`. Each result **and each `_children` entry** is reduced to these plus `dn`, `_class` and `_children`, which are always kept. See [Field projection](#field-projection). |
+| `fields` | `list[str]` | — | Attribute names to keep, e.g. `["name", "arpFlood"]`. Each result **and each `_children` entry of an `include_children` class** is reduced to these plus `dn`, `_class` and `_children`, which are always kept; children that arrive through `rsp_subtree_include` are returned whole. See [Field projection](#field-projection). |
 
 ### Time-based queries
 
@@ -119,7 +119,7 @@ An **envelope dict** — not a bare list:
 | `results` | `list[dict]` | The objects themselves — each dict has all APIC attributes, a `"_class"` key, an always-present `"dn"`, and `"_children"` when `include_children` is set. Same per-object shape as before; the change is the wrapper around it. |
 | `returned` | `int` | `len(results)` |
 | `total_available` | `int` | True match count, fabric- or subtree-wide — independent of how many were actually fetched |
-| `truncated` | `bool` | `total_available > returned` — a default-page result is a **partial page**, not the whole matching set. Never conclude a max/min/total/complete-list answer from a truncated result. |
+| `truncated` | `bool` | `True` when matches remain past this page — the objects on earlier pages plus `returned` fall short of `total_available`. A default-page result is then a **partial page**, not the whole matching set: never conclude a max/min/total/complete-list answer from it. **Always `False` with `fetch_all`**, including a walk that stopped at the cap or when the APIC ended its pages — read `complete` there. |
 | `next_page` | `int \| None` | `page + 1` when truncated and `fetch_all` was not used; `None` otherwise |
 | `complete` | `bool` | `False` only if `fetch_all=True` stopped short of `total_available` — at the 5,000-object cap, or because the APIC ended its pages before the `totalCount` it reported. A set of exactly 5,000 objects is complete. |
 | `note` | `str \| None` | Guidance text — set when truncated or capped, and when [relaxed attribute checking](#relaxing-the-check) sent a name the catalogue did not know (in `filters`, `order_by`, `include_children`, `filter_expr` or `fields`). When several apply they are joined into one string, the truncation or cap note first, never replacing it. |
@@ -194,8 +194,9 @@ bds = await query("fvBD", scope_dn="uni/tn-OT", fields=["name", "arpFlood"])
 ```
 
 - **Always kept:** `dn`, `_class` and `_children`. Naming them in `fields` is accepted and changes nothing.
-- **Children are projected too.** With `include_children`, each `_children` entry is reduced by the same list, so one flat list serves both levels. This includes children that arrive through `rsp_subtree_include`.
-- **Validation.** Every name must be a property of `class_name` *or* of at least one `include_children` class — a name valid only on the child is accepted, because the list is applied to both. Anything else raises `UnknownAttributeError` with the closest matches, before the request is sent; without that check a misspelled field would return objects that merely lack the key, which reads as "the attribute is empty".
+- **Children of the `include_children` classes are projected too.** Each `_children` entry whose class you listed in `include_children` is reduced by the same list, so one flat list serves both levels. An item may be comma-joined (`["fvSubnet,fvRsCtx"]`); it counts as the classes it names.
+- **Other children are returned whole.** A child that arrived through `rsp_subtree_include` (`faultInst` with `"faults"`, `healthInst` with `"health"`) was never checked against `fields`, so it is not reduced: `query("fvBD", rsp_subtree_include="faults", fields=["name"])` returns each bridge domain as `name`, `dn`, `_class` and `_children`, with every fault in `_children` complete, severity and code included.
+- **Validation.** Every name must be a property of `class_name` *or* of at least one `include_children` class — a name valid only on the child is accepted, because the list is applied to both. Anything else raises `UnknownAttributeError` with the closest matches, before the request is sent; without that check a misspelled field would return objects that merely lack the key, which reads as "the attribute is empty". That includes a name that exists only on an `rsp_subtree_include` child (`severity` on a bridge domain): those children arrive whole, so there is nothing for it to select — leave it out of `fields`.
 - **Empty list.** `fields=[]` keeps only `dn`, `_class` and `_children`, and the `note` says so. Omit `fields` to receive every attribute — the two are not the same request.
 - **Unchanged:** which objects match, `returned`, `total_available`, `truncated` and paging. Projection runs after the APIC answers, so it saves response size on the way to the agent, not work on the APIC. Key order is the APIC's.
 - **Relaxed checking.** With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` an unknown name is kept in the projection, a warning is logged, and the `note` lists it — an attribute missing from the results is then absent from the objects, not empty.

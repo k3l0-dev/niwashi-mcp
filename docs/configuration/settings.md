@@ -154,7 +154,7 @@ WARNING  niwashi-mcp  MCP_API_KEYS is not set — server is running WITHOUT auth
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `NIWASHI_MCP_STRICT_ATTRIBUTES` | No | `true` | Whether `query` and `count` refuse an attribute (or `include_children` / `filter_expr` class) that the catalogue does not know. `false`, `0`, `no` or `off` (any case, surrounding whitespace ignored) turns refusal into a warning; **any other value, including a typo, keeps it strict** — a mistyped switch must not silently disable the check. |
+| `NIWASHI_MCP_STRICT_ATTRIBUTES` | No | `true` | Whether the tools refuse a name the catalogue does not know: an attribute or class in `query`'s `filters`, `order_by`, `include_children` or `filter_expr`, and in `count`'s `filters` and `filter_expr`; a name in `fields` (`query` and `get_by_dn`); a class in `get_by_dn`'s `include_children`; and `count`'s `group_by`. `false`, `0`, `no` or `off` (any case, surrounding whitespace ignored) turns refusal into a warning; **any other value, including a typo, keeps it strict** — a mistyped switch must not silently disable the check. |
 
 The APIC answers a filter on an unknown attribute with HTTP 200 and no results, which reads as "there are none". By default the server therefore checks every attribute name in `filters`, `order_by` and `filter_expr`, and every class in `include_children`, against the catalogue before sending, and raises `UnknownAttributeError` (or `UnknownClassError`) with the closest real names. See [`query` — Attribute validation](../tools/query.md#attribute-validation) for exactly what is checked.
 
@@ -164,7 +164,7 @@ The catalogue describes **one APIC release**. A fabric on a newer one can legiti
 NIWASHI_MCP_STRICT_ATTRIBUTES=false
 ```
 
-Relaxed mode does not go quiet. The request is sent, and each unknown name is reported in the result — `note` for `query`, a `warnings` list for `count` — and logged as a warning. An empty result in that mode may mean the name is wrong, not that nothing matches.
+Relaxed mode does not go quiet. The request is sent, and each unknown name is reported in the result — `note` for `query`, a `warnings` list for `count`, a `_note` key on the object `get_by_dn` returns — and logged as a warning. An empty result in that mode may mean the name is wrong, not that nothing matches.
 
 - Read on **every call**, not at startup: a change takes effect on the next request, without a restart. Because a `SIGHUP` reload re-reads `.env` into the process environment, editing the variable there and sending `kill -HUP` applies it too.
 - The class named by `class_name` is outside this switch — an unknown one always raises `UnknownClassError`.

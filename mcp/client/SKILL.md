@@ -87,7 +87,7 @@ under `results`, alongside the true size of the matching set:
 | `results` | The objects, same per-item shape as before (`_class`, `dn`, attributes, optional `_children`) |
 | `returned` | `len(results)` — how many objects came back in this call |
 | `total_available` | The APIC-reported true match count — fabric-wide or subtree-wide, regardless of how many were fetched |
-| `truncated` | `total_available > returned` — this call did NOT return everything that matches. Always `false` after `fetch_all=True`, even when that stopped short: read `complete` there |
+| `truncated` | `true` when matches remain past this page (earlier pages plus `returned` fall short of `total_available`) — this call did NOT return everything that matches. Always `false` after `fetch_all=True`, even when that stopped short: read `complete` there |
 | `next_page` | `page + 1` when `truncated` and `fetch_all` was not used; `null` otherwise |
 | `complete` | `false` only when `fetch_all=True` stopped short of `total_available` — it holds at most 5,000 objects per call, and it also stops early if the APIC ends its pages before the count it reported. Either way the result is partial |
 | `note` | Guidance string when `truncated`, when `complete` is `false`, when a name was sent unchecked (section 5, Attribute validation) or when `fields=[]` was passed; `null` otherwise |
@@ -518,9 +518,16 @@ get_by_dn("uni/tn-OT/BD-servers", fields=["name", "arpFlood"])   # same, one obj
 
 - **`dn`, `_class` and `_children` are always kept**, so you can still address
   an object and tell what it is. Naming them in `fields` is accepted.
-- **Children are reduced by the same list.** With `include_children`, one flat
-  `fields` list serves the parents and their `_children`; a name is accepted if
-  it is a property of the queried class *or* of any `include_children` class.
+- **`include_children` children are reduced by the same list.** One flat
+  `fields` list serves the parents and the `_children` of the classes you listed
+  in `include_children`; a name is accepted if it is a property of the queried
+  class *or* of any `include_children` class.
+- **Other children come back whole.** Children that arrived through
+  `rsp_subtree_include` (`faultInst` for `"faults"`, `healthInst` for `"health"`)
+  are not reduced, and their attributes are not checked: `fields=["name"]` on
+  `query("fvBD", rsp_subtree_include="faults", ...)` leaves each fault complete,
+  severity and code included. A name that exists only on such a child (`severity`
+  on a bridge domain) is refused — it would select nothing — so leave it out.
 - **Names are checked against the catalogue.** A misspelled field would
   otherwise return objects that merely lack the key, which reads as "the
   attribute is empty". An unknown name raises `UnknownAttributeError` (below) —
@@ -539,29 +546,30 @@ get_by_dn("uni/tn-OT/BD-servers", fields=["name", "arpFlood"])   # same, one obj
 The APIC answers a filter on an attribute that does not exist, or an
 `include_children` entry for a class that does not exist, with HTTP 200 and an
 empty result — the same shape as "there are none". So before sending anything,
-`query` and `count` check the names you supplied against the catalogue:
+the tools check the names you supplied against the catalogue:
 
-| Where | What is checked |
-|---|---|
-| `filters` | every key, against the queried class |
-| `order_by` | the attribute of each term, against the class named in the term |
-| `include_children` | every class name |
-| `filter_expr` | each `Class.attr` operand (quoted values are never inspected) |
-| `fields` | every name (`query`, and `get_by_dn`, see above) |
-| `group_by` | the attribute (`count`, see section 7) |
+| Where | What is checked | Tools |
+|---|---|---|
+| `filters` | every key, against the queried class | `query`, `count` |
+| `order_by` | the attribute of each term, against the class named in the term | `query` |
+| `include_children` | every class name; an item may be comma-joined (`"fvSubnet,fvRsCtx"`), and counts as the classes it names | `query`, `get_by_dn` (before the fetch) |
+| `filter_expr` | each `Class.attr` operand (quoted values are never inspected) | `query`, `count` |
+| `fields` | every name (see above) | `query` (before the request), `get_by_dn` (after the fetch) |
+| `group_by` | the attribute (see section 7) | `count` |
 
 An unknown attribute raises **`UnknownAttributeError`**, an unknown class
 `UnknownClassError`, and **nothing is sent to the APIC**. The error names the
 closest real properties and tells you to call `get_schema` for the full list:
 
 ```text
-Unknown attribute 'arpFlod' on ACI class 'fvBD'. Closest matches: arpFlood Call get_schema('fvBD') to list its attributes. The catalogue describes APIC 6.0(9c); a fabric on another release may legitimately have this attribute.
+Unknown attribute 'arpFlod' on ACI class 'fvBD'. Closest matches: arpFlood. Call get_schema('fvBD') to list its attributes. The catalogue describes APIC 6.0(9c); a fabric on another release may legitimately have this attribute.
 ```
 
 Take one of the suggestions, or read `get_schema(class_name).properties`, fix the
 call and retry. Like every tool error it is a failure to answer, not an answer
 of zero (see section 7). The class named by `class_name` is always checked and
-always raises; only attribute names have the relaxed mode below.
+always raises; every other name — attributes, and the classes in
+`include_children`, `filter_expr` and `order_by` — has the relaxed mode below.
 
 Names are checked, **values are not**: `filters={"arpFlood": "yess"}` is a valid
 name with a value no object carries, so the result is `[]` (section 10). Read
@@ -573,7 +581,7 @@ class it lacks. The operator can then set `NIWASHI_MCP_STRICT_ATTRIBUTES=false`.
 You cannot change this from a tool call. In that mode nothing is refused: the
 request is sent, and the doubt is stated in the result — in `note` for `query`,
 in a `warnings` list for `count`, in a `_note` key on the object for `get_by_dn`
-with `fields`:
+(an unknown `include_children` class, or `fields`):
 
 ```text
 filters: Unknown attribute 'newAttr' on ACI class 'fvBD'. ... Sent anyway because strict attribute checking is off — an empty result may mean this name is wrong, not that nothing matches.
@@ -609,7 +617,9 @@ get_by_dn("uni/tn-OT/BD-servers", fields=["name", "arpFlood"])
 
 Return shape is a single object dict (same shape as one item of `query`'s
 `results` list), **not** an envelope and **not** a list. `fields` behaves as in
-section 5 (Keep answers small). If the DN does not
+section 5 (Keep answers small). Every class in `include_children` is checked
+before the request: a misspelt one raises `UnknownClassError` instead of
+returning the object with no `_children`. If the DN does not
 exist, you get an explicit not-found instead of a silent empty result:
 
 ```json
@@ -1062,7 +1072,7 @@ a sample object without filters to observe the actual values in context.
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `query`/`count` raises "Unknown ACI class '...'" | Wrong or nonexistent class name | The class does not exist — this is a failed lookup, not a zero result. Retry with one of the suggested closest matches or a fresh `search_classes` call; never report a count or existence answer from this error. |
+| `query`/`count` raises "Unknown ACI class '...'" (`get_by_dn` too, for a class in `include_children`) | Wrong or nonexistent class name | The class does not exist — this is a failed lookup, not a zero result. Retry with one of the suggested closest matches or a fresh `search_classes` call; never report a count or existence answer from this error. |
 | `query`/`count`/`get_by_dn` raises "Unknown attribute '...' on ACI class '...'" (`UnknownAttributeError`) | The name is not a property of that class in the catalogue — a typo, wrong case, a property of another class, or (rarely) an attribute the catalogue's release lacks | Nothing was sent, so this is a failed lookup, not a zero result. Take one of the "Closest matches", or read `get_schema(class)` `properties`, correct the call and retry. Never report "none found" from this error |
 | `query` `note`, `count` `warnings` or a `get_by_dn` `_note` says "Sent anyway because strict attribute checking is off" | The operator relaxed attribute checking for a fabric on another release; the request went out with a name the catalogue does not know | An empty result (`[]`, or a count of `0`) next to it is not a zero — the name may be wrong. Verify it with `get_schema` or drop that filter before saying nothing matches |
 | `query` returns `results: []`, class is valid | Object absent from backend OR wrong filter *value* (names are validated, values are not) — this applies even to an abstract class (`isAbstract: true`): querying one returns the union of its concrete subclasses' instances, not an automatic `[]` | Remove filters first to confirm objects exist, then re-add filters |
@@ -1071,7 +1081,7 @@ a sample object without filters to observe the actual values in context.
 | `count(..., group_by=...)` returns `complete: false` with `groups: null` | The objects could not be fetched whole to tally (5,000-object cap, APIC ended pages early, or the set changed while read) | There is no breakdown: do not report a partial or an inferred one. `count` is still the true total. Narrow (one tenant at a time, one value at a time) and group each narrower set, or retry |
 | `search_classes` returns no results | Keyword too specific | Try acronym, English label, or first 3 chars of the expected class name |
 | `get_schema` returns `{}` | No such class in the catalogue — lookup is exact and case-sensitive (`fvBd` is not `fvBD`) | Query without filters, inspect `properties` of a sample result |
-| `_children` is empty despite `include_children` | Children don't exist under that parent, or wrong child class name | Query child class directly with scope_dn to verify |
+| `_children` is empty despite `include_children` | The class name is valid (a misspelt one is refused with `UnknownClassError`, or flagged in `note`/`_note` when the operator relaxed checking), so there are no such children directly under that parent — `include_children` embeds one level only | Query the child class directly with `scope_dn` to verify, and check `get_schema` `containedBy` for where it really lives |
 | `get_by_dn` returns `{"found": false, ...}` | DN is stale, mistyped, or the object was deleted | Re-derive the DN from a fresh `query` result — never reconstruct it from memory |
 | `count` disagrees with a follow-up `query` | Read taken mid-materialisation after a config push | Wait for stabilisation and re-read (eventual consistency, section 7) |
 | An Rs relation is `missing-target` / `invalid-target` / `cardinality-violation` | The reference is configured but the APIC tried and failed to resolve it | Report the relation as unresolved. Do **not** resolve the name or DN and present the result as the object's target: a `missing-target` DN can still answer `get_by_dn` (section 8) |
