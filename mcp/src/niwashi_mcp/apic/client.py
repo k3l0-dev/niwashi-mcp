@@ -38,11 +38,31 @@ from niwashi_mcp.registry.filter import build_filter
 
 logger = logging.getLogger("niwashi-mcp.apic")
 
-# fetch_all safety caps — a fabric-wide class scan with no scope_dn can be
-# unbounded (a bad filter, or a class with tens of thousands of instances),
-# so a page-loop needs its own hard stop independent of the caller's limit.
-_MAX_PAGES = 25
+# fetch_all — how much one call may pull, and in what size of pages.
+#
+# A fabric-wide class scan with no scope_dn can be unbounded (a bad filter, or a
+# class with tens of thousands of instances), so the page loop needs a hard stop
+# of its own: _MAX_OBJECTS is the most objects one fetch_all ever holds.
+#
+# The page size is fixed here and is NOT the caller's `limit`. It used to be:
+# the loop paged by `limit` and stopped after 25 pages, so the default
+# limit=20 capped a "fetch everything" call at 25 x 20 = 500 objects — a tenth
+# of the advertised 5,000 — and reported complete=False on a result set of 600
+# that the cap was never meant to touch. 200 is the largest page the `query`
+# tool already sends (its `limit` clamp is [1, 200]), so it is a page-size this
+# server issues to the APIC anyway rather than a new one, and a full-size walk
+# is 25 requests instead of 250.
+#
+# _MAX_OBJECTS must be a multiple of the page size: the cap then lands on a page
+# boundary, the loop never holds an object past it, and nothing is fetched only
+# to be thrown away. tests/unit/test_client.py pins that relationship.
+_FETCH_ALL_PAGE_SIZE = 200
 _MAX_OBJECTS = 5000
+
+# The hard bound on the loop, derived so the two numbers above cannot drift
+# apart: a walk that never meets a short page or the reported total still ends
+# after this many requests. (25 at the current values.)
+_MAX_PAGES = _MAX_OBJECTS // _FETCH_ALL_PAGE_SIZE
 
 # HTTP statuses treated as transient and worth a bounded retry, rather than an
 # immediate permanent failure. 404 is included deliberately: nowhere in this
@@ -150,9 +170,14 @@ class QueryResult:
                           true number of matching objects fabric-wide (or
                           subtree-wide with scope_dn), independent of how many
                           were actually fetched into `objects`.
-        complete:         True unless fetch_all=True and the page loop stopped
-                          early after hitting _MAX_PAGES/_MAX_OBJECTS before
-                          exhausting all matching objects.
+        complete:         True when `objects` holds every object the query
+                          matches. Without fetch_all that is always True — it
+                          describes the loop, not the result set, and
+                          `total_available` is what says how much exists.
+                          With fetch_all=True it is False when the walk stopped
+                          before reaching the APIC's totalCount: at
+                          _MAX_OBJECTS, or because the APIC ran out of pages
+                          early. Never True on the strength of a guess.
     """
 
     objects: list[dict[str, Any]] = field(default_factory=list)
@@ -330,6 +355,19 @@ class ApicClient:
         return objects
 
     @staticmethod
+    def _reported_total(body: dict[str, Any]) -> int | None:
+        """The APIC's totalCount as an int, or None when it did not say.
+
+        None is a real answer, distinct from 0: the fetch_all loop must know
+        whether the size of the set was reported or merely guessed, because a
+        guess equal to "what I have so far" would end the walk after one page.
+        """
+        try:
+            return int(body["totalCount"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _parse_total_available(body: dict[str, Any], fallback: int) -> int:
         """Coerce the APIC-reported totalCount, defensively.
 
@@ -339,10 +377,8 @@ class ApicClient:
         number of objects in imdata), so both report the size of a result set
         from the same field and can never disagree about it.
         """
-        try:
-            return int(body.get("totalCount", fallback))
-        except (TypeError, ValueError):
-            return fallback
+        reported = ApicClient._reported_total(body)
+        return fallback if reported is None else reported
 
     async def query_class(
         self,
@@ -378,8 +414,9 @@ class ApicClient:
             filters:             Attribute equality filters {attr: value}.
             scope_dn:            Optional parent DN to scope the query.
             limit:               Maximum objects to return per page (APIC
-                                 page-size). Also the page size used internally
-                                 when fetch_all=True.
+                                 page-size). Has no effect when fetch_all=True,
+                                 which pages at _FETCH_ALL_PAGE_SIZE whatever
+                                 this is.
             order_by:            Optional ordering expression.
             include_children:    Child class names to embed via rsp-subtree=children.
             filter_expr:         Raw APIC filter string for complex predicates,
@@ -397,14 +434,28 @@ class ApicClient:
                                  APIC returns only user-configurable attributes and
                                  drops operational/internal noise (~40 attrs → the
                                  handful that define the object's intended config).
-            fetch_all:           When True, loop pages (0, 1, 2, ...) using `limit`
-                                 as the page size, accumulating every matching
-                                 object into one QueryResult instead of returning
-                                 just the first page. Stops at the first short
-                                 page (fewer objects than `limit` — the natural
-                                 end) or at the _MAX_PAGES/_MAX_OBJECTS safety
-                                 cap, whichever comes first; the latter sets
-                                 `complete=False` on the returned QueryResult.
+            fetch_all:           When True, loop pages (0, 1, 2, ...) at a fixed
+                                 page size of _FETCH_ALL_PAGE_SIZE (200) —
+                                 independent of `limit` — accumulating every
+                                 matching object into one QueryResult instead of
+                                 returning just the first page. Stops, in order
+                                 of precedence, when:
+                                   1. the objects in hand reach the APIC's
+                                      totalCount → complete=True (this includes
+                                      a set that is an exact multiple of the
+                                      page size, with no extra empty request);
+                                   2. a page comes back short or empty — the
+                                      natural end → complete=True when no
+                                      totalCount was reported, but complete=
+                                      False when one was and has not been
+                                      reached (the APIC ran dry early; the
+                                      loop never spins on empty pages);
+                                   3. _MAX_PAGES pages (= _MAX_OBJECTS objects)
+                                      have been fetched → complete=False.
+                                 At most _MAX_OBJECTS objects are ever fetched
+                                 or returned; none past the cap are trimmed
+                                 after the fact, because the cap lands on a
+                                 page boundary. `page` is ignored.
 
         Returns:
             A QueryResult carrying:
@@ -413,8 +464,12 @@ class ApicClient:
               total_available: The APIC-reported totalCount — the true number
                                of matching objects, regardless of how many
                                were actually fetched.
-              complete:        False only when fetch_all=True hit the safety
-                               cap before exhausting all matching objects.
+              complete:        False only when fetch_all=True stopped before
+                               holding every object the APIC reported — at
+                               the _MAX_OBJECTS cap, or on an early empty
+                               page. True otherwise (including every call
+                               without fetch_all, where it says nothing about
+                               the result set).
 
         Raises:
             ApicAuthError:     Both the initial request and the re-auth retry
@@ -432,8 +487,12 @@ class ApicClient:
             ApicResponseError: The response body is not valid JSON, or is
                                missing the expected 'imdata' key.
         """
+        # A fetch_all walk pages at its own fixed size, whatever `limit` the
+        # caller passed — see _FETCH_ALL_PAGE_SIZE for why.
         url, base_params = self._build_query_params(
-            class_name, filters, scope_dn, limit, order_by, include_children,
+            class_name, filters, scope_dn,
+            _FETCH_ALL_PAGE_SIZE if fetch_all else limit,
+            order_by, include_children,
             filter_expr, rsp_subtree_include, time_range, config_only,
         )
 
@@ -449,8 +508,8 @@ class ApicClient:
             return QueryResult(objects=objects, total_available=total_available)
 
         objects: list[dict[str, Any]] = []
-        total_available = 0
-        complete = True
+        reported_total: int | None = None
+        complete = False
         for page_num in range(_MAX_PAGES):
             params = dict(base_params)
             params["page"] = str(page_num)
@@ -458,15 +517,49 @@ class ApicClient:
             body = await self._request_json(url, params)
             page_objects = self._parse_query_objects(body, include_children)
             objects.extend(page_objects)
-            total_available = self._parse_total_available(body, len(objects))
 
-            if len(page_objects) < limit:
+            # totalCount is re-read on every page and the latest value wins: a
+            # set that grows or shrinks while it is being walked is then
+            # reported as the APIC last saw it. A page that omits it keeps the
+            # previous figure rather than forgetting it.
+            page_total = self._reported_total(body)
+            if page_total is not None:
+                reported_total = page_total
+
+            # 1. Everything the APIC says matches is in hand. Checked before
+            #    the short-page test so a set that is an exact multiple of the
+            #    page size ends here, without a further, empty request — and so
+            #    is not mistaken for a capped one.
+            if reported_total is not None and len(objects) >= reported_total:
+                complete = True
                 break
-            if len(objects) >= _MAX_OBJECTS:
-                complete = False
+
+            # 2. A short page is the natural end of the set. With no
+            #    totalCount to check it against, that is all the evidence there
+            #    is, and it is what this loop has always trusted. With one that
+            #    has not been reached the APIC has stopped answering before it
+            #    has finished, so the result is NOT complete — and we stop
+            #    rather than ask for page after empty page.
+            if len(page_objects) < _FETCH_ALL_PAGE_SIZE:
+                complete = reported_total is None
+                if not complete:
+                    logger.warning(
+                        "query_class(%s, fetch_all=True): page %d returned %d "
+                        "objects but totalCount is %s and only %d are in hand "
+                        "— stopping early, result is incomplete",
+                        class_name, page_num, len(page_objects),
+                        reported_total, len(objects),
+                    )
                 break
-        else:
-            complete = False
+            # 3. Otherwise the page was full: ask for the next, until
+            #    _MAX_PAGES. Falling out of the loop is the cap — `complete`
+            #    stays False, and `total_available` says how much was left.
+
+        # Without a totalCount from the APIC the best statement of the set's
+        # size is what was fetched, the same fallback every other path uses.
+        total_available = (
+            reported_total if reported_total is not None else len(objects)
+        )
 
         logger.debug(
             "query_class(%s, fetch_all=True) → %d/%d objects, complete=%s",
@@ -758,6 +851,61 @@ class ApicClient:
         count = self._parse_total_available(body, len(body.get("imdata", [])))
         logger.debug("count_class(%s) → %d", class_name, count)
         return count
+
+    async def controller_version(self) -> str | None:
+        """The firmware version the APIC controller is running, as it reports it.
+
+        One GET of `firmwareCtrlrRunning` filtered to `type == "controller"`
+        (the class also carries switch and plugin firmware), reading
+        `version` off the first object returned. The class and both attributes
+        are in the shipped catalogue; tests/unit/test_fabric_version.py checks
+        that they stay there. A cluster answers with one object per controller,
+        and only the first is read: a rolling upgrade can leave controllers on
+        different releases, and this reports the one that answered first, not
+        a consensus.
+
+        The string is returned exactly as the APIC wrote it, e.g. "apic-6.0(9c)"
+        or "6.0(9c)" — interpreting it is niwashi_mcp.apic.version's job, so that
+        a format this client has never seen is still reported rather than
+        discarded here.
+
+        Goes through the same GET path as every other read, so it re-authenticates
+        on 401/403 and retries transient failures like any query.
+
+        Returns:
+            The version string, or None when the APIC returned no controller
+            firmware object — "nothing reported", which is not an error.
+
+        Raises:
+            ApicConnectionError / ApicAuthError / ApicRequestError on transport
+            or protocol failures (see _request_json).
+            ApicResponseError: an object came back but carries no usable
+            `version` attribute — malformed, as opposed to absent.
+        """
+        url = f"{self._base}/api/class/firmwareCtrlrRunning.json"
+        params = {
+            "query-target-filter": build_filter(
+                "firmwareCtrlrRunning", {"type": "controller"}
+            )
+        }
+        body = await self._request_json(url, params)
+        imdata = body["imdata"]
+        if not imdata:
+            logger.debug("controller_version() → no firmwareCtrlrRunning object")
+            return None
+
+        try:
+            version = imdata[0]["firmwareCtrlrRunning"]["attributes"]["version"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ApicResponseError(
+                url, f"firmwareCtrlrRunning object has no usable version: {exc!r}"
+            ) from exc
+        if not isinstance(version, str) or not version.strip():
+            raise ApicResponseError(
+                url, f"firmwareCtrlrRunning version is not a non-empty string: {version!r}"
+            )
+        logger.debug("controller_version() → %s", version)
+        return version.strip()
 
     async def close(self) -> None:
         """Release the underlying HTTP connection pool."""

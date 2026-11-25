@@ -30,10 +30,10 @@ thing the real APIC would receive.
 
 import pytest
 
-from niwashi_mcp.apic.client import ApicClient
+from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
 from niwashi_mcp.exceptions import FilterError
 from tests.conftest import MINIMAL_DESCRIPTIONS, apic_response, make_ctx
-from tests.unit.test_client import FakeHTTPClient, _MockResponse
+from tests.unit.test_client import FakeHTTPClient, _bd_set, _MockResponse, _sent
 
 # ── Wiring helpers ────────────────────────────────────────────────────────────
 
@@ -186,6 +186,87 @@ async def test_query_clamped_limit_reaches_real_apic_request_as_page_size(catalo
 
     params = client._client.requests[0]["params"]
     assert params.get("page-size") == "200"
+
+
+# ── query(fetch_all=True) → the real page loop ───────────────────────────────
+#
+# StubBackend answers fetch_all in one step and has no notion of a page size, so
+# it can never notice the tool and the client disagreeing about what `limit`
+# means during a walk. Through the real client it can be seen: fetch_all pages at
+# a fixed 200 and the caller's `limit` has no say, so the default call is no
+# longer capped at 25 x 20 = 500 objects.
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_with_the_default_limit_returns_600_complete(catalogue_index):
+    """The tool's default limit is 20; 600 objects used to come back as 500 with
+    complete=False and a note blaming a cap the set never reached."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(600))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, fetch_all=True)
+
+    assert envelope["returned"] == 600
+    assert envelope["total_available"] == 600
+    assert envelope["complete"] is True
+    assert envelope["truncated"] is False
+    assert envelope["note"] is None
+    assert [p["page"] for p in _sent(client)] == ["0", "1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_sends_page_size_200_whatever_limit_the_caller_gave(
+    catalogue_index,
+):
+    """`limit` is the caller's page size for a single page; a walk ignores it.
+    Asserted on the wire, where the APIC would see it."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(450))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, limit=5, fetch_all=True)
+
+    assert envelope["returned"] == 450
+    assert envelope["complete"] is True
+    assert {p["page-size"] for p in _sent(client)} == {"200"}
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_over_the_cap_tells_the_agent_the_real_numbers(catalogue_index):
+    """One object past the cap: the first 5,000 arrive, complete is False, and
+    the note carries both numbers so the agent can say how much it is missing."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(_MAX_OBJECTS + 1))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, fetch_all=True)
+
+    assert envelope["returned"] == _MAX_OBJECTS
+    assert envelope["total_available"] == _MAX_OBJECTS + 1
+    assert envelope["complete"] is False
+    assert envelope["truncated"] is False, "fetch_all never reports `truncated`; `complete` is the signal"
+    assert str(_MAX_OBJECTS + 1) in envelope["note"]
+    assert f"{_MAX_OBJECTS} objects per call" in envelope["note"]
+    assert "partial answer" in envelope["note"]
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_exactly_at_the_cap_is_not_flagged(catalogue_index):
+    """A set of exactly 5,000 is whole; the envelope must not cry cap."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(_MAX_OBJECTS))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, fetch_all=True)
+
+    assert envelope["returned"] == _MAX_OBJECTS
+    assert envelope["complete"] is True
+    assert envelope["note"] is None
 
 
 # ── query() → FilterError propagation through the tool ───────────────────────

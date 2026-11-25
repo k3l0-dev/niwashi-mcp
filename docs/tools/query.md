@@ -52,10 +52,10 @@ query(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `limit` | `int` | `20` | Maximum objects to return per page. Clamped to `[1, 200]` — values below 1 are raised to 1 rather than passed to the APIC as an invalid page-size. Also the page size used internally when `fetch_all=True`. |
+| `limit` | `int` | `20` | Maximum objects to return per page. Clamped to `[1, 200]` — values below 1 are raised to 1 rather than passed to the APIC as an invalid page-size. Not used when `fetch_all=True`, which pages at its own fixed size of 200 whatever `limit` is. |
 | `page` | `int` | — | 0-based page number for paginated result sets. Ignored when `fetch_all=True`. |
 | `order_by` | `str` | — | APIC ordering expression, e.g. `"faultInst.severity\|desc"`. |
-| `fetch_all` | `bool` | `False` | Walk every page (using `limit` as page size) and return the complete matching set in one call — the reliable way to answer a max/min/total/all-of question over a whole class instead of paging manually. Stops early only if a safety cap is hit — 25 pages or 5,000 objects, whichever comes first — in which case `complete` is `False` in the response; narrow the query (e.g. `scope_dn`) and combine results. |
+| `fetch_all` | `bool` | `False` | Walk every page (200 objects per page, independent of `limit`) and return the complete matching set in one call — the reliable way to answer a max/min/total/all-of question over a whole class instead of paging manually. Holds at most 5,000 objects (25 pages): a set of 5,000 or fewer comes back whole with `complete` `True`, a larger one comes back as its first 5,000 with `complete` `False` and `total_available` still the true size — nothing beyond the cap is fetched. `complete` is also `False` if the APIC ends its pages before the `totalCount` it reported. Narrow the query (e.g. `scope_dn`) and combine results. |
 
 ### Children and subtrees
 
@@ -116,7 +116,7 @@ An **envelope dict** — not a bare list:
 | `total_available` | `int` | True match count, fabric- or subtree-wide — independent of how many were actually fetched |
 | `truncated` | `bool` | `total_available > returned` — a default-page result is a **partial page**, not the whole matching set. Never conclude a max/min/total/complete-list answer from a truncated result. |
 | `next_page` | `int \| None` | `page + 1` when truncated and `fetch_all` was not used; `None` otherwise |
-| `complete` | `bool` | `False` only if `fetch_all=True` hit the safety cap (25 pages / 5,000 objects) before exhausting all matches |
+| `complete` | `bool` | `False` only if `fetch_all=True` stopped short of `total_available` — at the 5,000-object cap, or because the APIC ended its pages before the `totalCount` it reported. A set of exactly 5,000 objects is complete. |
 | `note` | `str \| None` | Guidance text, present only when truncated or capped |
 
 Any code written against the older (pre-envelope) shape of this doc needs updating: `result["results"][0]["dn"]`, not `result[0]["dn"]`.
@@ -146,7 +146,7 @@ flowchart TD
     URL_CLASS --> PARAMS
 
     subgraph PARAMS["Query parameters added"]
-        P1["page-size = limit"]
+        P1["page-size = limit<br/>(200 when fetch_all=True)"]
         P2["query-target-filter (from filters + filter_expr)"]
         P3["order-by"]
         P4["rsp-subtree=children + rsp-subtree-class"]
@@ -231,7 +231,8 @@ page_1 = await query("faultInst", limit=50, page=1)
 ```python
 all_faults = await query("faultInst", fetch_all=True)
 if not all_faults["complete"]:
-    # hit the safety cap — narrow with scope_dn and combine
+    # stopped short (5,000-object cap, or the APIC ended its pages early) —
+    # narrow with scope_dn and combine
     ...
 count = all_faults["returned"]
 ```

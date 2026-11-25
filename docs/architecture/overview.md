@@ -37,9 +37,17 @@ Three consequences follow from the file being a build artefact inside a wheel:
 
 - It is opened **read-only and immutable** — `file:…?immutable=1` — which lets SQLite skip locking entirely.
 - Exactly **one connection per process** is opened and cached. A second connection would load a second copy of the string pools into memory for no benefit.
-- The APIC release the model describes is now pinned by the dependency, not chosen by the operator. It changes when niwaki changes, which is why it is logged at startup.
+- The APIC release the model describes is now pinned by the dependency, not chosen by the operator. It changes when niwaki changes, which is why it is logged at startup — and compared with the fabric's own release, below.
 
-That last point deserves care: the version logged at startup is the release the **catalogue** was generated from, read from the catalogue's own `manifest` table. It says nothing about the version of the fabric the server is connected to.
+That last point deserves care: the `APIC 6.0(9c)` in the `Registry loaded` line is the release the **catalogue** was generated from, read from the catalogue's own `manifest` table. By itself it says nothing about the fabric the server is connected to — so the lifespan also asks the fabric.
+
+Right after the login it reads the controller's running release (`GET /api/class/firmwareCtrlrRunning.json`, filtered to `type == "controller"`, reading `version` off the first object returned) and compares it with the catalogue's, after normalising both — `apic-6.0(9c)`, `APIC-6.0(9C)` and `6.0(9c)` are the same release. A mismatch is a `WARNING` that names both releases, says that classes and attributes added, removed or renamed between them may be refused as unknown or come back empty, and points to [SUPPORTED-APIC.md](../../SUPPORTED-APIC.md). The check is advisory:
+
+- It **never stops startup.** A failed lookup, an empty answer, an answer in a format it cannot read, or an account that may not read the firmware classes each log a warning and leave `fabric_version` as `None`.
+- It **never claims a mismatch it cannot establish.** A version string the server fails to parse is "unknown", not "different".
+- Only the **first** controller's release is read. During a rolling upgrade a cluster can briefly run mixed releases; the check reports the one that answered first, not a consensus.
+
+The result — the fabric's release in canonical form such as `6.0(9c)`, or `None` — is kept in the lifespan context as `fabric_version`, next to `descriptions` and `backend`.
 
 ---
 
@@ -223,11 +231,14 @@ sequenceDiagram
     life->>apic: POST /api/aaaLogin.json
     apic-->>life: session token, stored as the APIC-cookie
     life->>life: log the connected host
-    Note over life: yields descriptions and backend to every tool
+    life->>apic: GET /api/class/firmwareCtrlrRunning.json, type is controller
+    apic-->>life: the controller's running release, or an error
+    life->>life: normalise both releases, compare, warn on a mismatch or on anything unreadable
+    Note over life: yields descriptions, backend and fabric_version to every tool
     Note over life: on shutdown, close the httpx client
 ```
 
-Two details of that order matter in practice. The registry is built **before** any APIC contact, so a broken installation fails on `DescriptionsLoadError` rather than on a confusing authentication error. And `APIC_HOST` / `APIC_PASSWORD` are validated **before** the login attempt, so a missing variable raises `ConfigurationError` with the variable named instead of surfacing as a connection failure.
+Three details of that order matter in practice. The registry is built **before** any APIC contact, so a broken installation fails on `DescriptionsLoadError` rather than on a confusing authentication error. `APIC_HOST` / `APIC_PASSWORD` are validated **before** the login attempt, so a missing variable raises `ConfigurationError` with the variable named instead of surfacing as a connection failure. And the version lookup comes **after** the login and is the one APIC call at startup that is allowed to fail: a login failure refuses to start, a version failure only warns.
 
 The `.env` file itself is resolved in a fixed order: `NIWASHI_MCP_ENV_FILE` if set, then `./.env`, then the repository root when the code is running from a verified checkout, then `~/.config/niwashi-mcp/.env`. A checkout is recognised by the presence of `mcp/pyproject.toml`, never by path arithmetic alone — installed into `site-packages`, that arithmetic would silently yield a directory that exists and means nothing.
 

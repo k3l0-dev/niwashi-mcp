@@ -55,7 +55,8 @@ query() parameters
   scope_dn             Restrict query to a subtree DN
   limit / page         Pagination (page-size / 0-based page number)
   fetch_all            Walk every page and return the complete matching set
-                       in one call, instead of just the first page
+                       in one call, instead of just the first page (up to
+                       5,000 objects; `limit` does not apply)
   order_by             e.g. "faultInst.severity|desc"
   include_children     Embed direct children inline, e.g. ["fvSubnet","fvRsCtx"]
                        Equivalent to rsp-subtree=children&rsp-subtree-class=X,Y
@@ -93,7 +94,8 @@ from fastmcp.server.lifespan import lifespan
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator
 
-from niwashi_mcp.apic.client import ApicClient
+from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
+from niwashi_mcp.apic.version import check_fabric_version
 from niwashi_mcp.exceptions import ConfigurationError, UnknownClassError
 from niwashi_mcp.middleware.auth import ApiKeyMiddleware, KeyStore, load_api_keys
 from niwashi_mcp.middleware.health import HealthMiddleware
@@ -269,8 +271,12 @@ async def app_lifespan(server: FastMCP):
     """Load registry and connect to the APIC at startup; close on shutdown.
 
     Yields a context dict available to all tools via ctx.lifespan_context:
-      descriptions  — in-memory class descriptions index
-      backend       — ApicClient instance
+      descriptions   — in-memory class descriptions index
+      backend        — ApicClient instance
+      fabric_version — the APIC release the connected fabric reports, in
+                       canonical form ("6.0(9c)"), or None when it could not be
+                       read or understood. Compared with the catalogue's
+                       release at startup; a mismatch is logged, never fatal.
     """
     load_dotenv(ENV_FILE)
 
@@ -336,9 +342,15 @@ async def app_lifespan(server: FastMCP):
     logger.info("Connected to APIC — %s", host)
 
     try:
+        # The release logged above ("niwaki catalogue, APIC x") is the one the
+        # object model describes; it says nothing about the fabric this server
+        # is now talking to. Ask the fabric, and warn if the two differ. Never
+        # raises and never stops startup — see check_fabric_version.
+        fabric_version = await check_fabric_version(backend, catalog.apic_version())
         yield {
             "descriptions": descriptions,
             "backend": backend,
+            "fabric_version": fabric_version,
         }
     finally:
         await backend.close()
@@ -401,9 +413,11 @@ FULL-FABRIC AGGREGATION — a single default query() page is NOT the whole
     get the rest first.  Use count() for a pure tally; use
     query(..., fetch_all=True) for ranking, argmax, or an exhaustive list,
     aggregating locally over "results".  total_available is the true size of
-    the matching set regardless of how much was fetched; if complete=false
-    even after fetch_all=True, the safety cap was hit — narrow the query
-    (e.g. by tenant scope_dn) and combine results across narrower calls.
+    the matching set regardless of how much was fetched; fetch_all holds at
+    most 5,000 objects per call, and if complete=false even after
+    fetch_all=True the result is a partial answer (that cap was hit, or the
+    APIC ended its pages early) — narrow the query (e.g. by tenant scope_dn)
+    so each call matches fewer, and combine results across narrower calls.
 
 RELATION INTEGRITY — never report what an object points to without reading
     the relation's `state`.
@@ -667,8 +681,8 @@ async def query(
                           Clamped to the range [1, 200] — values below 1
                           (including 0 and negatives) are raised to 1 rather
                           than passed through to the APIC as an invalid
-                          page-size. Also the page size used internally when
-                          fetch_all=True.
+                          page-size. Not used when fetch_all=True, which pages
+                          at its own fixed size of 200 whatever `limit` is.
         order_by:         APIC ordering expression, e.g. "faultInst.severity|desc".
         include_children: Child class names to embed in each result in one call,
                           e.g. ["fvSubnet", "fvRsCtx"].  Each returned object
@@ -692,14 +706,18 @@ async def query(
                           ~40-attribute set.  Use it when comparing, backing up,
                           or diffing intended configuration without operational
                           noise (runtime state, timestamps, monitoring counters).
-        fetch_all:        When True, walk every page (using `limit` as page
-                          size) and return the complete matching set in one
-                          call — the reliable way to answer a max/min/total/
-                          all-of question over a whole class instead of
-                          paging manually. Stops early only if a safety cap
-                          (thousands of objects) is hit, in which case
-                          `complete` is False in the response; narrow the
-                          query (e.g. scope_dn) and combine results.
+        fetch_all:        When True, walk every page (200 objects per page,
+                          independent of `limit`) and return the complete
+                          matching set in one call — the reliable way to
+                          answer a max/min/total/all-of question over a
+                          whole class instead of paging manually. Holds at
+                          most 5,000 objects: a set of 5,000 or fewer comes
+                          back whole with `complete` True, a larger one comes
+                          back as its first 5,000 with `complete` False (and
+                          `total_available` still the true size); `complete`
+                          is also False if the APIC ends its pages before the
+                          count it reported. Narrow the query (e.g.
+                          scope_dn) and combine results.
 
     Returns:
         An envelope dict:
@@ -708,7 +726,9 @@ async def query(
            "total_available": <int>,    # true match count, fabric/subtree-wide
            "truncated": <bool>,         # total_available > returned
            "next_page": <int|None>,     # page+1 when truncated and not fetch_all
-           "complete": <bool>,          # False only if fetch_all hit the safety cap
+           "complete": <bool>,          # False only if fetch_all stopped short of
+                                        # total_available (5,000-object cap, or
+                                        # the APIC ended its pages early)
            "note": <str|None>}          # guidance, present only when truncated or capped
         Each dict in "results" contains all APIC attributes for the object
         plus a "_class" key with the ACI class name. The "dn" attribute is
@@ -800,10 +820,17 @@ async def query(
             "returned; re-run with fetch_all=True or page explicitly"
         )
     elif not result.complete:
+        # One note for both ways a fetch_all stops short — the 5,000-object
+        # safety cap, or the APIC ending its pages before the totalCount it
+        # reported — because the agent's next move is the same either way and
+        # it cannot tell them apart from the outside.
         note = (
             f"Fetched {returned} of {result.total_available} objects before "
-            "hitting the safety cap. Narrow the query (e.g. scope_dn) and "
-            "combine results."
+            f"hitting the safety cap (fetch_all holds at most {_MAX_OBJECTS} "
+            "objects per call) or the end of the APIC's pages. This is a "
+            "partial answer — do not state a maximum, minimum, total, or "
+            "complete list from it. Narrow the query (e.g. scope_dn) so each "
+            "call matches fewer objects, and combine results."
         )
         await ctx.warning(
             f"query({class_name!r}, fetch_all=True) capped — "
