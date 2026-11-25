@@ -163,6 +163,34 @@ def filter_expr_attributes(filter_expr: str | None) -> list[tuple[str, str]]:
     return list(dict.fromkeys(pairs))
 
 
+# Any `Class.attr`, wherever it stands outside a quoted value.
+_DOTTED_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]*)\.([A-Za-z][A-Za-z0-9]*)\b")
+
+
+def dotted_references(filter_expr: str | None) -> list[tuple[str, str]]:
+    """Every `(class, attribute)` token in a filter expression, found by shape alone.
+
+    The counterpart of `filter_expr_attributes` for a check that must not miss
+    one. That extractor anchors on `<operator>(` so a typo can be corrected
+    without refusing a request the APIC would have answered; a reference it
+    cannot place is left unchecked, which is the right trade for a spelling
+    check and the wrong one when the question is "does this expression touch a
+    secret". This one takes every dotted pair outside a quoted value, whatever
+    surrounds it (extra whitespace, nesting, an operator it has never heard of),
+    so a predicate cannot hide an operand by the way it is written. It may return
+    a pair that is not an operand — `eq(fvBD.dn,uni.tn)` yields `uni.tn` — which
+    a caller checking for secrets can only over-refuse.
+
+    >>> dotted_references('and( eq( vnsCCred.value ,"x"),eq(fvBD.name,"a.b"))')
+    [('vnsCCred', 'value'), ('fvBD', 'name')]
+    >>> dotted_references(None)
+    []
+    """
+    if not filter_expr:
+        return []
+    return list(dict.fromkeys(_DOTTED_RE.findall(_mask_string_literals(filter_expr))))
+
+
 def order_by_attributes(order_by: str | None) -> list[tuple[str, str]]:
     """The `(class, attribute)` pairs of an APIC order-by expression.
 

@@ -43,9 +43,10 @@ import json
 import sqlite3
 import threading
 import zlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from niwashi_mcp.exceptions import DescriptionsLoadError
@@ -831,6 +832,41 @@ def fault_names(codes: Iterable[str]) -> dict[str, str]:
     for code, name in _query("SELECT code, name FROM fault ORDER BY name"):
         table.setdefault(code, name)
     return {code: table[code] for code in dict.fromkeys(codes) if code in table}
+
+
+@lru_cache(maxsize=1)
+def secure_properties() -> Mapping[str, frozenset[str]]:
+    """Every property the schema flags ``secure``, grouped by class.
+
+    The ``secure`` flag marks what the APIC itself never echoes back on a read
+    (BGP and NTP passwords, KMS keys, pre-shared keys, ...). It is the
+    mechanical half of the redaction policy; ``registry.redaction`` adds the
+    positions the flag misses. A class lists the properties it inherits, because
+    ``class_prop`` rows are expanded down the hierarchy (see
+    ``_collect_properties``), so an abstract parent's flag is already on every
+    concrete child.
+
+    Measured on this catalogue: 169 (class, property) pairs on 112 classes, one
+    query of about 20 ms, so it is read once and kept.
+
+    The flag is tested on the signatures first and the memberships are walked
+    against that short list, as niwaki's own reader does: testing it per
+    membership would unpack the flags of all 332,297 rows.
+
+    Returns:
+        ``{wire class name: frozenset of wire property names}``, read-only.
+        A class with no secure property is absent rather than mapped to ``{}``.
+    """
+    secure_bit = _flag_bits()["secure"]
+    grouped: dict[str, set[str]] = {}
+    for class_name, wire in _query(
+        f"SELECT m.class_name, p.wire_name FROM {_CLASS_PROPS} "
+        "JOIN mo m ON m.id = cp.class_id "
+        "WHERE cp.sig_id IN (SELECT id FROM prop_sig WHERE flags & ? != 0)",
+        (secure_bit,),
+    ):
+        grouped.setdefault(class_name, set()).add(wire)
+    return MappingProxyType({c: frozenset(props) for c, props in grouped.items()})
 
 
 # Labels that appear in virtually every ACI class and carry no discriminating

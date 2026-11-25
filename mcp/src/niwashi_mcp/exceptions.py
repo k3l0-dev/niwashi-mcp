@@ -12,9 +12,12 @@ NiwashiMcpError
 ├── AuthenticationError       — incoming request carries no valid API key
 ├── RegistryError             — base for registry load failures
 │   ├── DescriptionsLoadError — niwaki catalogue missing, unreadable, or moved
+│   ├── RedactionPolicyError  — niwaki's secret-redaction policy missing or moved
 │   └── SchemaLoadError       — retained for compatibility; unreachable since 2.0
 ├── UnknownClassError         — class name not found in the descriptions registry
 ├── UnknownAttributeError     — attribute not among the class's properties in the catalogue
+├── SecretAttributeError      — filter/order/group on an attribute that holds a secret
+├── SecretDnError             — a DN that is itself named by a secret
 ├── FilterError               — invalid identifier or unsafe value in build_filter
 └── ApicError                 — base for APIC communication errors
     ├── ApicAuthError         — authentication failed (bad credentials or server error)
@@ -68,6 +71,19 @@ class DescriptionsLoadError(RegistryError):
 
     The remedy is to reinstall the dependency that carries the catalogue:
         pip install --force-reinstall niwaki
+    """
+
+
+class RedactionPolicyError(RegistryError):
+    """niwaki's secret-redaction policy is missing, or no longer what we read.
+
+    Raised at startup by `registry.redaction.verify_policy()`. The policy tables
+    (`niwaki._secrets`) are private to niwaki, which is pinned to one minor for
+    exactly that reason. A copy of them would go stale silently, and a server
+    that cannot say which values are secret must not start: serving without the
+    policy would hand credentials to an agent.
+
+    The remedy is the pin: `niwaki>=2.2,<2.3`.
     """
 
 
@@ -153,6 +169,58 @@ class UnknownAttributeError(NiwashiMcpError):
             f"{hint} Call get_schema('{class_name}') to list its attributes. "
             f"The catalogue describes {described}; a fabric on another release "
             f"may legitimately have this attribute."
+        )
+
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+#
+# Both messages are written for the agent that receives them, and neither quotes
+# what the agent sent: a refused guess is not echoed back into a log or a reply.
+
+
+class SecretAttributeError(NiwashiMcpError):
+    """A request filters, orders or groups on an attribute that holds a secret.
+
+    The server never returns such a value, but a predicate on it would answer
+    questions about it all the same: `filters={"value": "guess"}` returning one
+    object confirms the guess, and `group_by` would print the values as keys. So
+    the request is refused whatever `NIWASHI_MCP_STRICT_ATTRIBUTES` says — it
+    is not a catalogue check, and relaxing it would reopen the oracle.
+    """
+
+    def __init__(self, class_name: str, attribute: str, where: str) -> None:
+        self.class_name = class_name
+        self.attribute = attribute
+        self.where = where
+        super().__init__(
+            f"'{attribute}' on ACI class '{class_name}' holds a secret "
+            f"(a credential, key or community string), so `{where}` cannot use "
+            "it: filtering, ordering or grouping on it would let a guess be "
+            "checked or the values be read back, and the server withholds them. "
+            f"Use another attribute of '{class_name}'; the objects themselves "
+            "still come back, with that value shown as withheld."
+        )
+
+
+class SecretDnError(NiwashiMcpError):
+    """A DN or filter text names an object by a secret.
+
+    An SNMP community profile is named by its community string, a login session
+    by its token hash, a JWT site by its API key: the secret is part of the DN.
+    Fetching `.../community-public` and being told "found" or "not found" is a
+    way to check a guess, so every such DN is refused on its shape alone —
+    before the APIC is asked, and the same whether or not the object exists.
+    """
+
+    def __init__(self, where: str) -> None:
+        self.where = where
+        super().__init__(
+            f"`{where}` names an object by a secret: an SNMP community string, a "
+            "login-session token or an API key is part of that DN. The server "
+            "refuses every DN of that shape — whether or not such an object "
+            "exists — so a request cannot be used to check a guess. Query the "
+            "class, or the parent's DN, instead: the objects come back with "
+            "the secret withheld."
         )
 
 
