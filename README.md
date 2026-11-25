@@ -186,6 +186,16 @@ how to read a schema, how DNs are built, and when to reach for each tool.
 | OpenCode | `cp mcp/client/SKILL.md ~/.config/opencode/skills/niwashi-mcp-query/SKILL.md` (or `.opencode/skills/…` per project). The directory name must match the skill's `name:` field, and it must sit beside the server declaration — tools without the skill is the failure this file exists to prevent |
 | Anything else | Paste it into the system prompt or context file |
 
+**Experimental — the server also serves it.** The same file is published as an
+MCP resource, `skill://niwashi-mcp-query/SKILL.md` (with a `skill://niwashi-mcp-query/_manifest`
+carrying its size and SHA-256), and, on the 2026-07-28 protocol, through the
+Skills extension's `skills/list` and `skills/get`. A client that reads skills from
+the server it is connected to needs no copy at all; one that does not simply never
+asks, and the five tools are unaffected. It rides FastMCP 4.2's implementation of
+a draft extension (SEP-2640), so the URI scheme and the wire format may change in
+a FastMCP release, and a client has to know to ask for it — until yours does, copy
+the file as above.
+
 Then ask:
 
 > *"List all tenants configured in this fabric."*

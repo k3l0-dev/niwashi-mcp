@@ -117,6 +117,8 @@ from dotenv import load_dotenv
 from fastmcp import Context, FastMCP, settings
 from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
+from fastmcp.skills import Skill
+from fastmcp.skills.provider import SkillCatalogProvider
 from mcp import MCPDeprecationWarning
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator, ConfigDict, TypeAdapter, ValidationError
@@ -485,6 +487,22 @@ async def app_lifespan(server: FastMCP):
 settings.enable_subscriptions_listen = False
 
 
+# The operating guide an agent needs beside the five tools, served as an MCP
+# resource (`skill://niwashi-mcp-query/SKILL.md`) so a client that supports
+# skills can fetch it from the server it is already connected to, instead of the
+# user copying a file next to the configuration. EXPERIMENTAL: FastMCP 4.2 ships
+# this under the draft Skills extension (SEP-2640), and its API and wire format
+# may change in a release without notice. Nothing else depends on it — the five
+# tools work the same for a client that never asks.
+#
+# The file is package data: the folder is named after the skill, as the Agent
+# Skills spec and FastMCP require, and it is loaded here, at import, so a wheel
+# that lost it refuses to start instead of serving no skill. It is a copy of
+# `mcp/client/SKILL.md`, which stays the one people read and edit; a test
+# fails when the two differ, and `scripts/wheel_smoke.py` checks the built wheel.
+_SKILL = Skill.from_package("niwashi_mcp", "skills/niwashi-mcp-query")
+
+
 def _own_version() -> str:
     """This distribution's version, as installed — what `serverInfo.version` says.
 
@@ -505,6 +523,7 @@ mcp = FastMCP(
     name="niwashi-mcp",
     version=_own_version(),
     lifespan=app_lifespan,
+    providers=[SkillCatalogProvider([_SKILL])],
     instructions="""
 You are an assistant for querying a Cisco ACI fabric through its APIC REST API.
 
