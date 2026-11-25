@@ -170,17 +170,28 @@ Children are only included when `include_children` is set.
 
 | Mode | Behaviour |
 |---|---|
-| `fetch_all=False` (default) | One request. `page` is sent only when the caller supplied it. `QueryResult.complete` is always `True` — it describes the loop, not the result set |
-| `fetch_all=True` | Pages `0, 1, 2, …` with `page-size = limit`, accumulating into one `QueryResult`. `page` is ignored |
+| `fetch_all=False` (default) | One request with `page-size = limit`. `page` is sent only when the caller supplied it. `QueryResult.complete` is always `True` — it describes the loop, not the result set |
+| `fetch_all=True` | Pages `0, 1, 2, …` with a fixed `page-size` of 200, accumulating into one `QueryResult`. `limit` and `page` are both ignored |
 
-The loop stops at the first short page — fewer objects than `limit`, the natural end of the set — or at one of two safety caps:
+The three constants that govern a walk:
 
 ```python
-_MAX_PAGES = 25
+_FETCH_ALL_PAGE_SIZE = 200
 _MAX_OBJECTS = 5000
+_MAX_PAGES = _MAX_OBJECTS // _FETCH_ALL_PAGE_SIZE   # 25
 ```
 
-A fabric-wide class scan with no `scope_dn` can be unbounded (a bad filter, or a class with tens of thousands of instances), so the page loop needs a hard stop independent of the caller's `limit`. Hitting either cap sets `complete=False` on the returned `QueryResult`; a natural end leaves it `True`. `total_available` is re-read from every page and always reports the APIC's own `totalCount`, so a capped result still tells the caller how much it did not fetch.
+The page size is fixed rather than taken from the caller's `limit` because the two used to be coupled and the coupling made the cap unreachable: the loop stopped after 25 pages, so the default `limit=20` capped a "fetch everything" call at 25 × 20 = 500 objects — a tenth of the advertised 5,000 — and reported `complete=False` on sets the cap was never meant to touch. 200 is the largest page the `query` tool already sends (its `limit` clamp is `[1, 200]`), so it is a page size this server issues to the APIC anyway, and a full walk is 25 requests rather than 250. `_MAX_OBJECTS` is a multiple of it, so the cap lands on a page boundary: the loop never holds an object past the cap and nothing is fetched only to be discarded. `_MAX_PAGES` is derived from the other two, and is the loop's hard bound.
+
+After each page the loop checks, in this order:
+
+1. **Everything `totalCount` reported is in hand** — `complete=True`. This is checked first, so a set that is an exact multiple of the page size ends here with no extra, empty request, and a set of exactly 5,000 objects is complete rather than "capped".
+2. **The page was short or empty** — the natural end of the set. With no `totalCount` to compare against (absent or not a number) that is all the evidence there is, and the result is `complete=True`, as it has always been. If a `totalCount` *was* reported and has not been reached, the APIC ran dry early: the loop stops (it never requests page after empty page), logs a warning, and returns `complete=False`.
+3. **The page was full** — request the next, until `_MAX_PAGES` pages have been fetched. Falling out of the loop is the cap: `complete=False`, with `total_available` still carrying the APIC's own `totalCount` so the caller knows how much it did not get.
+
+`totalCount` is re-read from every page and the latest value wins; a page that omits it keeps the earlier figure. With none ever reported, `total_available` falls back to the number of objects fetched — and a walk that fills all 25 pages without ever meeting a short page is reported `complete=False`, never guessed complete.
+
+A fabric-wide class scan with no `scope_dn` can be unbounded (a bad filter, or a class with tens of thousands of instances), so the loop needs a hard stop independent of the caller. Objects past the cap are never fetched, never returned and never trimmed after the fact. The `query` tool reports a capped or early-ended walk through `complete=false` and a `note` — one note for both, since the agent's next move (narrow the query and combine) is the same.
 
 ---
 

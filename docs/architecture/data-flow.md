@@ -213,7 +213,7 @@ sequenceDiagram
     tool-->>LLM: envelope — results, returned, total_available,<br/>truncated, next_page, complete, note
 ```
 
-The envelope is not a bare list, and `truncated: true` must never be read as a maximum, a minimum, a total, or a complete list. `total_available` is the APIC-reported size of the matching set regardless of how much was fetched; `fetch_all=True` walks pages until a short page ends the loop or a safety cap of 25 pages or 5,000 objects sets `complete: false`.
+The envelope is not a bare list, and `truncated: true` must never be read as a maximum, a minimum, a total, or a complete list. `total_available` is the APIC-reported size of the matching set regardless of how much was fetched; `fetch_all=True` walks pages of 200 (whatever `limit` is) until everything `totalCount` reported is in hand; a safety cap of 5,000 objects, or the APIC ending its pages before that count, sets `complete: false`.
 
 `count` follows the same validation path — the identical `class_exists` guard, so the two tools can never disagree about whether a class is known — then issues the same class or subtree request with a page size of 1 and reads `totalCount` from the envelope.
 
@@ -234,7 +234,7 @@ flowchart TD
     URL_CLASS --> PARAMS
 
     subgraph PARAMS["Query parameters added when present"]
-        P1["page-size = limit"]
+        P1["page-size = limit<br/>(200 when fetch_all is true)"]
         P2["query-target-filter = built filter and filter_expr,<br/>combined with an APIC and predicate"]
         P3["order-by = order_by"]
         P4["rsp-subtree=children plus rsp-subtree-class=X,Y<br/>when include_children is set"]

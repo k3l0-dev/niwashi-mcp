@@ -14,7 +14,12 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from niwashi_mcp.apic.client import _MAX_OBJECTS, _MAX_PAGES, ApicClient
+from niwashi_mcp.apic.client import (
+    _FETCH_ALL_PAGE_SIZE,
+    _MAX_OBJECTS,
+    _MAX_PAGES,
+    ApicClient,
+)
 from niwashi_mcp.exceptions import (
     ApicAuthError,
     ApicConnectionError,
@@ -584,54 +589,137 @@ async def test_query_class_sets_page_param():
 
 
 # ── query_class() — fetch_all pagination ──────────────────────────────────────
+#
+# fetch_all pages at a fixed _FETCH_ALL_PAGE_SIZE and ignores the caller's
+# `limit`. It used to page by `limit` and stop after 25 pages, so the default
+# limit=20 capped a "fetch everything" call at 500 objects, and a set of exactly
+# 25 x limit objects was reported complete=False. The pages below are therefore
+# built at the real page size, from a generator, so a test states the *size of
+# the fabric* it models rather than a hand-rolled page layout.
 
 
-def _bd_page(names: list[str], total_count: int) -> _MockResponse:
-    """Build one fvBD page response carrying `total_count` as totalCount."""
+def _bd_page(names: list[str], total_count: int | str | None) -> _MockResponse:
+    """Build one fvBD page response carrying `total_count` as totalCount.
+
+    `None` omits the field entirely, as a response that never reported one.
+    """
     objects = make_imdata_objects(
         "fvBD", [{"dn": f"uni/tn-OT/BD-{n}", "name": n} for n in names]
     )
-    return _MockResponse(200, {"totalCount": str(total_count), "imdata": objects})
+    body: dict = {"imdata": objects}
+    if total_count is not None:
+        body["totalCount"] = str(total_count)
+    return _MockResponse(200, body)
+
+
+_TRUE_TOTAL = object()  # sentinel: "report the real number of objects"
+
+
+def _bd_set(
+    n_objects: int,
+    *,
+    reported: object = _TRUE_TOTAL,
+    page_size: int = _FETCH_ALL_PAGE_SIZE,
+) -> list[_MockResponse]:
+    """The pages an APIC would serve for `n_objects` matching fvBDs.
+
+    Every page carries `reported` as its totalCount — by default the true
+    `n_objects`; pass an int/str to model a count that disagrees, or None to
+    omit it. A set that is an exact multiple of `page_size` gets NO trailing
+    empty page, exactly as a real APIC would not serve one: a client that asks
+    for it has made a request the APIC never needed, and the fake transport
+    raises when its queue runs dry.
+    """
+    total = n_objects if reported is _TRUE_TOTAL else reported
+    pages = [
+        _bd_page([f"n{i}" for i in range(lo, min(lo + page_size, n_objects))], total)
+        for lo in range(0, n_objects, page_size)
+    ]
+    return pages or [_bd_page([], total)]
+
+
+def _sent(client: ApicClient) -> list[dict]:
+    """The `params` of every GET the client issued, in order."""
+    return [r.get("params", {}) for r in client._client.requests]
 
 
 @pytest.mark.asyncio
 async def test_query_class_fetch_all_walks_pages_and_concatenates():
-    """Three queued pages of page-size 3, the last one short (1 object) —
-    fetch_all stops there instead of requesting a fourth page."""
-    client = _make_client(
-        _bd_page(["a", "b", "c"], 7),
-        _bd_page(["d", "e", "f"], 7),
-        _bd_page(["g"], 7),
-    )
-    result = await client.query_class("fvBD", {}, limit=3, fetch_all=True)
-    assert {o["name"] for o in result.objects} == {"a", "b", "c", "d", "e", "f", "g"}
-    assert len(result.objects) == 7
-    assert result.total_available == 7
+    """450 objects = two full pages and a short one; fetch_all joins them and
+    stops at the short page instead of requesting a fourth."""
+    client = _make_client(*_bd_set(450))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert [o["name"] for o in result.objects] == [f"n{i}" for i in range(450)]
+    assert result.total_available == 450
     assert result.complete is True
     assert len(client._client.requests) == 3
 
 
 @pytest.mark.asyncio
-async def test_query_class_fetch_all_sets_page_and_page_size_per_request():
-    """Each page request in a fetch_all loop carries the same page-size
-    (=limit) and an incrementing 0-based page number."""
-    client = _make_client(
-        _bd_page(["a", "b"], 5),
-        _bd_page(["c", "d"], 5),
-        _bd_page(["e"], 5),
-    )
-    await client.query_class("fvBD", {}, limit=2, fetch_all=True)
-    params_per_page = [r.get("params", {}) for r in client._client.requests]
-    assert [p.get("page") for p in params_per_page] == ["0", "1", "2"]
-    assert all(p.get("page-size") == "2" for p in params_per_page)
+@pytest.mark.parametrize("limit", [1, 20, 200])
+async def test_query_class_fetch_all_pages_at_a_fixed_size_whatever_the_limit(limit):
+    """The wire carries page-size=200 on every page of a walk, with an
+    incrementing 0-based page number — `limit` never reaches it.
+
+    This replaces `..._sets_page_and_page_size_per_request`, which asserted
+    page-size == limit and so pinned the coupling that capped the default call
+    at 500 objects.
+    """
+    client = _make_client(*_bd_set(450))
+    await client.query_class("fvBD", {}, limit=limit, fetch_all=True)
+    sent = _sent(client)
+    assert [p.get("page") for p in sent] == ["0", "1", "2"]
+    assert {p.get("page-size") for p in sent} == {"200"}
+
+
+@pytest.mark.asyncio
+async def test_query_class_without_fetch_all_still_pages_by_limit():
+    """The decoupling is for fetch_all only: a plain page keeps `limit`."""
+    client = _make_client(*_bd_set(5, page_size=3))
+    await client.query_class("fvBD", {}, limit=3)
+    assert _sent(client)[0]["page-size"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_ignores_the_page_argument():
+    """`page` is documented as ignored under fetch_all: the walk starts at 0."""
+    client = _make_client(*_bd_set(250))
+    result = await client.query_class("fvBD", {}, page=7, fetch_all=True)
+    assert [p["page"] for p in _sent(client)] == ["0", "1"]
+    assert len(result.objects) == 250
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_with_the_default_limit_gets_600_objects():
+    """The reported regression: default limit (20) x 25 pages = 500, so 600
+    objects came back as 500 with complete=False. 600 is far under the cap and
+    must arrive whole."""
+    client = _make_client(*_bd_set(600))
+    result = await client.query_class("fvBD", {}, fetch_all=True)  # limit stays 20
+    assert len(result.objects) == 600
+    assert result.total_available == 600
+    assert result.complete is True
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_exact_multiple_of_the_page_size_is_complete():
+    """400 = exactly two full pages. The next page would be empty, so the loop
+    must conclude from totalCount, not from a short page — it never gets one —
+    and must not spend a request on a page past the end (the fake transport
+    raises if it does)."""
+    client = _make_client(*_bd_set(2 * _FETCH_ALL_PAGE_SIZE))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == 400
+    assert result.complete is True
+    assert len(client._client.requests) == 2
 
 
 @pytest.mark.asyncio
 async def test_query_class_fetch_all_single_short_page_no_truncation():
-    """A single page shorter than `limit` is the whole matching set — no
+    """A single page shorter than the page size is the whole matching set — no
     truncation or cap involved."""
-    client = _make_client(_bd_page(["only"], 1))
-    result = await client.query_class("fvBD", {}, limit=20, fetch_all=True)
+    client = _make_client(*_bd_set(1))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
     assert len(result.objects) == 1
     assert result.total_available == 1
     assert result.complete is True
@@ -639,40 +727,144 @@ async def test_query_class_fetch_all_single_short_page_no_truncation():
 
 
 @pytest.mark.asyncio
-async def test_query_class_fetch_all_stops_at_max_pages_cap():
-    """_MAX_PAGES full pages, none short — the loop stops at the page-count
-    cap (not the object-count cap, since page_size * _MAX_PAGES stays well
-    under _MAX_OBJECTS) and reports complete=False, while total_available
-    still carries the true (far larger) totalCount."""
-    page_size = 3
+async def test_query_class_fetch_all_empty_set_is_complete():
+    """Nothing matches: one empty page, totalCount 0 — complete, and not an
+    error. (An empty page is only suspicious when totalCount says more is due.)"""
+    client = _make_client(*_bd_set(0))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert result.objects == []
+    assert result.total_available == 0
+    assert result.complete is True
+    assert len(client._client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_exactly_at_the_cap_is_complete():
+    """A set of exactly _MAX_OBJECTS is all fetched, so it is complete.
+
+    The old loop ended its `for` without a break on the 25th full page and
+    reported complete=False — correctly capped, wrongly incomplete: nothing was
+    left behind.
+    """
+    client = _make_client(*_bd_set(_MAX_OBJECTS))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == _MAX_OBJECTS
+    assert result.total_available == _MAX_OBJECTS
+    assert result.complete is True
+    assert len(client._client.requests) == _MAX_PAGES
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_one_past_the_cap_is_incomplete():
+    """_MAX_OBJECTS + 1: the first _MAX_OBJECTS come back, complete is False,
+    total_available still names the true size, and no 26th request is made.
+    Nothing beyond the cap is fetched, so nothing needs trimming."""
+    client = _make_client(*_bd_set(_MAX_OBJECTS + 1))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == _MAX_OBJECTS
+    assert result.total_available == _MAX_OBJECTS + 1
+    assert result.complete is False
+    assert len(client._client.requests) == _MAX_PAGES
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_far_over_the_cap_stops_at_it():
+    """A fabric-wide scan of 999,999 stops after _MAX_PAGES requests with
+    _MAX_OBJECTS in hand — the cap is a bound on the walk, not a suggestion.
+    (Replaces the page-cap and object-cap tests: the two caps are now one,
+    since page size x _MAX_PAGES == _MAX_OBJECTS.)"""
     pages = [
-        _bd_page([f"p{p}-{i}" for i in range(page_size)], 999999)
+        _bd_page([f"p{p}-{i}" for i in range(_FETCH_ALL_PAGE_SIZE)], 999999)
         for p in range(_MAX_PAGES + 2)  # more supply than the cap will consume
     ]
     client = _make_client(*pages)
-    result = await client.query_class("fvBD", {}, limit=page_size, fetch_all=True)
-    assert len(result.objects) == _MAX_PAGES * page_size
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == _MAX_OBJECTS
     assert result.total_available == 999999
     assert result.complete is False
     assert len(client._client.requests) == _MAX_PAGES
 
 
 @pytest.mark.asyncio
-async def test_query_class_fetch_all_stops_at_max_objects_cap():
-    """Two full pages of _MAX_OBJECTS/2 objects each exactly reach the
-    object-count cap in far fewer than _MAX_PAGES requests — proving the
-    object cap (not just the page cap) independently stops the loop."""
-    page_size = _MAX_OBJECTS // 2
+async def test_query_class_fetch_all_empty_page_before_the_total_is_incomplete(caplog):
+    """The APIC says 1000 and then serves an empty page after 200.
+
+    The loop must stop (not request page after empty page), must not claim the
+    result complete, and must say why in the log. An empty page that counted as
+    "the natural end" would hand back 200 of 1000 as a finished answer.
+    """
     client = _make_client(
-        _bd_page([f"p0-{i}" for i in range(page_size)], 999999),
-        _bd_page([f"p1-{i}" for i in range(page_size)], 999999),
-        _bd_page([f"p2-{i}" for i in range(page_size)], 999999),  # unused — proves early stop
+        *_bd_set(200, reported=1000),
+        _bd_page([], 1000),
+        _bd_page(["never-asked-for"], 1000),
     )
-    result = await client.query_class("fvBD", {}, limit=page_size, fetch_all=True)
-    assert len(result.objects) == _MAX_OBJECTS
-    assert result.total_available == 999999
+    with caplog.at_level("WARNING", logger="niwashi-mcp.apic"):
+        result = await client.query_class("fvBD", {}, fetch_all=True)
+
+    assert len(result.objects) == 200
+    assert result.total_available == 1000
     assert result.complete is False
-    assert len(client._client.requests) == 2
+    assert len(client._client.requests) == 2, "kept paging past an empty page"
+    assert "incomplete" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_short_page_before_the_total_is_incomplete():
+    """A short page is the natural end only when nothing says otherwise. Here
+    totalCount promised 450 and the walk ran dry at 350."""
+    client = _make_client(*_bd_set(350, reported=450))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == 350
+    assert result.total_available == 450
+    assert result.complete is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [None, "n/a", ""], ids=["absent", "text", "blank"])
+async def test_query_class_fetch_all_without_a_usable_total_trusts_the_short_page(missing):
+    """No totalCount (absent, or not a number) means no figure to check the walk
+    against, so the short page is all the evidence there is — what this loop
+    always trusted. It must keep walking past FULL pages (a fallback of "what I
+    have so far" would stop after page one) and report the fetched count."""
+    client = _make_client(*_bd_set(450, reported=missing))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == 450
+    assert result.total_available == 450  # the fetched count, the usual fallback
+    assert result.complete is True
+    assert len(client._client.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_without_a_total_never_claims_a_capped_walk_complete():
+    """No totalCount, and the set never ends: after _MAX_PAGES full pages there
+    is no evidence the set is exhausted, so complete must be False."""
+    pages = [
+        _bd_page([f"p{p}-{i}" for i in range(_FETCH_ALL_PAGE_SIZE)], None)
+        for p in range(_MAX_PAGES + 2)
+    ]
+    client = _make_client(*pages)
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == _MAX_OBJECTS
+    assert result.complete is False
+    assert len(client._client.requests) == _MAX_PAGES
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_remembers_the_total_from_an_earlier_page():
+    """totalCount reported on page 0 and omitted from a later page still governs.
+
+    Page 0 promises 450; the short last page, which omits the field, delivers
+    only 300 in all. Forgetting the figure would read that short page as a
+    natural end and call the walk complete, with 150 objects missing and
+    `total_available` quietly shrinking to what was fetched.
+    """
+    first = _bd_set(450)[0]
+    last = _bd_page([f"n{i}" for i in range(200, 300)], None)
+    client = _make_client(first, last)
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+    assert len(result.objects) == 300
+    assert result.total_available == 450
+    assert result.complete is False
 
 
 @pytest.mark.asyncio
@@ -897,7 +1089,7 @@ async def test_count_class_retries_on_500_then_succeeds():
 # which proves the loop *honours* whatever the constants say and can never
 # notice their values changing. Measured: 25 → 250 and 5000 → 50000 both pass.
 # These bounds are what stops a fabric-wide scan from being unbounded, and the
-# tool docstrings promise an agent that a capped answer stops "in the thousands".
+# tool docstrings tell an agent what they are.
 
 
 @pytest.mark.asyncio
@@ -952,15 +1144,52 @@ def test_the_fetch_all_caps_hold_the_values_the_tools_promise():
 
     Every other cap test imports these constants and asserts against them, so
     they measure that the loop honours the cap — never what the cap is. Raising
-    `_MAX_PAGES` tenfold passes all of them. These two numbers are the only
-    thing bounding a fabric-wide scan with no `scope_dn`, and `query`'s docstring
-    tells an agent a capped fetch stops at "thousands of objects": a change here
-    is a change to what the server promises, so it should be deliberate and
-    arrive with its own diff.
+    `_MAX_OBJECTS` tenfold passes all of them. These numbers are the only thing
+    bounding a fabric-wide scan with no `scope_dn`, and `query`'s docstring
+    tells an agent exactly what they are: a change here is a change to what the
+    server promises, so it should be deliberate and arrive with its own diff.
     """
-    assert _MAX_PAGES == 25
+    assert _FETCH_ALL_PAGE_SIZE == 200
     assert _MAX_OBJECTS == 5000
+    assert _MAX_PAGES == 25
     assert 1_000 <= _MAX_OBJECTS < 100_000, "no longer 'thousands', as the tool docstring says"
+
+
+def test_the_fetch_all_cap_lands_on_a_page_boundary():
+    """The three constants must agree, or the cap stops being exact.
+
+    `_MAX_PAGES` is derived from the other two, so the loop's bound and the
+    object cap are one limit stated twice. If the object cap were not a
+    multiple of the page size, the last page would overshoot it and the cap
+    would be a number the server does not keep — or objects would have to be
+    fetched and then discarded.
+    """
+    assert _MAX_OBJECTS % _FETCH_ALL_PAGE_SIZE == 0
+    assert _MAX_PAGES * _FETCH_ALL_PAGE_SIZE == _MAX_OBJECTS
+    assert _FETCH_ALL_PAGE_SIZE <= 200, "above the page-size `query` clamps its own limit to"
+
+
+def test_the_fetch_all_numbers_quoted_to_the_agent_match_the_constants():
+    """The prose an agent reads must state the cap and page size the code keeps.
+
+    The docstrings cannot be f-strings, so "5,000" and "200" are typed twice.
+    This is the thing that fails when only one side moves.
+    """
+    import inspect
+
+    from niwashi_mcp import main as main_mod
+
+    cap = f"{_MAX_OBJECTS:,}"
+    page = f"{_FETCH_ALL_PAGE_SIZE} objects per page"
+    query_doc = inspect.getdoc(main_mod.query) or ""
+    for name, text in (
+        ("instructions", main_mod.mcp.instructions),
+        ("query docstring", query_doc),
+    ):
+        assert cap in text, f"{name} no longer states the {cap}-object fetch_all cap"
+    assert page in query_doc, (
+        f"query's docstring no longer states the fetch_all page size ({page})"
+    )
 
 
 def test_non_numeric_total_count_falls_back_rather_than_reporting_zero():
