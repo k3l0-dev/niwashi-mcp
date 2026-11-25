@@ -141,7 +141,7 @@ Any code written against the older (pre-envelope) shape of this doc needs updati
 | `SecretAttributeError` | `filters`, `order_by` or a `filter_expr` operand uses an attribute that holds a secret, `dn`/`rn` of a class named by one, or an audit record's `changeSet`. Raised whatever `NIWASHI_MCP_STRICT_ATTRIBUTES` is set to, before the APIC is called. See [Secrets](#secrets). |
 | `SecretDnError` | `scope_dn`, a `filters` value or `filter_expr` spells a DN that names an object by a secret (`.../community-<string>`). Refused on its shape alone, whether or not the object exists. |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter *values* are always escaped, never rejected — this can only be raised by an identifier, not a value. |
-| `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
+| `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Also raised for a filter value the APIC refuses (it answers `eq`/`ne` on a value outside the attribute's allowed set with an HTTP `301` and an error body — not a redirect), and for any `error` object in the answer. Carries the HTTP status and, when present, the APIC error code and text. |
 
 ---
 

@@ -144,7 +144,7 @@ if obj.get("found") is False:
 | `SecretDnError` | `dn` names an object by a secret — an SNMP community profile, a login session, a JWT site. Raised on the DN's shape alone, before the APIC is called, so it is the same answer for a DN that exists and one that does not. |
 | `UnknownClassError` | A class in `include_children` is not in the catalogue. Raised before anything is sent. Not raised when attribute checking is relaxed (see [Child classes are checked](#child-classes-are-checked)). |
 | `UnknownAttributeError` | A name in `fields` is not a property of the returned object's class nor of any `include_children` class. Raised after the fetch. Not raised when attribute checking is relaxed (see [Field projection](#field-projection)). |
-| `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed DN string, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. Note: a DN that is well-formed but points to nothing does **not** raise — it returns `{"found": False, ...}` (see [Return value](#return-value)). |
+| `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed DN string, or a transient 5xx that never recovered. Also raised for any `error` object in the answer, whatever the HTTP status, and for a 3xx (never followed): a refusal is never reported as `found: False`. Carries the HTTP status and, when present, the APIC error code and text. Note: a DN that is well-formed but points to nothing does **not** raise — it returns `{"found": False, ...}` (see [Return value](#return-value)). |
 
 ---
 

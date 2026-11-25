@@ -81,27 +81,77 @@ _MAX_PAGES = _MAX_OBJECTS // _FETCH_ALL_PAGE_SIZE
 _TRANSIENT_STATUSES = frozenset({404, 500, 502, 503, 504})
 
 
-def _extract_apic_error_text(resp: httpx.Response) -> str:
-    """Best-effort extraction of the human-readable APIC error message.
+# How much of an APIC error code or text is kept. The text is the APIC's own
+# sentence about the request ("Incorrect filter format for fvBD.unicastRoute,
+# value 'False' is not valid"), usually one line of under a hundred characters;
+# this is a ceiling for the day one is not.
+_MAX_ERROR_TEXT = 500
 
-    APIC embeds a reason for 4xx/5xx failures (malformed filter, unknown DN,
-    internal error, ...) at `imdata[0].error.attributes.text` in the response
-    body. This is opportunistic: any shape mismatch (non-JSON body, empty
-    imdata, missing keys) simply yields "" rather than raising, since the
-    caller (ApicRequestError) already has a usable message from the HTTP
-    status alone.
 
-    Args:
-        resp: The httpx response object for the failed request.
+def _clean_apic_text(value: object) -> str:
+    """An APIC error code or text as one bounded line, or "" when it is not text.
+
+    Both come off the wire and end up in a tool error and in logs, so control
+    characters are dropped, every run of whitespace (newlines included) becomes
+    a single space, and the length is capped. Anything that is not a string or
+    an integer is treated as absent rather than formatted: an error whose shape
+    is not the APIC's is still an error, it just has nothing to quote.
+    """
+    if not isinstance(value, (str, int)):
+        return ""
+    text = " ".join(
+        "".join(ch for ch in str(value) if ch.isprintable() or ch.isspace()).split()
+    )
+    return text if len(text) <= _MAX_ERROR_TEXT else text[: _MAX_ERROR_TEXT - 1] + "…"
+
+
+def _apic_errors(body: object) -> list[tuple[str, str]]:
+    """The (code, text) of every `error` object among a body's `imdata` items.
+
+    The APIC answers a request it refused with an `imdata` whose item is an
+    error object — `{"error": {"attributes": {"code": "301", "text": "..."}}}` —
+    and a `totalCount` of "1". It is not a managed object, and must never be
+    parsed as one. Opportunistic about shape: a body that is not JSON-shaped
+    like that, or an error object without attributes, yields "" for what is
+    missing instead of raising, so the caller can still raise on the error.
 
     Returns:
-        The APIC-supplied error text, or "" when unavailable.
+        One pair per error item, in order; empty when there is none.
     """
+    imdata = body.get("imdata") if isinstance(body, dict) else None
+    if not isinstance(imdata, list):
+        return []
+    errors: list[tuple[str, str]] = []
+    for item in imdata:
+        if not isinstance(item, dict) or "error" not in item:
+            continue
+        error = item["error"]
+        attributes = error.get("attributes") if isinstance(error, dict) else None
+        if not isinstance(attributes, dict):
+            attributes = {}
+        errors.append(
+            (_clean_apic_text(attributes.get("code")), _clean_apic_text(attributes.get("text")))
+        )
+    return errors
+
+
+def _request_error(url: str, status: int, body: object) -> ApicRequestError:
+    """The ApicRequestError for a refused request, quoting the APIC's reason if it gave one.
+
+    Only the first error object is quoted: the APIC sends one, and the others
+    would only be a longer message.
+    """
+    errors = _apic_errors(body)
+    code, text = errors[0] if errors else ("", "")
+    return ApicRequestError(url, status, text, code)
+
+
+def _error_body(resp: httpx.Response) -> object:
+    """The decoded body of an error response, or None when it is not JSON."""
     try:
-        body = resp.json()
-        return body["imdata"][0]["error"]["attributes"]["text"]
-    except (ValueError, KeyError, IndexError, TypeError):
-        return ""
+        return resp.json()
+    except ValueError:
+        return None
 
 
 # Characters and shapes that must never reach the path of an APIC URL. A DN is
@@ -223,7 +273,13 @@ class ApicClient:
         self._user = user
         self._password = password
         self._base = f"https://{host}"
-        self._client = httpx.AsyncClient(verify=verify_ssl, timeout=timeout)
+        # Redirects are never followed. httpx's default is already False; it is
+        # set so the rule does not rest on a default. The APIC's 3xx is not a
+        # redirect (see ApicRequestError), and a real one would send this
+        # session's cookie somewhere this client was not pointed at.
+        self._client = httpx.AsyncClient(
+            verify=verify_ssl, timeout=timeout, follow_redirects=False
+        )
         self._retry_attempts = retry_attempts
         self._retry_backoff_base = retry_backoff_base
 
@@ -487,10 +543,15 @@ class ApicClient:
             ApicRequestError:  APIC returned a non-2xx, non-auth status that
                                persisted across the retry budget — e.g. 400
                                for a malformed filter_expr (never retried,
-                               since it is a permanent error), or a transient
-                               500/502/503/504/404 that never recovered.
+                               since it is a permanent error), a 3xx for a
+                               filter value invalid for its attribute (never
+                               followed, never read as data), or a transient
+                               500/502/503/504/404 that never recovered — or
+                               a 2xx whose imdata holds an `error` object.
                                Carries the HTTP status and, when present, the
-                               APIC-supplied error text.
+                               APIC's error code and text. On any page of a
+                               fetch_all walk it ends the walk: no partial
+                               QueryResult is returned.
             ApicResponseError: The response body is not valid JSON, or is
                                missing the expected 'imdata' key.
         """
@@ -676,12 +737,19 @@ class ApicClient:
         one-shot step nested inside each attempt and is unaffected by this
         retry budget either way.
 
+        A body is returned only when the status is 2xx and `imdata` is a list
+        with no `error` object in it — which is what lets every caller parse
+        `imdata` as managed objects, and read `totalCount` as a count. The
+        APIC refuses a request with an error object, not always with a status
+        a client would notice: it answers an invalid filter value with a 301.
+
         Args:
             url:    Absolute APIC URL to GET.
             params: Query-string parameters.
 
         Returns:
-            The decoded response body — a dict guaranteed to carry an "imdata" key.
+            The decoded response body — a dict whose "imdata" is a list of
+            managed-object items, never of error objects.
 
         Raises:
             ApicConnectionError: Host unreachable or request timed out, after
@@ -691,11 +759,16 @@ class ApicClient:
                                  re-auth, since a bad credential won't fix
                                  itself on a second attempt.
             ApicRequestError:    APIC returned a non-2xx, non-auth status that
-                                 was either permanent (e.g. 400) or transient
-                                 but never recovered within the retry budget.
-                                 Carries the HTTP status and, when present,
-                                 the APIC-supplied error text.
-            ApicResponseError:   Body is not valid JSON or lacks 'imdata'.
+                                 was either permanent (e.g. 400, or the 3xx it
+                                 uses for an invalid filter value — redirects
+                                 are not followed) or transient but never
+                                 recovered within the retry budget; or answered
+                                 2xx with an `error` object among the imdata
+                                 items, alone or mixed with data rows. Carries
+                                 the HTTP status and, when present, the APIC's
+                                 error code and text.
+            ApicResponseError:   Body is not valid JSON, lacks 'imdata', or has
+                                 an 'imdata' that is not a list.
         """
         logger.debug("GET %s params=%s", url, params)
         last_exc: ApicConnectionError | None = None
@@ -714,30 +787,45 @@ class ApicClient:
                     continue
                 raise
 
-            if resp.status_code in _TRANSIENT_STATUSES:
+            status = resp.status_code
+            if status in _TRANSIENT_STATUSES:
                 if attempt < self._retry_attempts:
                     logger.warning(
                         "APIC returned transient status %d (attempt %d/%d) — retrying",
-                        resp.status_code, attempt, self._retry_attempts,
+                        status, attempt, self._retry_attempts,
                     )
                     await asyncio.sleep(self._backoff_delay(attempt))
                     continue
-                raise ApicRequestError(
-                    url, resp.status_code, _extract_apic_error_text(resp)
-                )
+                raise _request_error(url, status, _error_body(resp))
 
-            if resp.status_code >= 400:
-                raise ApicRequestError(
-                    url, resp.status_code, _extract_apic_error_text(resp)
-                )
+            # Anything but 2xx is a failure from here on — 3xx included. It is
+            # never parsed as data: the APIC's 301 carries an error object whose
+            # totalCount of "1" is what count() used to report.
+            if not 200 <= status < 300:
+                raise _request_error(url, status, _error_body(resp))
 
             try:
                 body = resp.json()
             except ValueError as exc:
                 raise ApicResponseError(url, f"response is not valid JSON: {exc}") from exc
 
-            if "imdata" not in body:
+            if not isinstance(body, dict) or "imdata" not in body:
                 raise ApicResponseError(url, "response body missing 'imdata' key")
+            if not isinstance(body["imdata"], list):
+                raise ApicResponseError(url, "response 'imdata' is not a list")
+
+            # A 2xx whose imdata holds an error object is a refusal all the
+            # same, and so is one that mixes error objects with data rows: the
+            # rows of an answer that also says "no" cannot be trusted as the
+            # whole answer, and are dropped rather than returned beside it.
+            if errors := _apic_errors(body):
+                if len(errors) < len(body["imdata"]):
+                    logger.warning(
+                        "APIC answered HTTP %d with %d error object(s) among %d "
+                        "imdata item(s) — discarding the response",
+                        status, len(errors), len(body["imdata"]),
+                    )
+                raise _request_error(url, status, body)
 
             return body
 

@@ -265,7 +265,8 @@ The table below describes the read path (`_request_json()`). See [exceptions.md]
 |---|---|
 | `httpx.TimeoutException` / `httpx.ConnectError` | `ApicConnectionError`, once the retry budget is exhausted — but immediately, on the first failure, when raised from `authenticate()` |
 | `resp.status_code in (401, 403)` | triggers re-auth; then `ApicAuthError` if still failing |
-| `resp.status_code` non-2xx, non-401/403 (e.g. 400, or transient 404/500/502/503/504 that never recovered) | `ApicRequestError` — carries the HTTP status and, when present, the APIC-supplied error text |
+| `resp.status_code` non-2xx, non-401/403 (e.g. 400, a 3xx, or transient 404/500/502/503/504 that never recovered) | `ApicRequestError` — carries the HTTP status and, when present, the APIC's error code and text. A 3xx is not a redirect: the APIC answers an `eq`/`ne` filter value that is invalid for its attribute with a `301` and an error body, and redirects are never followed |
+| status 2xx, but an `error` object among the `imdata` items (alone, or mixed with data rows) | `ApicRequestError` — same fields; a mixed answer is discarded whole, with a logged warning |
 | `resp.json()` raises `ValueError` | `ApicResponseError` |
-| `"imdata"` missing from body | `ApicResponseError` |
+| `"imdata"` missing from body, or not a list | `ApicResponseError` |
 | login body carries no `imdata[0].aaaLogin.attributes.token` | `ApicResponseError` — from `authenticate()` only |

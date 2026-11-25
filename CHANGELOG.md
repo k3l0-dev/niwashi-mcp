@@ -391,6 +391,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Fixed
 
+- **A request the APIC refused was read as data: `count` returned 1, `query`
+  returned an error row marked `complete: true`.** The client raised only on an
+  HTTP status of 400 or more and parsed the body of everything else. The APIC
+  does not always refuse with such a status. On 6.0(9c), an `eq` or `ne` filter
+  whose value is not valid for its attribute (`eq(faultInst.code,"F0526")`,
+  `eq(fvBD.unicastRoute,"False")`, `eq(faultInst.severity,"huge")`: attributes
+  with a fixed set of values) is answered `HTTP/1.1 301 Moved Permanently`,
+  with no `Location` header and the body `{"totalCount": "1", "imdata":
+  [{"error": {"attributes": {"code": "301", "text": "Incorrect filter format
+  for faultInst.code, value 'F0526' is not valid"}}}]}`. The 301 is the APIC's
+  own error code reused as the status line; it is not a redirect (the same
+  request repeated gives the same answer, and `wcard` on the same attribute is
+  not validated and answers normally). Parsed as data, that body became
+  `count: 1` (its `totalCount`), a result row of class `error` with
+  `complete: true` (the error object read as a managed object), a `get_by_dn`
+  that "found" an object of class `error`, and a `fetch_all` that ended on it.
+  An agent counting fault codes with `eq` received thirteen bogus counts of 1
+  for codes the fabric has none of, while `wcard` on the same codes said 0. This
+  affected `main` as well as this branch: the status check is the same there.
+
+  The client now fails loudly, on every read it makes (one page, every page of a
+  `fetch_all` walk, `count`, both requests of `count(group_by=...)`, `get_by_dn`
+  found or not, `include_children`, the controller version):
+
+  - **Any status that is not 2xx raises `ApicRequestError`** unless it is
+    handled earlier: 401/403 still re-authenticate once and retry, and the
+    transient list (404, 500, 502, 503, 504) is still retried. That adds 3xx
+    (4xx and 5xx already raised). Redirects are never followed: the APIC's 3xx
+    carries none, and following one would send the session cookie to wherever
+    it pointed. This was already httpx's default; it is now set explicitly and
+    pinned by a test.
+  - **An `error` object in `imdata` raises `ApicRequestError` whatever the
+    status**, including a 200, and including a body that mixes error objects
+    with data rows (the rows are discarded and a warning is logged: the answer
+    that also says "no" is not trusted as the whole answer).
+  - A malformed envelope (a body that is not an object, or an `imdata` that is
+    not a list) is an `ApicResponseError`, as a missing `imdata` already was.
+
+  What an agent sees: a tool error such as `APIC request to
+  https://…/api/class/faultInst.json failed with HTTP 301: Incorrect filter
+  format for faultInst.code, value 'F0526' is not valid`, where it saw a number
+  or a row. **A filter that used to answer 1 or an error row now raises**; to ask
+  whether a fault code is present, `count` it with `wcard` (or `group_by="code"`)
+  rather than `eq`, since `eq` is checked against the attribute's allowed values.
+  `ApicRequestError` gains `apic_code` (the APIC's own code) next to `status` and
+  `apic_text`, and the message adds `(APIC error code N)` when it differs from
+  the status. Both are cut to one line and 500 characters: they come off the
+  wire. Nothing secret can be in them that the caller did not send: a predicate
+  on a secret attribute, or a value spelling a secret DN, is refused before any
+  request is made, so the APIC never has the value to echo.
+
 - **`fetch_all` capped a "fetch everything" call at 500 objects, not the 5,000
   it advertised.** It paged by the caller's `limit` and stopped after 25 pages,
   so the default `limit=20` ended a call at 25 x 20 = 500 objects and reported

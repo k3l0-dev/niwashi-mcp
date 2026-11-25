@@ -23,7 +23,9 @@ NiwashiMcpError
     ├── ApicAuthError         — authentication failed (bad credentials or server error)
     ├── ApicConnectionError   — APIC unreachable (network error or timeout)
     ├── ApicResponseError     — APIC returned an unexpected or malformed response
-    └── ApicRequestError      — APIC rejected the request (400/404/500/... — non-auth)
+    └── ApicRequestError      — APIC rejected the request: any non-2xx answer other than
+                                401/403 (400/404/500/..., and the 3xx the APIC uses for
+                                an invalid filter value), or an `error` object in imdata
 """
 
 
@@ -311,28 +313,47 @@ class ApicResponseError(ApicError):
 
 
 class ApicRequestError(ApicError):
-    """APIC rejected a request with a non-2xx, non-authentication status.
+    """APIC rejected a request — by its HTTP status, or by what the body says.
 
-    Raised by ApicClient.query_class(), get_by_dn(), and count_class() (all
-    three share the same request path) for any status code other than
-    401/403 (which trigger the re-auth-and-retry flow instead) — typically
-    400 for a malformed filter_expr or query-target-filter, or a transient
-    404/500/502/503/504 that never recovered within the retry budget (a
-    permanent status like 400 is raised on the first attempt; a transient
-    one is retried a bounded number of times first — see
-    ApicClient.__init__'s retry_attempts).
+    Raised by ApicClient.query_class(), get_by_dn(), count_class() and
+    controller_version() (all four share the same request path) in two cases:
 
-    Carries the raw HTTP status and, when the response body follows APIC's
-    usual error shape (`imdata[0].error.attributes.text`), the human-readable
-    reason APIC supplied — so an LLM caller gets an actionable message
-    instead of an opaque httpx.HTTPStatusError.
+    * a status that is not 2xx and not 401/403 (those trigger the re-auth-and-
+      retry flow instead) — typically 400 for a malformed filter_expr or
+      query-target-filter, or a transient 404/500/502/503/504 that never
+      recovered within the retry budget (a permanent status like 400 is raised
+      on the first attempt; a transient one is retried a bounded number of
+      times first — see ApicClient.__init__'s retry_attempts). That includes
+      3xx. The APIC does answer 3xx, but never as a redirect: it reuses its own
+      error code as the HTTP status, so a filter value that is not valid for
+      its attribute ("Incorrect filter format for faultInst.code, value 'F0526'
+      is not valid") arrives as a `301 Moved Permanently` with no Location
+      header and an error body. The client does not follow redirects, and a 3xx
+      is never read as data.
+    * an `error` object among the `imdata` items, whatever the HTTP status: the
+      APIC's reply to a request it refused is an error object, and a client that
+      read it as an object would report an error row as a result, and its
+      `totalCount` of "1" as a count.
+
+    Carries the raw HTTP status and, when the response body follows APIC's usual
+    error shape (`imdata[n].error.attributes.{code,text}`), the APIC's own code
+    and the human-readable reason — so an LLM caller gets an actionable message
+    instead of an opaque httpx.HTTPStatusError. Both are single-line and
+    length-bounded: they come from the wire, and end up in a tool error and a log.
     """
 
-    def __init__(self, url: str, status: int, apic_text: str = "") -> None:
+    def __init__(
+        self, url: str, status: int, apic_text: str = "", apic_code: str = ""
+    ) -> None:
         self.url = url
         self.status = status
         self.apic_text = apic_text
+        self.apic_code = apic_code
         msg = f"APIC request to {url} failed with HTTP {status}"
+        # The APIC often repeats its code as the HTTP status; say it only when
+        # it adds something (an error object carried by a 200, or code 121 on a 400).
+        if apic_code and apic_code != str(status):
+            msg += f" (APIC error code {apic_code})"
         if apic_text:
             msg += f": {apic_text}"
         super().__init__(msg)

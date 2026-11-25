@@ -171,7 +171,7 @@ With `group_by`, objects are redacted **before** they are tallied, so a group ke
 | `SecretAttributeError` | `filters`, `filter_expr` or `group_by` uses an attribute that holds a secret (or `dn`/`rn` of a class named by one, or an audit record's `changeSet`). Raised whatever `NIWASHI_MCP_STRICT_ATTRIBUTES` is set to. |
 | `SecretDnError` | `scope_dn`, a filter value or `filter_expr` spells a DN that names an object by a secret. |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter values are always escaped, never rejected. |
-| `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
+| `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Also raised for a filter value the APIC refuses (it answers `eq`/`ne` on a value outside the attribute's allowed set with an HTTP `301` and an error body — not a redirect), and for any `error` object in the answer. Carries the HTTP status and, when present, the APIC error code and text. |
 
 ---
 

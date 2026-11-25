@@ -112,7 +112,9 @@ classDiagram
         +str url
         +int status
         +str apic_text
-        Non-2xx, non-auth status (400, or exhausted-retry 404/500/502/503/504)
+        +str apic_code
+        Non-2xx, non-auth status (400, a 3xx, or exhausted-retry 404/500/502/503/504),
+        or an error object in imdata whatever the status
         Raised by the shared _request_json() path
     }
 
@@ -157,7 +159,7 @@ Module paths below are relative to `mcp/src/niwashi_mcp/`.
 | `ApicAuthError` | `apic/client.py` | `authenticate()`: the login POST came back non-2xx. `_send()`: the request was still 401/403 after a re-authentication round-trip |
 | `ApicConnectionError` | `apic/client.py` | `httpx.TimeoutException` or `httpx.ConnectError`. `authenticate()` has no retry loop and raises on the first failure; the read path (`query_class()`, `get_by_dn()`, `count_class()`, all through `_request_json()`) raises only once the retry budget is exhausted |
 | `ApicResponseError` | `apic/client.py` | `authenticate()`: login body is not JSON, or carries no token. `_request_json()`: body is not valid JSON, or has no `imdata` key |
-| `ApicRequestError` | `apic/client.py` `_request_json()` | Non-2xx, non-auth status — a permanent one such as 400 on the first attempt, or a transient 404/500/502/503/504 that never recovered within the retry budget. Carries the status and, when the body follows APIC's error shape, its text |
+| `ApicRequestError` | `apic/client.py` `_request_json()` | Non-2xx, non-auth status — a permanent one such as 400 on the first attempt, a 3xx (the APIC answers an invalid filter value with a `301` that is not a redirect; redirects are never followed), or a transient 404/500/502/503/504 that never recovered within the retry budget. Also an `error` object among `imdata`, alone or mixed with data rows, whatever the status. Carries the status and, when the body follows APIC's error shape, its code (`apic_code`) and text (`apic_text`), each cut to one line of at most 500 characters |
 
 `DescriptionsLoadError` surfaces the first time the catalogue connection is opened, and never again — the connection is opened lazily and cached for the process. In a running server that first time is startup, when the lifespan builds the search index; the connection is nevertheless reached through every catalogue call, which is why `get_schema()` documents the exception too. Whichever caller triggers it, the condition is an installation failure rather than a user error, and the message carries the resolved path and the fix: `pip install --force-reinstall niwaki`.
 
