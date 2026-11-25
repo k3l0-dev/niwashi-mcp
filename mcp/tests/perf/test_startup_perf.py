@@ -107,19 +107,42 @@ class TestFootprint:
         """Two structures live for the process lifetime, by design.
 
         The catalogue connection holds the string pools; the tokenised search
-        index holds ~15,239 entries. Measured here: ~45 MB for the index, ~93 MB
-        more once tokenised, ~159 MB resident in total.
+        index holds ~15,239 entries. Measured in a fresh interpreter that has
+        imported the server and warmed the index: ~198 MB, of which ~160 MB is
+        the catalogue and the index and ~38 MB the server's own import tree
+        (FastMCP and the MCP SDK).
 
         The ceiling matters because a deployment with a memory limit gets a
         SIGKILL, not an exception — CPython does not read cgroup limits, so the
         process simply disappears with exit 137, no traceback and no log line.
-        """
-        index = catalog.descriptions_index()
-        search("bridge domain", index, limit=10)
 
-        rss = _rss_mb()
+        Measured in a subprocess, like the cold-start test above, because
+        `ru_maxrss` is a high-water mark. Read from the pytest process it
+        reports whatever the *whole run* peaked at — every fixture, every index
+        another test built, every module another test imported — so it moved
+        with test order and machine load, not with the server (488 to 516 MB
+        against a 500 MB limit, on the same code). The subprocess holds exactly
+        what a deployed server holds and nothing else.
+        """
+        code = (
+            "import resource;"
+            "import niwashi_mcp.main;"
+            "from niwashi_mcp.registry import catalog;"
+            "from niwashi_mcp.registry.descriptions import search;"
+            "i=catalog.descriptions_index();"
+            "search('bridge domain', i, limit=10);"
+            "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)"
+        )
+        raw = float(
+            subprocess.run(
+                [sys.executable, "-c", code], capture_output=True, text=True, check=True
+            ).stdout.split()[-1]
+        )
+        # ru_maxrss is bytes on macOS, KiB on Linux.
+        rss = raw / 1e6 if sys.platform == "darwin" else raw / 1e3
+
         assert rss < 500, (
-            f"resident set is {rss:.0f} MB. Measured at ~159 MB; this allows 3x "
+            f"resident set is {rss:.0f} MB. Measured at ~198 MB; this allows 2.5x "
             f"for interpreter and platform differences. Past it, a 512 MB "
             f"container limit is a coin toss."
         )
