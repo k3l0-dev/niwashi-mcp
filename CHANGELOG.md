@@ -179,6 +179,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Changed
 
+- **niwaki 1.8 → 2.2: the object model is the same, the catalogue is 10 MB
+  lighter.** `niwaki>=2.2,<2.3`, still a single minor. The one thing that moved
+  under this server is the private table it reads properties from: 2.1 replaced
+  `prop` (one row per class and property) with `prop_sig` (one row per distinct
+  property signature, 25,901 of them) and `class_prop` (which classes carry
+  which signature, the same 332,297 memberships). `catalog.py` now reads the
+  join, `verify_catalogue()` requires both tables, and the startup guard's
+  messages name the new pin. Everything else this server reads — the other
+  tables, the blob encodings, the manifest keys, 15,452 classes, APIC 6.0(9c) —
+  is unchanged, and the catalogue is 25,993,216 bytes instead of 36,229,120
+  (the wheel 16.8 MB instead of 18.8 MB).
+
+  Checked rather than assumed: the joined rows equal the old `prop` rows
+  exactly (332,297 of 332,297, every column), the rebuilt search index is
+  byte-identical to the recording, and the baseline passes unmodified. One
+  difference had to be handled: `prop` was keyed by `(class_id, wire_name)`, so
+  rows came back sorted by wire name without asking; `class_prop` returns them
+  in signature order. Search-index labels are built in that order, so
+  `prop_labels` now says `ORDER BY wire_name`, and a test checks the order
+  against the raw rows. Without it the digest test fails — the index changes —
+  but a bare "the index changed" says nothing about why.
+
 - **An attribute the catalogue does not know is now refused instead of sent —
   a behaviour change for every `query` and `count` caller.** Before,
   `query("fvBD", filters={"arpFlod": "yes"})` went to the APIC, which answered

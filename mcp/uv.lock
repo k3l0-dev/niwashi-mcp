@@ -712,7 +712,7 @@ wheels = [
 
 [[package]]
 name = "niwaki"
-version = "1.8.0"
+version = "2.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -721,9 +721,9 @@ dependencies = [
     { name = "stamina" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f6/4d/18f1637cdd346da2dce8dd35d22a4af68e41f341922fcc92569126c6c0f9/niwaki-1.8.0.tar.gz", hash = "sha256:a73506ded5c66458814aeda48577721b48c535e6197a6fe915f60f2cdd3370e4", size = 16878990, upload-time = "2026-08-08T06:21:11.082Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fd/8b/67a6291ce3bc5e8ff93fcbb26e1e79cd54f4a9ce86e6b407b4efeb104a56/niwaki-2.2.0.tar.gz", hash = "sha256:1896e30708d4f988fd9dd1b95d39f26dedaf18fc2b18144b8ff9dbf0d1333a50", size = 14887915, upload-time = "2026-11-25T08:32:39.975Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/62/f1/d068d01c6b4cdf69f48497c567d1c18e997f8bb5bbcdc9e8969f2e40cab6/niwaki-1.8.0-py3-none-any.whl", hash = "sha256:e20d436ca7b0d8208138518271e05d3e3cba408b6e90ff4d5a3e244765c99620", size = 18769129, upload-time = "2026-08-08T06:21:08.116Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/23/e649507c82e6f5925f868ff552223571d8d35d66dcd6c010c0f515079e8f/niwaki-2.2.0-py3-none-any.whl", hash = "sha256:ad0c1d582ff60418448a6a3d44c38942ab882e47d36c200d9e6886d9472c2654", size = 16786445, upload-time = "2026-11-25T08:32:36.574Z" },
 ]
 
 [[package]]
@@ -749,7 +749,7 @@ dev = [
 requires-dist = [
     { name = "fastmcp", specifier = ">=3.4.10,<4.0" },
     { name = "httpx", specifier = ">=0.27,<1.0" },
-    { name = "niwaki", specifier = ">=1.8,<1.9" },
+    { name = "niwaki", specifier = ">=2.2,<2.3" },
     { name = "python-dotenv", specifier = ">=1.0,<2.0" },
 ]
 

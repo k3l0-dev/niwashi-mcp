@@ -90,9 +90,12 @@ def test_every_property_detail_key_documented_can_actually_appear():
     instead of silently appearing.
     """
     bits = catalog._flag_bits()
-    total = catalog._query("SELECT COUNT(*) FROM prop")[0][0]
+    # Counted per (class, property) as the old `prop` table was: through the
+    # join, not over `prop_sig`, which holds each distinct signature only once.
+    join = "class_prop cp JOIN prop_sig p ON p.id = cp.sig_id"
+    total = catalog._query(f"SELECT COUNT(*) FROM {join}")[0][0]
     with_bit = catalog._query(
-        "SELECT COUNT(*) FROM prop WHERE flags & ?", (bits["mandatory"],)
+        f"SELECT COUNT(*) FROM {join} WHERE p.flags & ?", (bits["mandatory"],)
     )[0][0]
 
     doc = _doc("get_schema")
@@ -260,7 +263,7 @@ def test_every_aci_name_skill_teaches_actually_exists():
     )
 
     classes = {r[0] for r in catalog._query("SELECT class_name FROM mo")}
-    properties = {r[0] for r in catalog._query("SELECT DISTINCT wire_name FROM prop")}
+    properties = {r[0] for r in catalog._query("SELECT DISTINCT wire_name FROM prop_sig")}
 
     # Every entry must carry its reason, and — asserted below — must still be
     # in use. An allowlist that only grows is how a lint stops linting.

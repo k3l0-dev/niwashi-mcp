@@ -5,7 +5,7 @@ variables, and one command.
 
 There is no repository to clone and no schema bundle to download. The ACI
 object model — 15 452 classes, generated from APIC **6.0(9c)** — ships as a
-single SQLite catalogue (36 229 120 bytes) inside the `niwaki` dependency, which
+single SQLite catalogue (25 993 216 bytes) inside the `niwaki` dependency, which
 `uv` fetches along with the rest of the wheel.
 
 ## Prerequisites
@@ -268,8 +268,8 @@ The command changed, and one whole step disappeared.
 | | 1.2.2 | 2.0 |
 |---|---|---|
 | Install | `git clone` + download the schema bundle + `tar` | `uvx niwashi-mcp` |
-| Download | 98.8 MB | 16.2 MB — the niwaki wheel |
-| Object model on disk | 1.83 GB across 15 452 files | one 36 229 120-byte file |
+| Download | 98.8 MB | 16.8 MB — the niwaki wheel |
+| Object model on disk | 1.83 GB across 15 452 files | one 25 993 216-byte file |
 | Start | `python main.py` | `niwashi-mcp` |
 
 The step that downloaded and extracted a jsonmeta bundle into `data/schemas/` is

@@ -199,7 +199,7 @@ no hand-written API work.
 
 The server does not ship the ACI object model, and it does not download one. It
 reads a SQLite catalogue embedded in its [`niwaki`](https://pypi.org/project/niwaki/)
-dependency — a single 36 MB file covering all **15,452** managed-object classes,
+dependency — a single 26 MB file covering all **15,452** managed-object classes,
 built from APIC **6.0(9c)**. `get_schema()` reads that file directly; the keyword
 index behind `search_classes()` is rebuilt from it once at startup.
 
@@ -209,8 +209,8 @@ unchanged; only the source of the data moved.
 | | 1.2.2 | 2.0 |
 |---|---|---|
 | Install | `git clone`, download a schema bundle, extract it | `uvx niwashi-mcp` |
-| Download | 98.8 MB tarball | the `niwaki` wheel (18.8 MB at 1.8.0) |
-| Object model on disk | 1.82 GB across 15,452 jsonmeta files | one 36 MB SQLite file |
+| Download | 98.8 MB tarball | the `niwaki` wheel (16.8 MB at 2.2.0) |
+| Object model on disk | 1.82 GB across 15,452 jsonmeta files | one 26 MB SQLite file |
 | Data directory to manage | `data/` | none |
 
 The APIC release is now pinned by the `niwaki` dependency rather than chosen by

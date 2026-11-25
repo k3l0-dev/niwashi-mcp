@@ -28,7 +28,7 @@ Two traps this module exists to avoid
    wire-only end to end: a readable name reaches the APIC, is syntactically
    valid, and returns ``[]`` with no error. Measured: 2,207 properties (4.4 % of
    configurable ones) would slip past ``filter.py``'s identifier regex. **No
-   readable name is ever read here.** ``prop.wire_name`` is the only source.
+   readable name is ever read here.** ``prop_sig.wire_name`` is the only source.
 2. **Two shapes leak if taken verbatim.** ``enum`` blobs carry a
    ``defaultValue`` marker entry whose ``localName`` is not an APIC-acceptable
    value (present on 90 % of enums), and ``comment_pool`` stores the string
@@ -61,7 +61,7 @@ _SCALAR_COLUMNS = (
     ("class_pkg", "classPkg"),
 )
 
-# Bit layout of `prop.flags`, read from manifest.prop_flags rather than
+# Bit layout of `prop_sig.flags`, read from manifest.prop_flags rather than
 # hard-coded: niwaki owns this layout and may extend it. Verified at import.
 _EXPECTED_FLAGS = (
     "isConfigurable",
@@ -74,6 +74,15 @@ _EXPECTED_FLAGS = (
     "implicit",
     "mandatory",
 )
+
+
+# A class's property rows. niwaki 2.1 stopped storing one row per (class,
+# property): each distinct signature — wire name, label, enum, type, flags,
+# everything but the class — is stored once in `prop_sig`, and `class_prop`
+# says which classes carry it. Every per-class property read goes through this
+# join (`cp.class_id` is `mo.id`, `p` is the signature). Neither table is
+# ordered by wire name, so a caller that needs an order says `ORDER BY`.
+_CLASS_PROPS = "class_prop cp JOIN prop_sig p ON p.id = cp.sig_id"
 
 
 def catalog_path() -> Path:
@@ -179,10 +188,11 @@ def apic_version() -> str:
 # Every table and column the queries below name. The catalogue's schema is
 # *private* to niwaki: its public API is `Niwaki`/`AsyncNiwaki`/`models`, and
 # none of these tables appear in it. niwaki is therefore free to restructure
-# them in any 1.x release without breaking SemVer — the dependency is pinned
-# `>=1.8,<1.9` for exactly that reason, but a pin is only advice: a resolver
-# override, a `--force-reinstall`, or a monorepo constraint can all put a
-# different catalogue underneath this module.
+# them in any release without breaking SemVer, and has: 2.1 replaced `prop`
+# (one row per class and property) with `prop_sig` + `class_prop` in a minor.
+# The dependency is pinned `>=2.2,<2.3` for exactly that reason, but a pin is
+# only advice: a resolver override, a `--force-reinstall`, or a monorepo
+# constraint can all put a different catalogue underneath this module.
 #
 # A renamed table fails loudly on its own (OperationalError). The dangerous
 # cases are the quiet ones — a repurposed column, a changed blob encoding —
@@ -195,10 +205,11 @@ _REQUIRED_TABLES: dict[str, frozenset[str]] = {
         | {"identified_by", "rn_format", "is_abstract", "is_configurable"}
         | {"residual", "dn_formats"}
     ),
-    "prop": frozenset(
-        {"class_id", "wire_name", "label_id", "comment_id", "enum_id"}
+    "prop_sig": frozenset(
+        {"id", "wire_name", "label_id", "comment_id", "enum_id"}
         | {"base_type_id", "model_type_id", "default_val", "flags"}
     ),
+    "class_prop": frozenset({"class_id", "sig_id"}),
     "comment_pool": frozenset({"id", "text"}),
     "label_pool": frozenset({"id", "text"}),
     "type_pool": frozenset({"id", "value"}),
@@ -232,7 +243,7 @@ def verify_catalogue() -> None:
     """Fail at startup if niwaki's private catalogue schema has moved.
 
     Structural first — every table and column the queries name, then the
-    manifest keys and the `prop.flags` bit layout — and then functional, by
+    manifest keys and the `prop_sig.flags` bit layout — and then functional, by
     decoding one known class end to end. The functional half is what catches an
     encoding change: if `residual` stopped being zlib+JSON, every column would
     still be present and every query would still run, and `containedBy` would
@@ -254,14 +265,14 @@ def verify_catalogue() -> None:
             raise DescriptionsLoadError(
                 f"niwaki {version}'s catalogue has no '{table}' table. "
                 f"This server reads the catalogue's private schema; that release "
-                f"restructured it. Pin niwaki>=1.8,<1.9."
+                f"restructured it. Pin niwaki>=2.2,<2.3."
             )
         have = {r[1] for r in _query(f"PRAGMA table_info({table})")}
         if missing := sorted(columns - have):
             raise DescriptionsLoadError(
                 f"niwaki {version}'s catalogue table '{table}' is missing {missing}. "
                 f"This server reads the catalogue's private schema; that release "
-                f"changed it. Pin niwaki>=1.8,<1.9."
+                f"changed it. Pin niwaki>=2.2,<2.3."
             )
 
     keys = {r[0] for r in _query("SELECT key FROM manifest")}
@@ -270,7 +281,7 @@ def verify_catalogue() -> None:
             f"niwaki {version}'s catalogue manifest is missing {missing}."
         )
 
-    _flag_bits()  # validates the prop.flags bit layout against _EXPECTED_FLAGS
+    _flag_bits()  # validates the prop_sig.flags bit layout against _EXPECTED_FLAGS
 
     # Functional: prove the decode paths still work rather than trusting that
     # unchanged column names imply unchanged contents.
@@ -290,7 +301,7 @@ def verify_catalogue() -> None:
     if broken := sorted(k for k, ok in checks.items() if not ok):
         raise DescriptionsLoadError(
             f"niwaki {version}'s catalogue resolves '{_PROBE_CLASS}' but {broken} "
-            f"came back empty — the stored encoding changed. Pin niwaki>=1.8,<1.9."
+            f"came back empty — the stored encoding changed. Pin niwaki>=2.2,<2.3."
         )
 
     # Read through the uncached collector: a cached union from an earlier, healthy
@@ -301,7 +312,7 @@ def verify_catalogue() -> None:
             f"niwaki {version}'s catalogue resolves '{_PROBE_ABSTRACT_CLASS}' but its "
             f"concrete subclasses add no properties to its {len(own)} own — the "
             f"'inherits' table no longer carries colon-notation ancestors. "
-            f"Pin niwaki>=1.8,<1.9."
+            f"Pin niwaki>=2.2,<2.3."
         )
 
 
@@ -320,7 +331,7 @@ def _unzip(blob: bytes | None, field: str = "blob") -> Any:
     except (zlib.error, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise DescriptionsLoadError(
             f"niwaki catalogue column '{field}' is not the expected zlib+JSON "
-            f"encoding ({exc}). Reinstall niwaki, or pin niwaki>=1.8,<1.9."
+            f"encoding ({exc}). Reinstall niwaki, or pin niwaki>=2.2,<2.3."
         ) from exc
 
 
@@ -404,9 +415,10 @@ def _collect_properties(class_name: str) -> frozenset[str]:
 
     Resolution, which is not obvious from the table names:
 
-    * ``prop.class_id`` is ``mo.id``, and a subclass's rows already include the
-      properties it inherits (measured: all 34 of abstract ``fvABD``'s are also
-      on concrete ``fvBD``). Own properties are therefore one indexed lookup.
+    * ``class_prop.class_id`` is ``mo.id``, and a subclass's rows already include
+      the properties it inherits (measured: all 34 of abstract ``fvABD``'s are
+      also on concrete ``fvBD``). Own properties are therefore one indexed
+      lookup on ``class_prop``'s primary key, joined to ``prop_sig`` for the name.
     * ``inherits(class_id, ancestor)`` holds, for each descendant, its **full**
       ancestor chain, with ``ancestor`` in colon notation (``fv:ABD``). That is
       the class's ``mo.class_pkg || ':' || mo.short_name``, which is what lets
@@ -435,11 +447,11 @@ def _collect_properties(class_name: str) -> frozenset[str]:
     its properties are repeated on every concrete class beneath it anyway.
     """
     rows = _query(
-        "SELECT p.wire_name FROM prop p JOIN mo c ON c.id = p.class_id "
+        f"SELECT p.wire_name FROM {_CLASS_PROPS} JOIN mo c ON c.id = cp.class_id "
         "WHERE c.class_name = ? "
         "UNION "
-        "SELECT p.wire_name FROM prop p "
-        "JOIN mo d ON d.id = p.class_id AND d.is_abstract = 0 "
+        f"SELECT p.wire_name FROM {_CLASS_PROPS} "
+        "JOIN mo d ON d.id = cp.class_id AND d.is_abstract = 0 "
         "JOIN inherits i ON i.class_id = d.id "
         "WHERE i.ancestor = "
         "(SELECT class_pkg || ':' || short_name FROM mo WHERE class_name = ?)",
@@ -487,9 +499,10 @@ def property_exists(class_name: str, wire_name: str) -> bool:
     cannot suggest, or reject one that ``known_properties`` lists. Preferring
     the wider set errs towards letting a valid filter through.
 
-    A single indexed ``prop`` lookup costs ~0.001 ms, so the cache is not what
-    makes this cheap for concrete classes; it is there for the abstract union,
-    which is built once and then answered by a set lookup.
+    A single indexed ``class_prop`` lookup (joined to ``prop_sig``) costs
+    ~0.01 ms, so the cache is not what makes this cheap for concrete classes; it
+    is there for the abstract union, which is built once and then answered by a
+    set lookup.
 
     Returns ``False`` for an unknown class, and for any attribute on it.
     """
@@ -675,8 +688,9 @@ def load_schema(
     result["dnFormats"] = _unzip(dn_formats, "mo.dn_formats") or []
 
     prop_rows = _query(
-        "SELECT wire_name, comment_id, enum_id, base_type_id, model_type_id, "
-        "default_val, flags FROM prop WHERE class_id = ?",
+        "SELECT p.wire_name, p.comment_id, p.enum_id, p.base_type_id, "
+        f"p.model_type_id, p.default_val, p.flags FROM {_CLASS_PROPS} "
+        "WHERE cp.class_id = ?",
         (class_id,),
     )
 
@@ -726,11 +740,19 @@ def _extract_prop_labels(class_id: int, bits: dict[str, int]) -> list[str]:
     Reproduces the collector's filtering exactly: hidden properties, generic
     cross-class labels, labels of three characters or fewer (``dn``, ``rn``),
     and labels that merely restate the property name are all dropped. Returns a
-    list, in schema order — the reference file stores a list, and the search
-    tokeniser depends on that shape.
+    list — the reference file stores a list, and the search tokeniser depends on
+    that shape — in wire-name order.
+
+    The order is spelled out in the query because the catalogue no longer
+    supplies it. ``prop`` was keyed ``(class_id, wire_name)``, so rows came back
+    sorted by wire name for free; ``class_prop`` is keyed ``(class_id, sig_id)``
+    and returns them in signature order. It is observable: a label shared by two
+    properties is kept for the first one met, and the list is hashed into the
+    index digest the baseline records.
     """
     rows = _query(
-        "SELECT wire_name, label_id, flags FROM prop WHERE class_id = ?",
+        f"SELECT p.wire_name, p.label_id, p.flags FROM {_CLASS_PROPS} "
+        "WHERE cp.class_id = ? ORDER BY p.wire_name",
         (class_id,),
     )
     hidden = bits.get("isHidden", 0)

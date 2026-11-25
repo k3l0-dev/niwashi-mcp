@@ -70,7 +70,7 @@ directory of JSON files.
 ### The database
 
 `catalog_path()` resolves `niwaki.__file__` → `query/_catalog/catalog.db`. The
-project pins `niwaki>=1.8,<2.0`; the installed 1.8.0 ships a 36 229 120-byte
+project pins `niwaki>=2.2,<2.3`; the installed 2.2.0 ships a 25 993 216-byte
 catalogue built from APIC **6.0(9c)**.
 
 Two `manifest` rows matter to this server:
@@ -78,19 +78,20 @@ Two `manifest` rows matter to this server:
 | Key | Value | Used for |
 |---|---|---|
 | `apic_version` | `6.0(9c)` | `apic_version()`, logged at startup — from 2.0 the corpus version is pinned by a dependency, not chosen by the operator, so it has to be visible |
-| `prop_flags` | Comma-separated flag names | The bit layout of `prop.flags`, read rather than hard-coded |
+| `prop_flags` | Comma-separated flag names | The bit layout of `prop_sig.flags`, read rather than hard-coded |
 
 Tables the adapter reads:
 
 | Table | Rows | Read for |
 |---|---|---|
 | `mo` | 15 452 | One row per ACI class: the scalar schema fields, plus two compressed blobs |
-| `prop` | 332 297 | One row per property per class. `PRIMARY KEY (class_id, wire_name)`, `WITHOUT ROWID` — a lookup by `class_id` walks a b-tree prefix, not the whole table |
+| `prop_sig` | 25 901 | One row per distinct property signature — wire name, label, comment, enum, types, default, flags — stored once however many classes carry it |
+| `class_prop` | 332 297 | One row per property per class: `(class_id, sig_id)`. `PRIMARY KEY (class_id, sig_id)`, `WITHOUT ROWID` — a lookup by `class_id` walks a b-tree prefix, not the whole table. A class's properties are this table joined to `prop_sig`; the join returns them in `sig_id` order, so the one place order is observable (`prop_labels`) sorts by `wire_name` explicitly |
 | `label_pool` | 26 654 | Deduplicated human labels, addressed by id |
 | `comment_pool` | 25 411 | Deduplicated comment text (a JSON list of lines), addressed by id |
 | `type_pool` | 3 458 | ACI model types and primitive base types |
 | `enum` | 3 947 | zlib-compressed JSON blobs of enumerated values |
-| `manifest` | 16 | Build metadata |
+| `manifest` | 17 | Build metadata |
 
 The catalogue also carries `relation`, `inherits`, `subclass`, `fault`,
 `scopemeta`, `name_override` and an FTS index. None of them is read here — this
@@ -121,7 +122,7 @@ One connection for the process, held by `lru_cache(maxsize=1)`:
 | `_pool(table, column, id)` | 4096 | Pooled strings — labels, comments, types |
 | `_pool_blob(table, id)` | 8192 | Compressed enum blobs |
 
-Measured on an Apple-silicon workstation with niwaki 1.8.0: `load_schema("fvBD")`
+Measured on an Apple-silicon workstation with niwaki 2.2.0: `load_schema("fvBD")`
 0.18 ms, the same call with `include_property_details=True` 0.33 ms.
 
 ### Where every `get_schema()` field comes from
@@ -155,8 +156,8 @@ flowchart TD
 | `relationTo` | `residual["relationTo"]` | `{relClass: {targetClass, cardinality}}` |
 | `relationFrom` | `residual["relationFrom"]` | `{relClass: {sourceClass}}` |
 | `dnFormats` | `mo.dn_formats` | zlib + JSON; `[]` when stored null |
-| `properties` | `prop.wire_name` for the class | Sorted names only |
-| `property_details` | `prop` row + `enum` + `type_pool` + `comment_pool` | Opt-in only — see below |
+| `properties` | `prop_sig.wire_name` of the class's `class_prop` rows | Sorted names only |
+| `property_details` | `prop_sig` row + `enum` + `type_pool` + `comment_pool` | Opt-in only — see below |
 
 **Nine keys are emitted unconditionally**, even when empty: `identifiedBy`,
 `rnFormat`, `isAbstract`, `isConfigurable`, `className`, `classPkg`, `label`,
@@ -204,7 +205,7 @@ Opt-in, because many classes carry more than a hundred properties.
 `include_property_details=True` projects every property. Unknown names in
 `properties_filter` are skipped silently.
 
-The bit layout of `prop.flags` is read from `manifest.prop_flags`, never
+The bit layout of `prop_sig.flags` is read from `manifest.prop_flags`, never
 hard-coded — niwaki owns that layout and may extend it. Nine flags must be
 present (`isConfigurable`, `needsPropDelimiters`, `createOnly`, `readWrite`,
 `readOnly`, `isNaming`, `secure`, `implicit`, `mandatory`); the check runs the
@@ -217,7 +218,7 @@ first time the flags are read, and a layout missing any of them raises
 | `access` | `flags` | Always |
 | `naming` | `flags & isNaming` | The property is part of the DN |
 | `mandatory` | `flags & mandatory` | Required on create |
-| `default` | `prop.default_val` | Declared, and neither `None` nor `""` |
+| `default` | `prop_sig.default_val` | Declared, and neither `None` nor `""` |
 | `options` | `enum_id` → `enum.content` | The enumeration has values left after filtering |
 | `comment` | `comment_id` → `comment_pool` | Non-empty after the sentinel filter |
 
@@ -257,7 +258,7 @@ failure this server exists to prevent, and it would be indistinguishable from
 "no objects match".
 
 So `catalog.py` never calls niwaki's accessors and never reads a readable name:
-`prop.wire_name` is the only source of a property name, for both `properties` and
+`prop_sig.wire_name` is the only source of a property name, for both `properties` and
 `property_details`. `mcp/tests/unit/test_catalog_adapter.py::TestWireOnlyBoundary`
 pins it in two ways — spot checks on known renames (`fvBD.descr` exposed and
 `description` absent; `fvSubnet.ip` exposed and `subnet` absent), and a sweep

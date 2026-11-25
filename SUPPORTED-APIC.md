@@ -7,7 +7,7 @@ data directory.
 
 | Currently shipped | Classes | Source |
 |---|---:|---|
-| **APIC 6.0(9c)** | 15,452 | `niwaki>=1.8,<1.9` |
+| **APIC 6.0(9c)** | 15,452 | `niwaki>=2.2,<2.3` |
 
 The server logs the catalogue's release at startup, then asks the fabric what it
 is running and compares the two:

@@ -2,10 +2,11 @@
 """The catalogue schema guard.
 
 `registry/catalog.py` reads niwaki's embedded SQLite catalogue with hand-written
-SQL against tables — `mo`, `prop`, `comment_pool`, `label_pool`, `type_pool`,
-`enum`, `manifest` — that are **private** to niwaki. Its public API is
-`Niwaki` / `AsyncNiwaki` / `models`, and none of these appear in it, so any 1.x
-release may restructure them without breaking SemVer.
+SQL against tables — `mo`, `prop_sig`, `class_prop`, `comment_pool`,
+`label_pool`, `type_pool`, `enum`, `manifest` — that are **private** to niwaki.
+Its public API is `Niwaki` / `AsyncNiwaki` / `models`, and none of these appear
+in it, so any release may restructure them without breaking SemVer — 2.1 did,
+splitting `prop` into `prop_sig` and `class_prop`.
 
 Some of those changes fail loudly on their own: a renamed table raises
 `OperationalError` on the first query. The ones worth building a guard for are
@@ -108,8 +109,19 @@ class TestStructuralDamage:
             catalog.verify_catalogue()
 
     def test_a_dropped_prop_column_is_named(self, broken_catalogue):
-        broken_catalogue("ALTER TABLE prop DROP COLUMN default_val")
+        broken_catalogue("ALTER TABLE prop_sig DROP COLUMN default_val")
         with pytest.raises(DescriptionsLoadError, match="default_val"):
+            catalog.verify_catalogue()
+
+    def test_a_dropped_class_prop_table_is_named(self, broken_catalogue):
+        """The table a class's properties are found through, which 2.1 introduced."""
+        broken_catalogue("DROP TABLE class_prop")
+        with pytest.raises(DescriptionsLoadError, match="no 'class_prop' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_class_prop_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE class_prop RENAME COLUMN sig_id TO signature_id")
+        with pytest.raises(DescriptionsLoadError, match="sig_id"):
             catalog.verify_catalogue()
 
     def test_the_error_names_the_niwaki_release(self, broken_catalogue):
@@ -118,7 +130,7 @@ class TestStructuralDamage:
         with pytest.raises(DescriptionsLoadError) as excinfo:
             catalog.verify_catalogue()
         assert "niwaki" in str(excinfo.value)
-        assert "1.9" in str(excinfo.value), "the message should say what to pin"
+        assert "2.3" in str(excinfo.value), "the message should say what to pin"
 
     def test_a_missing_table_reports_the_table_not_its_columns(self, broken_catalogue):
         """Pins the table branch specifically.
@@ -188,7 +200,7 @@ class TestManifestDamage:
             catalog.verify_catalogue()
 
     def test_a_changed_flag_layout_is_caught(self, broken_catalogue):
-        """`prop.flags` is a bitfield whose order lives in the manifest.
+        """`prop_sig.flags` is a bitfield whose order lives in the manifest.
 
         Dropping a flag shifts every bit above it. Nothing would raise; write
         access and `mandatory` would just quietly become wrong.
@@ -239,10 +251,16 @@ class TestEncodingDamage:
         with pytest.raises(DescriptionsLoadError, match="fvBD"):
             catalog.verify_catalogue()
 
-    def test_an_emptied_prop_table_is_caught(self, broken_catalogue):
+    def test_an_emptied_class_prop_table_is_caught(self, broken_catalogue):
         """Structurally intact, functionally useless: every class would report
         zero properties, and `query()` would accept any filter key."""
-        broken_catalogue("DELETE FROM prop")
+        broken_catalogue("DELETE FROM class_prop")
+        with pytest.raises(DescriptionsLoadError, match=r"properties|encoding"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_prop_sig_table_is_caught(self, broken_catalogue):
+        """The other half of the join: memberships remain but name nothing."""
+        broken_catalogue("DELETE FROM prop_sig")
         with pytest.raises(DescriptionsLoadError, match=r"properties|encoding"):
             catalog.verify_catalogue()
 

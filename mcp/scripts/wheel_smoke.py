@@ -67,7 +67,7 @@ def main() -> None:
 
     # The startup guard, against the niwaki the resolver actually chose. This is
     # the check that fails if a release moved the catalogue's private schema —
-    # exactly the scenario the `niwaki>=1.8,<1.9` pin exists to prevent, and the
+    # exactly the scenario the `niwaki>=2.2,<2.3` pin exists to prevent, and the
     # only place in this script where the *resolved* dependency is under test
     # rather than the one in the lockfile.
     try:

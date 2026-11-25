@@ -28,10 +28,10 @@ Until 1.2.2 the server read raw jsonmeta files from a schema bundle that had to 
 | | 1.2.2 | 2.0 |
 |---|---|---|
 | Install | `git clone` + download script + `tar` | `uvx niwashi-mcp` |
-| Download | 98.8 MB | 16.2 MB — the niwaki wheel |
-| On disk | 1.83 GB | 32.8 MB |
+| Download | 98.8 MB | 16.8 MB — the niwaki wheel |
+| On disk | 1.83 GB | 26.0 MB |
 
-The catalogue is `catalog.db`, resolved at runtime as `<niwaki package dir>/query/_catalog/catalog.db` — 36,229,120 bytes, built from **APIC 6.0(9c)**, holding **15,452 classes** and 332,297 property rows. `mcp/pyproject.toml` pins the dependency to `niwaki>=1.8,<1.9` — a single minor, because this server reads the catalogue's *private* schema, which niwaki may restructure in any 1.x release without breaking SemVer; the version installed here is 1.8.0.
+The catalogue is `catalog.db`, resolved at runtime as `<niwaki package dir>/query/_catalog/catalog.db` — 25,993,216 bytes, built from **APIC 6.0(9c)**, holding **15,452 classes** and 332,297 class-property memberships (25,901 distinct property signatures). `mcp/pyproject.toml` pins the dependency to `niwaki>=2.2,<2.3` — a single minor, because this server reads the catalogue's *private* schema, which niwaki may restructure in any release without breaking SemVer (2.1 did, splitting the `prop` table into `prop_sig` and `class_prop`); the version installed here is 2.2.0.
 
 Three consequences follow from the file being a build artefact inside a wheel:
 
@@ -66,7 +66,7 @@ graph TD
 
     subgraph pypi["Python package index"]
         dist["niwashi-mcp wheel"]
-        niwaki["niwaki wheel — 16.2 MB<br/>catalog.db inside"]
+        niwaki["niwaki wheel — 16.8 MB<br/>catalog.db inside"]
     end
 
     envfile[".env<br/>APIC credentials"]
@@ -161,7 +161,7 @@ This is a deliberate architectural constraint, not an accident of the migration:
 Two related choices are visible at the boundary and worth stating, because both are silent when wrong:
 
 - **Wire names only.** Every property in the catalogue carries a wire name — `descr` — and a readable name — `description`. This server reads `wire_name` and nothing else. A readable name reaches the APIC, is syntactically valid, and returns `[]` without an error.
-- **The server does not use niwaki's own full-text index.** `catalog.py` reads the `mo` and `prop` tables and rebuilds the search index this server has always used, so the v2 scorer, its synonym table, and its structural priors are unchanged by the migration.
+- **The server does not use niwaki's own full-text index.** `catalog.py` reads the `mo`, `prop_sig` and `class_prop` tables and rebuilds the search index this server has always used, so the v2 scorer, its synonym table, and its structural priors are unchanged by the migration.
 
 ---
 
@@ -221,7 +221,7 @@ sequenceDiagram
     Note over life: inside app_lifespan
     life->>life: load_dotenv on the resolved .env
     life->>cat: descriptions_index
-    cat->>cat: read the mo and prop tables, resolve label and comment pools
+    cat->>cat: read the mo, prop_sig and class_prop tables, resolve label and comment pools
     cat-->>life: 15,239-entry search index, in memory
     life->>cat: apic_version from the catalogue manifest
     cat-->>life: the APIC release the catalogue was built from
@@ -287,7 +287,7 @@ Anything below is gone from the running server. It appears here only so that a r
 | Removed | Replacement |
 |---|---|
 | `data/` directory and the schema bundle | the catalogue inside the `niwaki` dependency |
-| `data/schemas/*.json` jsonmeta files | the `mo` and `prop` tables of `catalog.db` |
+| `data/schemas/*.json` jsonmeta files | the `mo`, `prop_sig` and `class_prop` tables of `catalog.db` |
 | `data/class-descriptions.json` | `catalog.descriptions_index()`, rebuilt at startup |
 | the bundle download script | nothing — `uvx niwashi-mcp` installs everything |
 | `registry/schema.py` and `resolve_schemas_dir()` | `registry/catalog.py` |

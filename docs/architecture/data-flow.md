@@ -49,7 +49,7 @@ flowchart LR
     tools["search_classes"]
 
     db -->|"read-only, immutable"| cat
-    cat -->|"mo and prop tables,<br/>label and comment pools"| idx
+    cat -->|"mo, prop_sig and class_prop tables,<br/>label and comment pools"| idx
     idx -->|"tokenised once on first search"| tools
 ```
 

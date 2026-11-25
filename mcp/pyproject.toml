@@ -28,10 +28,11 @@ dependencies = [
     # Pinned to a single minor, not `<2.0`: this server reads the *private*
     # SQLite schema of niwaki's embedded catalogue (see registry/catalog.py —
     # the fields it needs have no public accessor yet). That schema is not
-    # covered by niwaki's SemVer contract, so a 1.9 could restructure it
-    # legitimately. `catalog.verify_catalogue()` refuses startup if it ever
+    # covered by niwaki's SemVer contract, so a minor can restructure it
+    # legitimately — 2.1 did, replacing the `prop` table with `prop_sig` +
+    # `class_prop`. `catalog.verify_catalogue()` refuses startup if it ever
     # does; this pin keeps the resolver from getting there in the first place.
-    "niwaki>=1.8,<1.9",
+    "niwaki>=2.2,<2.3",
     "python-dotenv>=1.0,<2.0",
 ]
 

@@ -16,7 +16,7 @@ It declares 34 properties; its concrete descendants `fvBD`, `fvBDDef` and
 `fvBD` and absent from `fvABD`'s own list.
 
 Expectations are derived from `load_schema` (a separate code path, reading
-`prop` by class id) rather than copied from the implementation's own SQL, so a
+`class_prop` by class id) rather than copied from the implementation's own SQL, so a
 bug shared by both would still have to be a bug in two places.
 """
 
