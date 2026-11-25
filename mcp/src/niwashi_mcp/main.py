@@ -72,9 +72,10 @@ query() parameters
                        "faults,required", "faults,no-scoped"
   time_range           Log record window: "24h", "1week", "2026-01-01|2026-01-31"
                        Valid for faultRecord, aaaModLR, eventRecord, healthRecord
-  fields               Keep only these attributes on each result and each
-                       child, plus dn / _class / _children; unknown names are
-                       refused (UnknownAttributeError)
+  fields               Keep only these attributes on each result and on each
+                       include_children child, plus dn / _class / _children;
+                       children that came with rsp_subtree_include are left
+                       whole; unknown names are refused (UnknownAttributeError)
 
 query() return shape
 --------------------
@@ -462,6 +463,8 @@ FULL-FABRIC AGGREGATION — a single default query() page is NOT the whole
     and combine results across narrower calls.
     When objects are wide or many, pass fields=[...] (query and get_by_dn) to
     keep only the attributes you will read; dn, _class and _children stay.
+    It reduces the objects and the children you embedded with include_children;
+    children that came with rsp_subtree_include (faults, health) stay whole.
 
 RELATION INTEGRITY — never report what an object points to without reading
     the relation's `state`.
@@ -690,6 +693,26 @@ async def get_schema(
 # governed by it: that check is older, and a typo there has no legitimate reading.
 
 
+def _requested_child_classes(include_children: list[str] | None) -> list[str]:
+    """The class names ``include_children`` asks for, one entry per name.
+
+    An item may itself be a comma-joined list: the client joins the items with
+    "," into rsp-subtree-class, so ["fvSubnet,fvRsCtx"] reaches the APIC as two
+    classes and has always worked. Every consumer of the list — the class check,
+    the ``fields`` check, its suggestions, and the rule for which children a
+    projection touches — has to read it the same way, or a request one of them
+    accepts is refused or mis-projected by another. Names are stripped and empty
+    ones dropped; order is kept and duplicates are not removed (the callers that
+    must not repeat themselves already track what they have seen).
+    """
+    return [
+        name
+        for item in include_children or []
+        for name in (part.strip() for part in item.split(","))
+        if name
+    ]
+
+
 def _attribute_problems(
     class_name: str,
     descriptions: dict,
@@ -751,13 +774,8 @@ def _attribute_problems(
             check_attr(class_name, attr, "filters")
     for cls, attr in order_by_attributes(order_by):
         check_attr(cls, attr, "order_by")
-    # An item may itself be a comma-joined list: the client joins the items with
-    # "," into rsp-subtree-class, so ["fvSubnet,fvRsCtx"] has always worked and
-    # must keep working.
-    for item in include_children or []:
-        for name in (part.strip() for part in item.split(",")):
-            if name:
-                check_class(name, "include_children")
+    for name in _requested_child_classes(include_children):
+        check_class(name, "include_children")
     for cls, attr in filter_expr_attributes(filter_expr):
         check_attr(cls, attr, "filter_expr")
     return problems
@@ -775,6 +793,10 @@ async def _enforce_attributes(
     filter_expr: str | None,
 ) -> list[str]:
     """Validate a request's names against the catalogue; refuse or warn.
+
+    ``class_name`` is the class the request is about, and labels the log lines;
+    `get_by_dn`, which knows no class before its fetch, passes its DN and
+    supplies only ``include_children``.
 
     Strict (the default): the first unknown name raises `UnknownAttributeError`
     — or `UnknownClassError` for a class — before anything reaches the backend.
@@ -854,14 +876,29 @@ class CountEnvelope(TypedDict):
 # ── Field projection ──────────────────────────────────────────────────────────
 
 # What a projection never removes. `dn` is how the object is addressed again,
-# `_class` says what it is, and `_children` is the embedded subtree — which is
-# projected in turn rather than dropped, so a caller that asked for children
-# still receives them.
+# `_class` says what it is, and `_children` is the embedded subtree, which is
+# kept (and, for the classes the caller asked to embed, projected in turn)
+# rather than dropped.
 _PROJECTION_KEEPS = frozenset({"dn", "_class", "_children"})
 
 
-def _project(obj: dict[str, Any], keep: frozenset[str]) -> dict[str, Any]:
-    """Reduce ``obj`` and each of its ``_children`` to ``keep`` plus the fixed keys.
+def _project(
+    obj: dict[str, Any], keep: frozenset[str], child_classes: frozenset[str]
+) -> dict[str, Any]:
+    """Reduce ``obj`` to ``keep`` plus the fixed keys, and the children it owns.
+
+    ``child_classes`` names the classes whose ``_children`` entries are reduced
+    the same way: the class of ``obj`` itself and each class the caller asked to
+    embed with ``include_children``. Those are the classes ``fields`` was
+    validated against, so a name the caller listed is a name that was checked.
+
+    Children of any other class are left whole. They are there because of a
+    different parameter — ``rsp_subtree_include`` brings ``faultInst``,
+    ``healthInst`` and ``aaaModLR`` children — and ``fields`` was never checked
+    against them. Reducing them anyway turned a fault into its ``dn`` and
+    ``_class`` with no note: the severity the caller asked for with
+    ``rsp_subtree_include="faults"`` deleted by the projection that was meant to
+    trim the bridge domain.
 
     Builds new dicts and leaves ``obj`` alone: it is the backend's answer, and a
     backend that hands out a cached or shared dict must not see it shrink. Key
@@ -873,7 +910,10 @@ def _project(obj: dict[str, Any], keep: frozenset[str]) -> dict[str, Any]:
     children = out.get("_children")
     if isinstance(children, list):
         out["_children"] = [
-            {k: v for k, v in child.items() if k in kept} for child in children
+            {k: v for k, v in child.items() if k in kept}
+            if child.get("_class") in child_classes
+            else dict(child)
+            for child in children
         ]
     return out
 
@@ -912,6 +952,17 @@ def _unknown_fields_note(unknown: list[str], class_name: str) -> str:
         "relaxed; a name missing from the results is absent from this "
         "fabric's objects, not an empty value."
     )
+
+
+# The two ways a fetch_all stops short, worded once. query() and count's
+# group_by both tell an agent "this is a partial answer" and the agent's next
+# move is the same for both reasons — and it cannot tell them apart from the
+# outside — so a note that names only the cap sends it looking for a cap it
+# never reached when the APIC simply ran out of pages.
+_FETCH_STOPPED_BY = (
+    f"the safety cap (fetch_all holds at most {_MAX_OBJECTS} objects per call) "
+    "or the end of the APIC's pages"
+)
 
 
 def _append_note(note: str | None, extra: str) -> str:
@@ -1017,13 +1068,26 @@ async def query(
                           is also False if the APIC ends its pages before the
                           count it reported. Narrow the query (e.g.
                           scope_dn) and combine results.
+        fields:           Attribute names to keep, e.g. ["name", "arpFlood"].
+                          Each result, and each "_children" entry of a class
+                          listed in include_children, is reduced to these plus
+                          "dn", "_class" and "_children", which are always
+                          kept. A child that arrived through
+                          rsp_subtree_include (faultInst, healthInst, ...) is
+                          not reduced and its attributes are not checked: it is
+                          returned whole. Every name must be a property of
+                          class_name or of an include_children class; an
+                          unknown one raises UnknownAttributeError. [] keeps
+                          only the always-kept keys; omit `fields` to get every
+                          attribute.
 
     Returns:
         An envelope dict:
           {"results": [...],            # attribute dicts, same shape as before
            "returned": <int>,           # len(results)
            "total_available": <int>,    # true match count, fabric/subtree-wide
-           "truncated": <bool>,         # total_available > returned
+           "truncated": <bool>,         # matches remain past this page; always
+                                        # false with fetch_all (read `complete`)
            "next_page": <int|None>,     # page+1 when truncated and not fetch_all
            "complete": <bool>,          # False only if fetch_all stopped short of
                                         # total_available (5,000-object cap, or
@@ -1103,8 +1167,9 @@ async def query(
     # yield objects that merely lack the key, indistinguishable from objects
     # that never had it. Checked before the APIC is called, like the class.
     fields_note: str | None = None
+    child_classes = _requested_child_classes(include_children)
     if fields is not None:
-        field_classes = [class_name, *(include_children or [])]
+        field_classes = [class_name, *child_classes]
         unknown_fields = _unknown_fields(fields, field_classes)
         if unknown_fields:
             await ctx.warning(
@@ -1149,7 +1214,8 @@ async def query(
     objects = result.objects
     if fields is not None:
         keep = frozenset(fields)
-        objects = [_project(obj, keep) for obj in objects]
+        projected_classes = frozenset([class_name, *child_classes])
+        objects = [_project(obj, keep, projected_classes) for obj in objects]
 
     returned = len(objects)
 
@@ -1185,8 +1251,7 @@ async def query(
         # it cannot tell them apart from the outside.
         note = (
             f"Fetched {returned} of {result.total_available} objects before "
-            f"hitting the safety cap (fetch_all holds at most {_MAX_OBJECTS} "
-            "objects per call) or the end of the APIC's pages. This is a "
+            f"hitting {_FETCH_STOPPED_BY}. This is a "
             "partial answer — do not state a maximum, minimum, total, or "
             "complete list from it. Narrow the query (e.g. scope_dn) so each "
             "call matches fewer objects, and combine results."
@@ -1246,11 +1311,17 @@ async def get_by_dn(
                           (APIC rsp-prop-include=config-only) — ideal for backup
                           and comparison without operational noise.
         include_children: Child class names to embed, e.g. ["fvSubnet", "fvRsCtx"].
-                          The returned object gains a "_children" list.
+                          The returned object gains a "_children" list. Each
+                          class is checked against the catalogue before the
+                          request is sent; an unknown one raises
+                          UnknownClassError, since the APIC would embed nothing
+                          and the object would look childless.
         fields:           Attribute names to keep, e.g. ["name", "arpFlood"].
-                          The object and each "_children" entry are reduced to
-                          these plus "dn", "_class" and "_children", which are
-                          always kept. Names are checked against the class the
+                          The object and each "_children" entry of a class
+                          listed in include_children are reduced to these plus
+                          "dn", "_class" and "_children", which are always
+                          kept; a child of any other class is returned whole.
+                          Names are checked against the class the
                           APIC returned (and any include_children class), not
                           against a class you named — the DN carries it. An
                           unknown name raises UnknownAttributeError. [] keeps
@@ -1262,7 +1333,8 @@ async def get_by_dn(
         element: all APIC attributes plus a "_class" key (and "_children" when
         include_children is set), reduced to `fields` when that is set. With
         attribute checking relaxed (NIWASHI_MCP_STRICT_ATTRIBUTES=false) an
-        unknown name is not refused: the object carries a "_note" key saying so.
+        unknown name — a field, or a class in include_children — is not
+        refused: the object carries a "_note" key saying so.
 
         When no object exists at that DN, a structured not-found dict:
           {"found": False, "dn": <dn>, "message": <explanation>}
@@ -1271,6 +1343,9 @@ async def get_by_dn(
         is a stale or mistyped DN — re-verify it via search_classes → query.
 
     Raises:
+        UnknownClassError: a class in `include_children` is not in the
+                          catalogue — includes the closest matches. Raised
+                          before the APIC is called.
         UnknownAttributeError: a name in `fields` is no property of the returned
                           object's class nor of any include_children class —
                           includes the closest matches. Raised only after the
@@ -1279,7 +1354,25 @@ async def get_by_dn(
                           for a malformed DN string. Carries the HTTP status
                           and, when present, the APIC error text.
     """
+    descriptions: dict = ctx.lifespan_context["descriptions"]
     backend: ApicClient = ctx.lifespan_context["backend"]
+
+    # An unknown class in include_children is embedded as nothing: the object
+    # comes back with no `_children`, which reads as "it has none". The class
+    # names are all there is to check before the fetch (the object's own class
+    # is not known yet), so they are checked exactly as query() checks them —
+    # refused before anything is sent, or, with attribute checking relaxed,
+    # sent and reported. The DN stands in for the class in the log lines.
+    class_warnings = await _enforce_attributes(
+        "get_by_dn",
+        ctx,
+        descriptions,
+        dn,
+        filters=None,
+        include_children=include_children,
+        filter_expr=None,
+    )
+    note: str | None = " ".join(class_warnings) or None
 
     await ctx.info(f"get_by_dn({dn!r}, config_only={config_only})")
     obj = await backend.get_by_dn(
@@ -1300,14 +1393,17 @@ async def get_by_dn(
         }
     await ctx.info(f"get_by_dn({dn!r}) → {obj.get('_class')}")
     if fields is None:
-        return obj
+        # No envelope to carry a note here — the object is the whole answer — so
+        # it rides on the object under a synthetic key, like `_class`. Copied
+        # rather than set in place: `obj` is the backend's.
+        return {**obj, "_note": note} if note else obj
 
     # The class is only known now, from the object the DN resolved to — which
     # is why this cannot fail before the APIC is called as query()'s check does.
     object_class = str(obj.get("_class", ""))
-    field_classes = [object_class, *(include_children or [])]
+    child_classes = _requested_child_classes(include_children)
+    field_classes = [object_class, *child_classes]
     unknown_fields = _unknown_fields(fields, field_classes)
-    note: str | None = None
     if unknown_fields:
         await ctx.warning(
             f"get_by_dn({dn!r}) fields not in the catalogue for "
@@ -1320,7 +1416,7 @@ async def get_by_dn(
                 _suggest_fields(unknown_fields[0], field_classes),
                 catalog.apic_version(),
             )
-        note = _unknown_fields_note(unknown_fields, object_class)
+        note = _append_note(note, _unknown_fields_note(unknown_fields, object_class))
     if not fields:
         note = _append_note(
             note,
@@ -1328,10 +1424,10 @@ async def get_by_dn(
             "to receive every attribute.",
         )
 
-    projected = _project(obj, frozenset(fields))
+    projected = _project(
+        obj, frozenset(fields), frozenset([object_class, *child_classes])
+    )
     if note:
-        # No envelope to carry it here — the object is the whole answer — so
-        # the note rides on the object under a synthetic key, like `_class`.
         projected["_note"] = note
     return projected
 
@@ -1444,41 +1540,70 @@ async def _group_counts(
     the cheap `count_class` figure the caller already holds, and is what the
     tally is checked against.
 
+    That figure also decides, before anything is fetched, the two cases where
+    a fetch has nothing useful to do. Nothing matches: the breakdown is empty
+    and complete. More match than one fetch_all call can hold: the fetch would
+    walk all of the cap's pages, _MAX_OBJECTS objects in full, to produce a
+    breakdown it is then bound to withhold (a capped fetch is never complete),
+    so it is withheld at the cost of the one request `count_class` already made.
+
     A breakdown that does not account for every object is worse than none: a
     partial one reads as a finding ("only 3 tenants have faults") when it is
-    just where the fetch stopped. So when the fetch hit its safety cap, or
-    fetched a number of objects different from `total`, the groups are
-    withheld and the reason given — never an empty or partial dict standing in
-    for an answer.
+    just where the fetch stopped. So when the fetch stopped short — the safety
+    cap, or the APIC ending its pages early — or fetched a number of objects
+    different from `total`, the groups are withheld and the reason given: never
+    an empty or partial dict standing in for an answer.
     """
-    result = await backend.query_class(
-        class_name=class_name,
-        filters=filters,
-        scope_dn=scope_dn,
-        limit=_GROUP_FETCH_PAGE,
-        filter_expr=filter_expr,
-        fetch_all=True,
-    )
-    fetched = len(result.objects)
+    if total == 0:
+        return {
+            "group_by": group_by,
+            "groups": {},
+            "ungrouped": 0,
+            "complete": True,
+            "note": None,
+        }
 
+    narrow = (
+        "Narrow the query with filters or scope_dn (for example one tenant at a "
+        "time, scope_dn='uni/tn-<name>') and group each narrower set."
+    )
+    objects: list[dict[str, Any]] = []
+    fetched = 0
     withheld: str | None = None
-    if not result.complete:
+    if total > _MAX_OBJECTS:
         withheld = (
-            f"Only {fetched} of {total} objects could be fetched before the "
-            f"safety cap, so a breakdown by {group_by!r} would be partial; "
-            "`groups` and `ungrouped` are null rather than shown as an answer. "
-            "`count` is the true total. Narrow the query with filters or "
-            "scope_dn (for example one tenant at a time, scope_dn="
-            "'uni/tn-<name>') and group each narrower set."
+            f"{total} objects match, more than the {_MAX_OBJECTS} one fetch_all "
+            f"call can hold (the safety cap), so a breakdown by {group_by!r} "
+            "would be partial and none was attempted; `groups` and `ungrouped` "
+            "are null rather than shown as an answer. `count` is the true "
+            f"total. {narrow}"
         )
-    elif fetched != total:
-        withheld = (
-            f"The APIC counted {total} matching objects but {fetched} were "
-            "fetched, so the set changed while it was being read (or a page "
-            f"was missed) and a breakdown by {group_by!r} would not add up to "
-            "`count`; `groups` and `ungrouped` are null. Retry, and if it "
-            "keeps happening narrow the query with filters or scope_dn."
+    else:
+        result = await backend.query_class(
+            class_name=class_name,
+            filters=filters,
+            scope_dn=scope_dn,
+            limit=_GROUP_FETCH_PAGE,
+            filter_expr=filter_expr,
+            fetch_all=True,
         )
+        objects = result.objects
+        fetched = len(objects)
+        if not result.complete:
+            withheld = (
+                f"Only {fetched} of {total} objects could be fetched before "
+                f"{_FETCH_STOPPED_BY}, so a breakdown by {group_by!r} would be "
+                "partial; `groups` and `ungrouped` are null rather than shown "
+                f"as an answer. `count` is the true total. {narrow}"
+            )
+        elif fetched != total:
+            withheld = (
+                f"The APIC counted {total} matching objects but {fetched} were "
+                "fetched, so the set changed while it was being read (or a page "
+                f"was missed) and a breakdown by {group_by!r} would not add up "
+                "to `count`; `groups` and `ungrouped` are null. Retry, and if "
+                "it keeps happening narrow the query with filters or scope_dn."
+            )
     if withheld is not None:
         await ctx.warning(
             f"count({class_name!r}, group_by={group_by!r}) withheld — "
@@ -1492,7 +1617,7 @@ async def _group_counts(
             "note": withheld,
         }
 
-    groups, ungrouped = _tally(result.objects, group_by, from_dn)
+    groups, ungrouped = _tally(objects, group_by, from_dn)
     await ctx.info(
         f"count group_by={group_by!r} → {len(groups)} group(s), "
         f"{ungrouped} ungrouped"

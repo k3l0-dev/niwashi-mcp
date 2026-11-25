@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 """
-Integration tests for attribute validation in `query` and `count`.
+Integration tests for attribute validation in `query` and `count` — and for the
+one check `get_by_dn` shares with them, the classes named in `include_children`.
 
 The APIC answers an unknown attribute — or an unknown class in
 `include_children` — with HTTP 200 and an empty result, which is
@@ -531,6 +532,26 @@ async def test_relaxed_mode_reports_a_name_once_however_often_it_appears(tool_ct
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "include_children",
+    [["fvX", "fvX"], ["fvX,fvX"], ["fvX", "fvX, fvX"]],
+    ids=["repeated", "comma-joined", "mixed"],
+)
+async def test_relaxed_mode_reports_a_class_once_however_often_it_is_listed(
+    tool_ctx, relaxed, include_children
+):
+    """A class named twice is one mistake, and one warning — in the note an
+    agent reads and in the log alike. `fvX` is not in the catalogue."""
+    from niwashi_mcp.main import query
+
+    envelope = await query("fvBD", tool_ctx, include_children=include_children)
+
+    assert envelope["note"].count("Unknown ACI class 'fvX'") == 1
+    assert len([w for w in _warned(tool_ctx) if "fvX" in w]) == 1
+    assert len(_backend(tool_ctx).calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_relaxed_note_is_appended_to_the_truncation_note_not_instead_of_it(
     tool_ctx, relaxed
 ):
@@ -575,3 +596,121 @@ async def test_relaxed_mode_still_refuses_an_unknown_class_name(tool_ctx, relaxe
     with pytest.raises(UnknownClassError):
         await count("fvBDD", tool_ctx)
     assert _backend(tool_ctx).calls == []
+
+
+# ── get_by_dn: include_children ──────────────────────────────────────────────
+#
+# `get_by_dn` has no class to check before its fetch — the DN carries it — but
+# the classes named in `include_children` are known up front, and an unknown one
+# is embedded as nothing: the object came back with no `_children`, which reads
+# as "it has none". Checked exactly as `query` checks them.
+
+_MGMT = "uni/tn-OT/BD-mgmt"  # the sample BD that carries one fvSubnet child
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_unknown_include_children_class_raises_and_sends_nothing(
+    tool_ctx,
+):
+    from niwashi_mcp.main import get_by_dn
+
+    with pytest.raises(UnknownClassError) as caught:
+        await get_by_dn(_MGMT, tool_ctx, include_children=["fvSubnet", "fvSubnett"])
+
+    assert caught.value.class_name == "fvSubnett"
+    assert caught.value.suggestions == _primary_guard_suggestions(tool_ctx, "fvSubnett")
+    assert _backend(tool_ctx).calls == [], "the APIC was called anyway"
+    assert any("fvSubnett" in w for w in _warned(tool_ctx))
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_refuses_before_the_fetch_even_for_a_dn_that_is_not_there(
+    tool_ctx,
+):
+    """The refusal does not depend on what the DN resolves to."""
+    from niwashi_mcp.main import get_by_dn
+
+    with pytest.raises(UnknownClassError):
+        await get_by_dn("uni/tn-OT/BD-nope", tool_ctx, include_children=["fvSubnett"])
+    assert _backend(tool_ctx).calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_reads_a_comma_joined_include_children_item_as_classes(
+    tool_ctx,
+):
+    from niwashi_mcp.main import get_by_dn
+
+    obj = await get_by_dn(_MGMT, tool_ctx, include_children=["fvSubnet,fvRsCtx"])
+    assert [c["_class"] for c in obj["_children"]] == ["fvSubnet"]
+
+    with pytest.raises(UnknownClassError) as caught:
+        await get_by_dn(_MGMT, tool_ctx, include_children=["fvSubnet, fvRsCtxx"])
+    assert caught.value.class_name == "fvRsCtxx"
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_known_include_children_and_none_pass_untouched(tool_ctx):
+    """No new key on a valid call: the check must cost a clean request nothing."""
+    from niwashi_mcp.main import get_by_dn
+
+    plain = await get_by_dn(_MGMT, tool_ctx)
+    with_children = await get_by_dn(_MGMT, tool_ctx, include_children=["fvSubnet"])
+
+    assert "_note" not in plain and "_note" not in with_children
+    assert [c["_class"] for c in with_children["_children"]] == ["fvSubnet"]
+    assert _backend(tool_ctx).calls[-1]["include_children"] == ["fvSubnet"]
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_relaxed_sends_the_request_and_says_so_on_the_object(
+    tool_ctx, relaxed
+):
+    from niwashi_mcp.main import get_by_dn
+
+    obj = await get_by_dn(_MGMT, tool_ctx, include_children=["fvSubnett"])
+
+    assert obj["name"] == "mgmt", "the object was not returned"
+    assert "fvSubnett" in obj["_note"]
+    assert "Sent anyway" in obj["_note"]
+    assert any("fvSubnett" in w for w in _warned(tool_ctx))
+    assert _backend(tool_ctx).calls[0]["include_children"] == ["fvSubnett"]
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_relaxed_note_does_not_clobber_the_fields_note(
+    tool_ctx, relaxed
+):
+    """Two doubts on one request, one `_note`: each survives the other."""
+    from niwashi_mcp.main import get_by_dn
+
+    obj = await get_by_dn(
+        _MGMT, tool_ctx, include_children=["fvSubnett"], fields=["name", "newFangledAttr"]
+    )
+
+    assert "fvSubnett" in obj["_note"], "the class warning was overwritten"
+    assert "newFangledAttr" in obj["_note"], "the fields warning was overwritten"
+
+    empty = await get_by_dn(_MGMT, tool_ctx, include_children=["fvSubnett"], fields=[])
+    assert "fvSubnett" in empty["_note"]
+    assert "fields=[]" in empty["_note"]
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_relaxed_does_not_edit_the_backends_object(relaxed):
+    """The `_note` goes on a copy: `obj` is the backend's answer."""
+    from niwashi_mcp.main import get_by_dn
+
+    backend_obj = {"dn": "uni/tn-OT/BD-x", "name": "x", "_class": "fvBD"}
+
+    class _Fixed(StubBackend):
+        async def get_by_dn(self, **kwargs):
+            return backend_obj
+
+    ctx = make_ctx(
+        {"descriptions": {}, "backend": _Fixed([])},
+    )
+    out = await get_by_dn("uni/tn-OT/BD-x", ctx, include_children=["fvSubnett"])
+
+    assert "_note" in out
+    assert "_note" not in backend_obj, "the note was written into the backend's dict"

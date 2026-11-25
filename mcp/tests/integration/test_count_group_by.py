@@ -360,6 +360,28 @@ async def test_hitting_the_safety_cap_withholds_the_groups():
 
 
 @pytest.mark.asyncio
+async def test_a_capped_breakdown_names_both_ways_a_fetch_stops_short():
+    """The APIC ending its pages early also yields complete=False, and the note
+    must not send the agent after a cap it never reached. It is worded as
+    query()'s own note for the same condition — the clause is shared, so this
+    compares the two rather than quoting either."""
+    from niwashi_mcp.apic.client import _MAX_OBJECTS
+    from niwashi_mcp.main import count, query
+
+    ctx = _ctx(_FAULTS, cap_at=3)
+    clause = (
+        f"the safety cap (fetch_all holds at most {_MAX_OBJECTS} objects per "
+        "call) or the end of the APIC's pages"
+    )
+
+    grouped = await count("faultInst", ctx, group_by="severity")
+    queried = await query("faultInst", ctx, fetch_all=True)
+
+    assert clause in grouped["note"]
+    assert clause in queried["note"]
+
+
+@pytest.mark.asyncio
 async def test_a_capped_tenant_breakdown_is_withheld_too():
     from niwashi_mcp.main import count
 
@@ -368,6 +390,82 @@ async def test_a_capped_tenant_breakdown_is_withheld_too():
     assert result["complete"] is False
     assert result["groups"] is None and result["ungrouped"] is None
     assert result["count"] == 7
+
+
+class _CountingBackend(StubBackend):
+    """count_class reports `reported`, whatever is stored — a fabric of any size."""
+
+    def __init__(self, imdata: list[dict], reported: int):
+        super().__init__(imdata)
+        self._reported = reported
+
+    async def count_class(self, *args, **kwargs) -> int:
+        await super().count_class(*args, **kwargs)
+        return self._reported
+
+
+def _methods(ctx) -> list[str]:
+    return [c["method"] for c in ctx.lifespan_context["backend"].calls]
+
+
+@pytest.mark.asyncio
+async def test_a_set_past_the_fetch_cap_is_withheld_without_fetching_it():
+    """More match than one fetch_all call holds, so the fetch can only end
+    capped and its breakdown can only be withheld. Walking 25 pages of full
+    objects to arrive there spent ~5,000 objects of APIC and network for no
+    answer; `count_class` had already said so with one request."""
+    from niwashi_mcp.apic.client import _MAX_OBJECTS
+    from niwashi_mcp.main import count
+
+    total = _MAX_OBJECTS + 1
+    ctx = _ctx(_FAULTS, backend=_CountingBackend(_FAULTS, total))
+
+    result = await count("faultInst", ctx, group_by="severity")
+
+    assert _methods(ctx) == ["count_class"], "the set was fetched to be refused"
+    assert result["complete"] is False
+    assert result["groups"] is None and result["ungrouped"] is None
+    assert result["count"] == total
+    assert result["group_by"] == "severity"
+    note = result["note"]
+    assert str(total) in note and "safety cap" in note
+    assert "scope_dn" in note and "filters" in note  # says how to narrow it
+    ctx.warning.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_a_set_exactly_at_the_fetch_cap_is_still_fetched():
+    """_MAX_OBJECTS fits in one fetch_all call, so it is tried — the shortcut is
+    for sets that cannot fit, not for big ones. (The stub holds 7 objects, so the
+    tally then disagrees with the 5,000 reported; reaching the fetch is the point.)"""
+    from niwashi_mcp.apic.client import _MAX_OBJECTS
+    from niwashi_mcp.main import count
+
+    ctx = _ctx(_FAULTS, backend=_CountingBackend(_FAULTS, _MAX_OBJECTS))
+
+    await count("faultInst", ctx, group_by="severity")
+
+    assert _methods(ctx) == ["count_class", "query_class"]
+
+
+@pytest.mark.asyncio
+async def test_a_breakdown_of_nothing_is_answered_without_fetching():
+    """Zero matches: nothing to tally, so nothing to fetch — and the answer is
+    the same empty, complete one as before."""
+    from niwashi_mcp.main import count
+
+    ctx = _ctx(_FAULTS)
+
+    result = await count(
+        "faultInst", ctx, filters={"severity": "cleared"}, group_by="code"
+    )
+
+    assert _methods(ctx) == ["count_class"], "an empty set was fetched"
+    assert result["count"] == 0
+    assert result["groups"] == {}
+    assert result["ungrouped"] == 0
+    assert result["note"] is None
+    _assert_partitions_count(result)
 
 
 class _DriftingBackend(StubBackend):
