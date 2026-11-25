@@ -139,7 +139,7 @@ class UnknownAttributeError(NiwashiMcpError):
         self.suggestions = suggestions
         self.catalogue_version = catalogue_version
         hint = (
-            f"Closest matches: {', '.join(suggestions)}"
+            f"Closest matches: {', '.join(suggestions)}."
             if suggestions
             else "No close matches found."
         )

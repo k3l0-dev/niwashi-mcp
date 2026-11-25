@@ -190,6 +190,16 @@ def test_unknown_attribute_error_includes_action_hint():
     assert "get_schema('fvBD')" in str(UnknownAttributeError("fvBD", "x", [], "6.0(9c)"))
 
 
+def test_unknown_attribute_error_ends_the_suggestions_sentence_before_the_next_one():
+    """"Closest matches: arpFlood Call get_schema(...)" ran two sentences into
+    one, so an agent read the tool name as part of the last suggestion."""
+    message = str(UnknownAttributeError("fvBD", "arpFlod", ["arpFlood"], "6.0(9c)"))
+    assert "Closest matches: arpFlood. Call get_schema('fvBD')" in message
+
+    several = str(UnknownAttributeError("fvBD", "x", ["a", "b"], "6.0(9c)"))
+    assert "Closest matches: a, b. Call get_schema('fvBD')" in several
+
+
 def test_unknown_attribute_error_is_catchable_as_the_base():
     with pytest.raises(NiwashiMcpError):
         raise UnknownAttributeError("fvBD", "x", [], "6.0(9c)")
