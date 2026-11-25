@@ -229,6 +229,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Changed
 
+- **Dev tooling moved to pytest 9.2.0, pytest-asyncio 1.5.0 and ruff 0.17.6.**
+  Ruff reports no findings under the existing rule selection. pytest-asyncio
+  1.5 warns when `asyncio_default_fixture_loop_scope` is unset, so it is set to
+  `fixture-scope`, which keeps the current loop behaviour. Lock only; no runtime
+  change.
+
 - **`get_schema` samples very long enumerations.** A property's `options` is
   cut at max(`list_limit`, 100) and the entry gains `optionsTruncated:
   {returned, total, note}`. `faultInst.code` enumerates 80,512 values, so
@@ -426,6 +432,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   installation from the published package resolves from `pyproject.toml` and
   ignores `uv.lock` — a lock bump alone would leave `uvx niwashi-mcp` free to
   resolve a release the advisories cover.
+- Lock moved for the transitive packages under fastmcp's transport and auth
+  stack. Reached on `/mcp`: `mcp` 1.28.1 → 1.30.0 fixes GHSA-84m7-p3x7-pcfv
+  (unbounded session accumulation in the StreamableHTTP transport), and
+  `opentelemetry-api` 1.44.0 → 1.45.2 fixes GHSA-mf5v-w3w3-f6cg (quadratic
+  `traceparent` parsing) and GHSA-xcq7-p3pf-p88h (unbounded `tracestate`).
+  fastmcp extracts `traceparent` and `tracestate` from each tool call's
+  request metadata, so a caller who reaches `/mcp` reaches that parser. With
+  `mcp` 1.30 an idle stateful session closes after 30 minutes and a server
+  holds at most 10,000 sessions; a client whose session has expired gets a 404
+  and re-initialises.
+  Pulled in but not reached by niwashi, which configures no fastmcp auth
+  provider and uses its own API-key middleware: `dnspython` 2.8.0 → 2.9.2
+  (GHSA-45c3-73f7-pv4m, GHSA-vvf4-9x63-8xvv; only `email-validator` loads it,
+  and no wire or zone parsing runs), `authlib` 1.7.2 → 1.9.10 (empty HMAC key
+  acceptance, GHSA-8m4g-j4wp-wgcg; the JWT and OAuth paths are not used),
+  `joserfc` 1.7.4 → 1.8.0 (GHSA-9pg5-8c7x-5hfx, GHSA-jpxq-7h8p-2q76) and
+  `pyjwt` 2.13.0 → 2.15.1 (GHSA-42vr-xj54-vc7v). `python-dotenv` 1.2.2 → 1.2.4
+  is a direct dependency bumped in the same lock.
 
 ---
 
