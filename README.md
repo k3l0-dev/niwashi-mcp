@@ -326,6 +326,23 @@ Vulnerability disclosure policy: [SECURITY.md](SECURITY.md).
 
 ---
 
+## Upgrading from 2.x
+
+3.0 is a major release: five things can change what an existing deployment or
+agent sees. Everything else is additive.
+
+| What changed | What to do |
+|---|---|
+| A reverse proxy on the **same machine** gets `421` on every request, `/health` included | Set `MCP_ALLOWED_HOSTS=<public name>` — see the [reverse proxy guide](docs/getting-started/reverse-proxy.md). Proxies on another host, LAN binds with API keys and local clients are unaffected |
+| An unknown attribute name in `filters`, `order_by`, `filter_expr` or `include_children` raises `UnknownAttributeError` (with suggestions) instead of returning `[]` | Nothing for a correct query. `NIWASHI_MCP_STRICT_ATTRIBUTES=false` downgrades it to a warning |
+| An `eq`/`ne` value outside an attribute's allowed set (e.g. a fault code the attribute does not list) is a tool error, where it used to come back as `count: 1` or an `error` row | Use `wcard`, or `count(..., group_by="code")` to list the codes present |
+| Secrets the APIC returns in clear (device credentials, SNMP communities, session tokens, and their echoes in audit and event records) read `<redacted>`; filters, `order_by` and `group_by` on them, and DNs that spell one, are refused | Nothing to configure, and there is no opt-out |
+| `python main.py` is removed | Start with `niwashi-mcp` or `python -m niwashi_mcp.main` |
+
+The server now runs on fastmcp 4.2.6 and the MCP SDK 2.x; the wire protocol
+clients see is unchanged, and Claude Code was checked against it. Full detail:
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Migrating from 1.x
 
 Upgrading is mostly deletion. The tools an agent calls did not change, so a
@@ -334,7 +351,7 @@ client config only needs its URL to keep working.
 | What changed | What to do |
 |---|---|
 | Distribution is `niwashi-mcp`, import package `niwashi_mcp` | Install with `uvx niwashi-mcp` |
-| `python main.py` is deprecated | Use `niwashi-mcp`, or `python -m niwashi_mcp.main`. The shim still works and goes away in 3.0 |
+| `python main.py` was deprecated in 2.0 and is removed in 3.0 | Use `niwashi-mcp`, or `python -m niwashi_mcp.main` |
 | `data/` and the schema download are gone | Delete the directory; drop any `/data` volume mount from your compose file |
 | `query()` and `count()` now accept 15,452 classes instead of 15,239 | Nothing — strictly more classes are valid than before |
 | `mo:MoClassId`, `mo:PropId`, `mo:StatsClassId` and `mo:StatsPropId` properties no longer carry an `options` list | Nothing. One of them listed 17,653 entries — the entire class list — into the agent's context |
