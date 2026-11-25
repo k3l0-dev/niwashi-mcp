@@ -867,6 +867,113 @@ async def test_query_class_fetch_all_remembers_the_total_from_an_earlier_page():
     assert result.complete is False
 
 
+# ── query_class() — fetch_all: totalCount that moves, and objects seen twice ──
+#
+# The set is not frozen while a walk reads it. totalCount can change between
+# pages, and an object created or deleted early in the set shifts every later
+# page by one — so the object on a page boundary can arrive twice while another
+# is never sent.
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_latest_total_count_wins_when_the_set_shrinks():
+    """Page 0 says 450, page 1 says 400 and 400 objects are in hand: complete.
+
+    Keeping the FIRST figure would see 400 < 450 behind a full page and ask for
+    a page 2 the set no longer has (the fake transport raises on it), and would
+    report a total_available the APIC had already retracted.
+    """
+    client = _make_client(
+        _bd_page([f"n{i}" for i in range(0, 200)], 450),
+        _bd_page([f"n{i}" for i in range(200, 400)], 400),
+    )
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+
+    assert len(result.objects) == 400
+    assert result.total_available == 400
+    assert result.complete is True
+    assert len(client._client.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_latest_total_count_wins_when_the_set_grows():
+    """Page 0 says 250, the short page 1 says 300 and only 250 are in hand.
+
+    The figure the walk ends on is the one the APIC last gave. Keeping the first
+    would call 250 of 300 complete, the set having grown under the walk.
+    """
+    client = _make_client(
+        _bd_page([f"n{i}" for i in range(0, 200)], 250),
+        _bd_page([f"n{i}" for i in range(200, 250)], 300),
+    )
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+
+    assert len(result.objects) == 250
+    assert result.total_available == 300
+    assert result.complete is False
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_an_object_seen_twice_is_not_a_second_object(caplog):
+    """250 matches; page 1 repeats the last object of page 0 and so is one short.
+
+    249 distinct objects against a totalCount of 250: the walk is incomplete.
+    Counting the repeat made it 250 — complete=True, a duplicate in the answer,
+    and the object the shift skipped never missed. The first copy is the one
+    kept, and the drop is logged.
+    """
+    first = _bd_page([f"n{i}" for i in range(0, 200)], 250)
+    second = _bd_page(["changed-copy"] + [f"n{i}" for i in range(200, 249)], 250)
+    # Same dn as the last object of page 0, different content.
+    second.json()["imdata"][0]["fvBD"]["attributes"]["dn"] = "uni/tn-OT/BD-n199"
+    client = _make_client(first, second)
+    with caplog.at_level("WARNING", logger="niwashi-mcp.apic"):
+        result = await client.query_class("fvBD", {}, fetch_all=True)
+
+    dns = [o["dn"] for o in result.objects]
+    assert len(dns) == len(set(dns)) == 249
+    assert next(o for o in result.objects if o["dn"].endswith("BD-n199"))["name"] == "n199"
+    assert result.total_available == 250
+    assert result.complete is False
+    assert "dropped 1 duplicate" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_a_repeat_on_a_full_page_does_not_end_the_walk():
+    """450 matches, and page 1 repeats n199 yet still carries 200 objects.
+
+    A full page is full whatever it repeats, so the walk goes on to page 2 —
+    judging "short" on the objects KEPT would stop at 199 and report a walk that
+    had 51 objects to go as incomplete. Page 2 then covers the remaining
+    distinct objects: all 450 are in hand, once each, so it is complete. Without
+    the dedupe the count reaches 450 a page early with 451 objects in the
+    answer.
+    """
+    client = _make_client(
+        _bd_page([f"n{i}" for i in range(0, 200)], 450),
+        _bd_page([f"n{i}" for i in range(199, 399)], 450),
+        _bd_page([f"n{i}" for i in range(399, 450)], 450),
+    )
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+
+    names = [o["name"] for o in result.objects]
+    assert names == [f"n{i}" for i in range(450)]
+    assert result.total_available == 450
+    assert result.complete is True
+    assert len(client._client.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_query_class_fetch_all_objects_without_a_dn_are_kept_and_counted():
+    """Nothing to tell two of them apart by, so none is ever called a repeat."""
+    objects = make_imdata_objects("fvBD", [{"name": "a"}, {"name": "a"}, {"name": "b"}])
+    client = _make_client(_MockResponse(200, {"totalCount": "3", "imdata": objects}))
+    result = await client.query_class("fvBD", {}, fetch_all=True)
+
+    assert [o["name"] for o in result.objects] == ["a", "a", "b"]
+    assert result.complete is True
+
+
 @pytest.mark.asyncio
 async def test_query_class_timeout_after_reauth_recovers_on_next_attempt():
     """A timeout on the retry GET (right after a successful re-auth) is now

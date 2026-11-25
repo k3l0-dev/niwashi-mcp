@@ -440,10 +440,11 @@ class ApicClient:
                                  matching object into one QueryResult instead of
                                  returning just the first page. Stops, in order
                                  of precedence, when:
-                                   1. the objects in hand reach the APIC's
-                                      totalCount → complete=True (this includes
-                                      a set that is an exact multiple of the
-                                      page size, with no extra empty request);
+                                   1. the distinct objects in hand reach
+                                      the APIC's totalCount → complete=True
+                                      (this includes a set that is an exact
+                                      multiple of the page size, with no
+                                      extra empty request);
                                    2. a page comes back short or empty — the
                                       natural end → complete=True when no
                                       totalCount was reported, but complete=
@@ -456,6 +457,12 @@ class ApicClient:
                                  or returned; none past the cap are trimmed
                                  after the fact, because the cap lands on a
                                  page boundary. `page` is ignored.
+                                 An object that arrives twice — the set shifted
+                                 between two pages — is kept once, by `dn`
+                                 (first copy wins; an object with no `dn` is
+                                 always kept), and counted once toward
+                                 totalCount, so a repeat can never stand in for
+                                 an object the walk missed.
 
         Returns:
             A QueryResult carrying:
@@ -508,6 +515,8 @@ class ApicClient:
             return QueryResult(objects=objects, total_available=total_available)
 
         objects: list[dict[str, Any]] = []
+        seen_dns: set[str] = set()
+        duplicates = 0
         reported_total: int | None = None
         complete = False
         for page_num in range(_MAX_PAGES):
@@ -516,12 +525,34 @@ class ApicClient:
             logger.debug("GET %s params=%s", url, params)
             body = await self._request_json(url, params)
             page_objects = self._parse_query_objects(body, include_children)
-            objects.extend(page_objects)
+
+            # The set is not frozen while it is walked. An object created or
+            # deleted between two requests shifts every later page by one, so
+            # the object at a page boundary arrives twice (and another is
+            # skipped). Counting the repeat toward totalCount would let the
+            # walk reach the count one object short and call itself complete
+            # with a duplicate in the answer, so the first copy is kept and
+            # the walk is judged on the objects that are actually distinct. An
+            # object with no dn cannot be told apart from another, so it is
+            # always kept and counted.
+            for obj in page_objects:
+                dn = obj.get("dn")
+                if dn is None:
+                    objects.append(obj)
+                elif dn in seen_dns:
+                    duplicates += 1
+                else:
+                    seen_dns.add(dn)
+                    objects.append(obj)
 
             # totalCount is re-read on every page and the latest value wins: a
             # set that grows or shrinks while it is being walked is then
             # reported as the APIC last saw it. A page that omits it keeps the
-            # previous figure rather than forgetting it.
+            # previous figure rather than forgetting it. The consequence is
+            # that completeness is a count, not an identity check: if the set
+            # shrinks to the number of distinct objects already in hand the
+            # walk is complete, because that is every object the APIC says
+            # there now is.
             page_total = self._reported_total(body)
             if page_total is not None:
                 reported_total = page_total
@@ -540,6 +571,9 @@ class ApicClient:
             #    has not been reached the APIC has stopped answering before it
             #    has finished, so the result is NOT complete — and we stop
             #    rather than ask for page after empty page.
+            #    "Short" is judged on what the APIC sent, not on what was
+            #    kept: a full page that happened to repeat an object is not
+            #    the end of the set.
             if len(page_objects) < _FETCH_ALL_PAGE_SIZE:
                 complete = reported_total is None
                 if not complete:
@@ -554,6 +588,13 @@ class ApicClient:
             # 3. Otherwise the page was full: ask for the next, until
             #    _MAX_PAGES. Falling out of the loop is the cap — `complete`
             #    stays False, and `total_available` says how much was left.
+
+        if duplicates:
+            logger.warning(
+                "query_class(%s, fetch_all=True): dropped %d duplicate "
+                "object(s) — the set changed while it was being read",
+                class_name, duplicates,
+            )
 
         # Without a totalCount from the APIC the best statement of the set's
         # size is what was fetched, the same fallback every other path uses.
