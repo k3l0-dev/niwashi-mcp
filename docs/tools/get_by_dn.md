@@ -11,6 +11,7 @@ get_by_dn(
     dn: str,
     config_only: bool = False,
     include_children: list[str] | None = None,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]
 ```
 
@@ -19,6 +20,7 @@ get_by_dn(
 | `dn` | `str` | — | Full Distinguished Name, e.g. `"uni/tn-OT/BD-servers"` |
 | `config_only` | `bool` | `False` | Return only user-configurable attributes (`rsp-prop-include=config-only`) — ideal for backup and comparison |
 | `include_children` | `list[str]` | — | Child class names to embed. The returned object gains a `_children` list |
+| `fields` | `list[str]` | — | Attribute names to keep. The object and each `_children` entry are reduced to these plus `dn`, `_class` and `_children`. See [Field projection](#field-projection) |
 
 ---
 
@@ -62,6 +64,21 @@ With `include_children` set, the object also carries a `_children` list:
 }
 ```
 
+### Field projection
+
+With `fields` set, the object and each `_children` entry keep only the listed attributes plus `dn`, `_class` and `_children` (always kept):
+
+```python
+bd = await get_by_dn("uni/tn-OT/BD-servers", fields=["name", "arpFlood"])
+# {"name": "servers", "arpFlood": "no", "dn": "uni/tn-OT/BD-servers", "_class": "fvBD"}
+```
+
+- **Validated after the fetch.** The DN encodes the class, so nothing names it up front; each name is checked against the `_class` of the object the APIC returned, plus any `include_children` classes (so a field valid only on an embedded child is accepted). That is why, unlike [`query`](query.md), a bad name is refused only after the request has been made.
+- **Unknown name:** `UnknownAttributeError`, with the closest matches for the returned class.
+- **Empty list:** `fields=[]` keeps only `dn`, `_class` and `_children`; omit `fields` to receive every attribute.
+- **Relaxed checking** (`NIWASHI_MCP_STRICT_ATTRIBUTES=false`): an unknown name is not refused. A warning is logged and, because this tool returns the bare object rather than an envelope, the object carries a `_note` key naming the unverified fields. `_note` appears only in that case (and with `fields=[]`).
+- **Not found** is unaffected: a missing DN returns the `found: false` dict below, whatever `fields` says — there is no class to validate against.
+
 ### Not found
 
 The APIC returns an empty result for a missing DN. `get_by_dn` turns that into an explicit, structured message rather than a bare `[]`:
@@ -104,6 +121,7 @@ if obj.get("found") is False:
 
 | Exception | Condition |
 |---|---|
+| `UnknownAttributeError` | A name in `fields` is not a property of the returned object's class nor of any `include_children` class. Raised after the fetch. Not raised when attribute checking is relaxed (see [Field projection](#field-projection)). |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed DN string, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. Note: a DN that is well-formed but points to nothing does **not** raise — it returns `{"found": False, ...}` (see [Return value](#return-value)). |
 
 ---

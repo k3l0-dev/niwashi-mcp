@@ -72,13 +72,16 @@ query() parameters
                        "faults,required", "faults,no-scoped"
   time_range           Log record window: "24h", "1week", "2026-01-01|2026-01-31"
                        Valid for faultRecord, aaaModLR, eventRecord, healthRecord
+  fields               Keep only these attributes on each result and each
+                       child, plus dn / _class / _children; unknown names are
+                       refused (UnknownAttributeError)
 
 query() return shape
 --------------------
   An envelope, not a bare list:
     {"results": [...], "returned": <int>, "total_available": <int>,
      "truncated": <bool>, "next_page": <int|None>, "complete": <bool>,
-     "note": <str|None>}
+     "note": <str|None>, "fields": <list[str]|None>}
   A `truncated: true` response must never be read as a maximum, minimum,
   total, or complete list — re-run with fetch_all=True or page to exhaustion
   first. See the FULL-FABRIC AGGREGATION section of the server instructions.
@@ -90,7 +93,7 @@ import logging
 import os
 import signal
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, NotRequired, TypedDict
 
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
@@ -790,6 +793,113 @@ async def _enforce_attributes(
             "matches."
         )
     return messages
+# ── Typed envelopes ───────────────────────────────────────────────────────────
+#
+# FastMCP derives a tool's advertised `outputSchema` from its return annotation.
+# `dict[str, Any]` produced `{"type": "object", "additionalProperties": true}` —
+# a client was told "an object" and nothing about the envelope an agent must
+# read (`truncated`, `complete`, `next_page`). These name the keys. Result items
+# stay free-form: which attributes an object carries depends on its class.
+#
+# Keys another change may add are `NotRequired`, so that adding one is an
+# addition to the schema rather than a break of every client that validates
+# against it. A key that is present but null (`next_page`, `note`) is `| None`
+# instead: the wire carries the null, so the schema has to admit it.
+
+
+class QueryEnvelope(TypedDict):
+    """The envelope `query` returns — see the tool's docstring for each key."""
+
+    results: list[dict[str, Any]]
+    returned: int
+    total_available: int
+    truncated: bool
+    next_page: int | None
+    complete: bool
+    note: str | None
+    fields: list[str] | None
+
+
+class CountEnvelope(TypedDict):
+    """The dict `count` returns — see the tool's docstring for each key."""
+
+    class_name: str
+    count: int
+    scope_dn: str | None
+    filters: dict[str, str]
+    warnings: NotRequired[list[str]]
+    group_by: NotRequired[str]
+    groups: NotRequired[dict[str, int]]
+    complete: NotRequired[bool]
+    note: NotRequired[str]
+
+
+# ── Field projection ──────────────────────────────────────────────────────────
+
+# What a projection never removes. `dn` is how the object is addressed again,
+# `_class` says what it is, and `_children` is the embedded subtree — which is
+# projected in turn rather than dropped, so a caller that asked for children
+# still receives them.
+_PROJECTION_KEEPS = frozenset({"dn", "_class", "_children"})
+
+
+def _project(obj: dict[str, Any], keep: frozenset[str]) -> dict[str, Any]:
+    """Reduce ``obj`` and each of its ``_children`` to ``keep`` plus the fixed keys.
+
+    Builds new dicts and leaves ``obj`` alone: it is the backend's answer, and a
+    backend that hands out a cached or shared dict must not see it shrink. Key
+    order is the APIC's, not the caller's — the same object reads the same way
+    with and without a projection.
+    """
+    kept = keep | _PROJECTION_KEEPS
+    out = {k: v for k, v in obj.items() if k in kept}
+    children = out.get("_children")
+    if isinstance(children, list):
+        out["_children"] = [
+            {k: v for k, v in child.items() if k in kept} for child in children
+        ]
+    return out
+
+
+def _unknown_fields(fields: list[str], classes: list[str]) -> list[str]:
+    """The names in ``fields`` that no class in ``classes`` carries, in order.
+
+    A name counts as known when ANY of the classes has it: a field may be
+    wanted for the queried objects or for the children embedded in them, and
+    the two are validated together because one flat list is projected onto
+    both. ``dn``, ``_class`` and ``_children`` are always kept, so naming them
+    is accepted rather than refused as an attribute nobody has.
+    """
+    known: frozenset[str] = frozenset().union(
+        *(catalog.known_properties(c) for c in classes if c)
+    )
+    return [f for f in fields if f not in known and f not in _PROJECTION_KEEPS]
+
+
+def _suggest_fields(name: str, classes: list[str]) -> list[str]:
+    """Closest property names to ``name`` across ``classes``, nearest-class first."""
+    seen: list[str] = []
+    for cls in classes:
+        for candidate in catalog.closest_properties(cls, name):
+            if candidate not in seen:
+                seen.append(candidate)
+    return seen[:5]
+
+
+def _unknown_fields_note(unknown: list[str], class_name: str) -> str:
+    """The non-strict wording: the request goes through, the doubt is said aloud."""
+    return (
+        f"fields not found on {class_name} or its requested children in the "
+        f"catalogue (APIC {catalog.apic_version()}): {', '.join(unknown)}. They "
+        "were kept in the projection anyway because attribute checking is "
+        "relaxed; a name missing from the results is absent from this "
+        "fabric's objects, not an empty value."
+    )
+
+
+def _append_note(note: str | None, extra: str) -> str:
+    """Add ``extra`` to ``note`` without overwriting what is already there."""
+    return f"{note} {extra}" if note else extra
 
 
 @mcp.tool(title="Query ACI objects", annotations=_FABRIC_READ)
@@ -807,7 +917,8 @@ async def query(
     page: int | None = None,
     config_only: bool = False,
     fetch_all: bool = False,
-) -> dict[str, Any]:
+    fields: _JsonList | None = None,
+) -> QueryEnvelope:
     """Query ACI objects of a given class from the APIC.
 
     ⚠ PREREQUISITE — before calling this tool you MUST have:
@@ -900,8 +1011,9 @@ async def query(
            "complete": <bool>,          # False only if fetch_all stopped short of
                                         # total_available (5,000-object cap, or
                                         # the APIC ended its pages early)
-           "note": <str|None>}          # guidance, present only when truncated or
+           "note": <str|None>,          # guidance, present only when truncated or
                                         # capped, or when a name was sent unchecked
+           "fields": <list[str]|None>}  # the projection applied, None when `fields` was not set
         Each dict in "results" contains all APIC attributes for the object
         plus a "_class" key with the ACI class name. The "dn" attribute is
         always present and encodes the full object path. When
@@ -925,11 +1037,14 @@ async def query(
                            or in a `filter_expr` operand.
         UnknownAttributeError: an attribute in `filters`, `order_by` or
                            `filter_expr` is not a property of its class in the
-                           catalogue — includes the closest real names. For an
-                           abstract class every concrete subclass's properties
-                           count. The catalogue describes one APIC release, so
-                           a fabric on another may carry a name it lacks; the
-                           operator can relax the check (see above).
+                           catalogue, or a name in `fields` is no property of
+                           class_name nor of any include_children class —
+                           includes the closest real names. For an abstract
+                           class every concrete subclass's properties count.
+                           Raised before the APIC is called. The catalogue
+                           describes one APIC release, so a fabric on another
+                           may carry a name it lacks; the operator can relax
+                           the check (see above).
         FilterError:       `class_name` or a `filters` key contains characters
                            outside the expected ACI identifier format (see
                            registry.filter.build_filter). Filter *values* are
@@ -967,6 +1082,31 @@ async def query(
         include_children=include_children,
         filter_expr=filter_expr,
     )
+    # A projected-away attribute is invisible: a misspelled `fields` entry would
+    # yield objects that merely lack the key, indistinguishable from objects
+    # that never had it. Checked before the APIC is called, like the class.
+    fields_note: str | None = None
+    if fields is not None:
+        field_classes = [class_name, *(include_children or [])]
+        unknown_fields = _unknown_fields(fields, field_classes)
+        if unknown_fields:
+            await ctx.warning(
+                f"query({class_name!r}) fields not in the catalogue: {unknown_fields!r}"
+            )
+            if _strict_attributes():
+                raise UnknownAttributeError(
+                    class_name,
+                    unknown_fields[0],
+                    _suggest_fields(unknown_fields[0], field_classes),
+                    catalog.apic_version(),
+                )
+            fields_note = _unknown_fields_note(unknown_fields, class_name)
+        if not fields:
+            fields_note = _append_note(
+                fields_note,
+                "fields=[] keeps only dn, _class and _children; omit `fields` "
+                "to receive every attribute.",
+            )
 
     clamped_limit = max(1, min(limit, 200))
     await ctx.info(
@@ -989,7 +1129,12 @@ async def query(
         fetch_all=fetch_all,
     )
 
-    returned = len(result.objects)
+    objects = result.objects
+    if fields is not None:
+        keep = frozenset(fields)
+        objects = [_project(obj, keep) for obj in objects]
+
+    returned = len(objects)
 
     # `truncated` must be measured against what the caller has *consumed*, not
     # against the size of the page in hand. Comparing `total_available` to
@@ -1044,14 +1189,18 @@ async def query(
         f"(truncated={truncated}, complete={result.complete})"
     )
 
+    if fields_note:
+        note = _append_note(note, fields_note)
+
     return {
-        "results": result.objects,
+        "results": objects,
         "returned": returned,
         "total_available": result.total_available,
         "truncated": truncated,
         "next_page": (page or 0) + 1 if truncated and not fetch_all else None,
         "complete": result.complete,
         "note": note,
+        "fields": list(fields) if fields is not None else None,
     }
 
 
@@ -1061,6 +1210,7 @@ async def get_by_dn(
     ctx: Context,
     config_only: bool = False,
     include_children: _JsonList | None = None,
+    fields: _JsonList | None = None,
 ) -> dict[str, Any]:
     """Fetch a single ACI object directly by its Distinguished Name.
 
@@ -1080,11 +1230,22 @@ async def get_by_dn(
                           and comparison without operational noise.
         include_children: Child class names to embed, e.g. ["fvSubnet", "fvRsCtx"].
                           The returned object gains a "_children" list.
+        fields:           Attribute names to keep, e.g. ["name", "arpFlood"].
+                          The object and each "_children" entry are reduced to
+                          these plus "dn", "_class" and "_children", which are
+                          always kept. Names are checked against the class the
+                          APIC returned (and any include_children class), not
+                          against a class you named — the DN carries it. An
+                          unknown name raises UnknownAttributeError. [] keeps
+                          only the always-kept keys; omit `fields` to get every
+                          attribute.
 
     Returns:
         On success, the object's attribute dict — same shape as a query() result
         element: all APIC attributes plus a "_class" key (and "_children" when
-        include_children is set).
+        include_children is set), reduced to `fields` when that is set. With
+        attribute checking relaxed (NIWASHI_MCP_STRICT_ATTRIBUTES=false) an
+        unknown name is not refused: the object carries a "_note" key saying so.
 
         When no object exists at that DN, a structured not-found dict:
           {"found": False, "dn": <dn>, "message": <explanation>}
@@ -1093,6 +1254,10 @@ async def get_by_dn(
         is a stale or mistyped DN — re-verify it via search_classes → query.
 
     Raises:
+        UnknownAttributeError: a name in `fields` is no property of the returned
+                          object's class nor of any include_children class —
+                          includes the closest matches. Raised only after the
+                          fetch, since the class is not known before it.
         ApicRequestError: APIC returned a non-2xx, non-auth response — e.g. 400
                           for a malformed DN string. Carries the HTTP status
                           and, when present, the APIC error text.
@@ -1117,7 +1282,41 @@ async def get_by_dn(
             ),
         }
     await ctx.info(f"get_by_dn({dn!r}) → {obj.get('_class')}")
-    return obj
+    if fields is None:
+        return obj
+
+    # The class is only known now, from the object the DN resolved to — which
+    # is why this cannot fail before the APIC is called as query()'s check does.
+    object_class = str(obj.get("_class", ""))
+    field_classes = [object_class, *(include_children or [])]
+    unknown_fields = _unknown_fields(fields, field_classes)
+    note: str | None = None
+    if unknown_fields:
+        await ctx.warning(
+            f"get_by_dn({dn!r}) fields not in the catalogue for "
+            f"{object_class!r}: {unknown_fields!r}"
+        )
+        if _strict_attributes():
+            raise UnknownAttributeError(
+                object_class,
+                unknown_fields[0],
+                _suggest_fields(unknown_fields[0], field_classes),
+                catalog.apic_version(),
+            )
+        note = _unknown_fields_note(unknown_fields, object_class)
+    if not fields:
+        note = _append_note(
+            note,
+            "fields=[] keeps only dn, _class and _children; omit `fields` "
+            "to receive every attribute.",
+        )
+
+    projected = _project(obj, frozenset(fields))
+    if note:
+        # No envelope to carry it here — the object is the whole answer — so
+        # the note rides on the object under a synthetic key, like `_class`.
+        projected["_note"] = note
+    return projected
 
 
 @mcp.tool(title="Count ACI objects", annotations=_FABRIC_READ)
@@ -1127,7 +1326,7 @@ async def count(
     filters: _JsonDict | None = None,
     scope_dn: str | None = None,
     filter_expr: str | None = None,
-) -> dict[str, Any]:
+) -> CountEnvelope:
     """Count ACI objects of a class without transferring them.
 
     Answers "how many X?" — a pure tally. It does NOT answer "which X has the

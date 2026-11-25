@@ -416,9 +416,11 @@ async def test_a_valid_request_returns_exactly_the_shape_it_always_did(tool_ctx)
     envelope = await query("fvBD", tool_ctx, filters={"name": "servers"})
     assert set(envelope) == {
         "results", "returned", "total_available",
-        "truncated", "next_page", "complete", "note",
+        "truncated", "next_page", "complete", "note", "fields",
     }
     assert envelope["note"] is None
+    # `fields` is the projection echo added alongside validation; unset, it is null.
+    assert envelope["fields"] is None
 
     result = await count("fvBD", tool_ctx, filters={"name": "servers"})
     assert result == {

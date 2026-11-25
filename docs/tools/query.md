@@ -22,7 +22,8 @@ query(
     page: int | None = None,
     config_only: bool = False,
     fetch_all: bool = False,
-) -> dict[str, Any]
+    fields: list[str] | None = None,
+) -> QueryEnvelope
 ```
 
 **Returns an envelope dict, not a bare list** — see [Return value](#return-value) below. This is a breaking-looking change for any code written against an older version of this doc: `result["results"][0]["dn"]`, not `result[0]["dn"]`.
@@ -71,6 +72,7 @@ query(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `config_only` | `bool` | `False` | When `True`, return only user-configurable attributes (APIC `rsp-prop-include=config-only`) instead of the full ~40-attribute set. Ideal for comparison, drift detection, and backup — drops runtime state, timestamps, and monitoring counters. |
+| `fields` | `list[str]` | — | Attribute names to keep, e.g. `["name", "arpFlood"]`. Each result **and each `_children` entry** is reduced to these plus `dn`, `_class` and `_children`, which are always kept. See [Field projection](#field-projection). |
 
 ### Time-based queries
 
@@ -107,7 +109,8 @@ An **envelope dict** — not a bare list:
   "truncated": false,
   "next_page": null,
   "complete": true,
-  "note": null
+  "note": null,
+  "fields": null
 }
 ```
 
@@ -119,7 +122,10 @@ An **envelope dict** — not a bare list:
 | `truncated` | `bool` | `total_available > returned` — a default-page result is a **partial page**, not the whole matching set. Never conclude a max/min/total/complete-list answer from a truncated result. |
 | `next_page` | `int \| None` | `page + 1` when truncated and `fetch_all` was not used; `None` otherwise |
 | `complete` | `bool` | `False` only if `fetch_all=True` stopped short of `total_available` — at the 5,000-object cap, or because the APIC ended its pages before the `totalCount` it reported. A set of exactly 5,000 objects is complete. |
-| `note` | `str \| None` | Guidance text, present only when truncated or capped — or when [relaxed attribute checking](#relaxing-the-check) sent a name the catalogue did not know. When several apply they are joined into one string, the truncation or cap note first. |
+| `note` | `str \| None` | Guidance text — set when truncated or capped, and when [relaxed attribute checking](#relaxing-the-check) sent a name the catalogue did not know (in `filters`, `order_by`, `include_children`, `filter_expr` or `fields`). When several apply they are joined into one string, the truncation or cap note first, never replacing it. |
+| `fields` | `list[str] \| None` | The projection that was applied, echoed as given; `None` when `fields` was not set. Added in this release: every envelope now carries it, `null` by default — the one change to an unprojected result. |
+
+The envelope is a typed dict (`QueryEnvelope`), so the `outputSchema` the server advertises names these keys, marks all of them required, and admits `null` for `next_page`, `note` and `fields`. `results` items stay free-form objects: which attributes an object carries depends on its class.
 
 Any code written against the older (pre-envelope) shape of this doc needs updating: `result["results"][0]["dn"]`, not `result[0]["dn"]`.
 
@@ -130,7 +136,7 @@ Any code written against the older (pre-envelope) shape of this doc needs updati
 | Exception | Condition |
 |---|---|
 | `UnknownClassError` | `class_name` is not in the catalogue — the single source of truth for whether an ACI class exists (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index, which is smaller than the validated universe). The 213 catalogue classes absent from the search index validate normally: 2.0 removed the two-tier fallback and the warning it used to emit on them. Also raised for an unknown class in `include_children`, or as the `Class` of a `Class.attr` operand in `filter_expr` or `order_by` (the same error, built the same way). |
-| `UnknownAttributeError` | An attribute in `filters`, `order_by` or `filter_expr` is not a property of its class in the catalogue. Carries `.class_name`, `.attribute`, `.suggestions` (the closest real property names — a case-only difference first) and `.catalogue_version`. Nothing has been sent to the APIC when it is raised. |
+| `UnknownAttributeError` | An attribute in `filters`, `order_by` or `filter_expr` is not a property of its class in the catalogue, or a name in `fields` is not a property of `class_name` nor of any class in `include_children`. Carries `.class_name`, `.attribute`, `.suggestions` (the closest real property names — a case-only difference first) and `.catalogue_version`. Nothing has been sent to the APIC when it is raised. With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` it is not raised: see [Relaxing the check](#relaxing-the-check). |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter *values* are always escaped, never rejected — this can only be raised by an identifier, not a value. |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
 
@@ -178,6 +184,27 @@ Set `NIWASHI_MCP_STRICT_ATTRIBUTES=false` (see [Settings](../configuration/setti
 ```
 
 An empty result next to such a note is **not** an answer of zero. The class named by `class_name` itself is outside this switch: an unknown one always raises.
+## Field projection
+
+A wide class carries ~40 attributes per object. `fields` cuts each object down to the few the caller will read, so more objects fit in one answer:
+
+```python
+bds = await query("fvBD", scope_dn="uni/tn-OT", fields=["name", "arpFlood"])
+# every result: {"name": ..., "arpFlood": ..., "dn": ..., "_class": "fvBD"}
+```
+
+- **Always kept:** `dn`, `_class` and `_children`. Naming them in `fields` is accepted and changes nothing.
+- **Children are projected too.** With `include_children`, each `_children` entry is reduced by the same list, so one flat list serves both levels. This includes children that arrive through `rsp_subtree_include`.
+- **Validation.** Every name must be a property of `class_name` *or* of at least one `include_children` class — a name valid only on the child is accepted, because the list is applied to both. Anything else raises `UnknownAttributeError` with the closest matches, before the request is sent; without that check a misspelled field would return objects that merely lack the key, which reads as "the attribute is empty".
+- **Empty list.** `fields=[]` keeps only `dn`, `_class` and `_children`, and the `note` says so. Omit `fields` to receive every attribute — the two are not the same request.
+- **Unchanged:** which objects match, `returned`, `total_available`, `truncated` and paging. Projection runs after the APIC answers, so it saves response size on the way to the agent, not work on the APIC. Key order is the APIC's.
+- **Relaxed checking.** With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` an unknown name is kept in the projection, a warning is logged, and the `note` lists it — an attribute missing from the results is then absent from the objects, not empty.
+
+```python
+# `ip` belongs to fvSubnet, not fvBD: valid only because fvSubnet is included
+bd = await query("fvBD", filters={"name": "servers"},
+                 include_children=["fvSubnet"], fields=["name", "ip"])
+```
 
 ---
 
@@ -300,6 +327,12 @@ nodes = await query("fabricNode",
     filter_expr='ne(fabricNode.role,"controller")',
     order_by="fabricNode.id|asc")
 node_list = nodes["results"]
+```
+
+### Just names and addresses, over a large class
+
+```python
+subnets = await query("fvSubnet", fetch_all=True, fields=["ip", "scope"])
 ```
 
 ### Configuration snapshot for backup / diff

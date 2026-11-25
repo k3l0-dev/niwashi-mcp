@@ -14,7 +14,7 @@ count(
     filters: dict[str, str] | None = None,
     scope_dn: str | None = None,
     filter_expr: str | None = None,
-) -> dict[str, Any]
+) -> CountEnvelope
 ```
 
 | Parameter | Type | Default | Description |
@@ -76,6 +76,8 @@ With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` nothing is raised: the request is sen
 ```
 
 **A `count` of zero beside a warning is not an answer of zero.** Re-check the name with `get_schema()` before reporting it.
+
+The return is a typed dict (`CountEnvelope`), so the `outputSchema` the server advertises names these keys: the four above are required, and `scope_dn` admits `null`. Any key a later release adds is declared optional in that schema, so a client validating against it keeps working.
 
 ---
 
