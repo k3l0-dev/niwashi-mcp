@@ -56,6 +56,9 @@ Changelog = "https://github.com/k3l0-dev/niwashi-mcp/blob/main/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# pytest-asyncio 1.5 warns when this is unset. "fixture-scope" keeps the
+# current behaviour (async fixtures run on their own scope's loop).
+asyncio_default_fixture_loop_scope = "fixture-scope"
 testpaths = ["tests"]
 # Exclude tests/live/ (real APIC required) from the default run so a plain
 # `uv run pytest` never attempts network access to the internal lab
