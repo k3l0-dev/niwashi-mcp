@@ -14,7 +14,7 @@ count(
     filters: dict[str, str] | None = None,
     scope_dn: str | None = None,
     filter_expr: str | None = None,
-) -> dict[str, Any]
+) -> CountEnvelope
 ```
 
 | Parameter | Type | Default | Description |
@@ -53,6 +53,8 @@ Because the tally is the very same `total_available` that `query` reports, the t
 | `count` | `int` | Number of matching objects |
 | `scope_dn` | `str \| null` | The scope DN, if one was supplied |
 | `filters` | `dict` | The filters that were applied |
+
+The return is a typed dict (`CountEnvelope`), so the `outputSchema` the server advertises names these keys: the four above are required, and `scope_dn` admits `null`. Any key a later release adds is declared optional in that schema, so a client validating against it keeps working.
 
 ---
 

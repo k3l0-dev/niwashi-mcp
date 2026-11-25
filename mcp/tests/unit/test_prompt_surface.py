@@ -147,7 +147,7 @@ def test_the_envelope_keys_promised_are_the_keys_returned():
     doc = _doc("query")
     returned = {
         "results", "returned", "total_available",
-        "truncated", "next_page", "complete", "note",
+        "truncated", "next_page", "complete", "note", "fields",
     }
     for key in returned:
         assert f'"{key}"' in doc, f"query returns {key!r} but never documents it"
