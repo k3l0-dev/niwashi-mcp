@@ -214,6 +214,45 @@ _BOUNDED_SCHEMA_LISTS = {
     "containedBy": "sample of {total} parent classes.",
 }
 
+# Enumerations get a floor above list_limit's default. Of the catalogue's 3,947
+# distinct enums the median has 3 values and the 99th percentile 33, and an agent
+# filtering on an enumerated attribute needs the whole list, so cutting at 25
+# would hide real values on ordinary classes. Only 13 enums exceed 100 — but one
+# of them, faultInst.code, has 80,512 values and made a single
+# get_schema("faultInst", properties_filter=["code"]) about 880 KB, the largest
+# tool result any agent-eval task provoked.
+_SCHEMA_OPTIONS_FLOOR = 100
+
+
+def _bound_property_options(schema: dict[str, Any], limit: int) -> dict[str, Any]:
+    """Trim each property's `options` to `limit`, recording what was withheld.
+
+    Same contract as `_bound_schema_lists`: a list at or under the limit is
+    untouched and gets no marker; a longer one is cut and its property detail
+    gains `optionsTruncated: {returned, total, note}`. Mutates and returns
+    `schema`.
+    """
+    details = schema.get("property_details")
+    if not isinstance(details, dict):
+        return schema
+    for detail in details.values():
+        options = detail.get("options") if isinstance(detail, dict) else None
+        if not isinstance(options, list) or len(options) <= limit:
+            continue
+        total = len(options)
+        detail["options"] = options[:limit]
+        detail["optionsTruncated"] = {
+            "returned": limit,
+            "total": total,
+            "note": (
+                f"sample of {total} allowed values. A value missing from the "
+                "sample may still be valid: filter on it directly rather than "
+                f"concluding it does not exist. Raise list_limit (max "
+                f"{_SCHEMA_LIST_MAX}) for a larger sample."
+            ),
+        }
+    return schema
+
 
 def _bound_schema_lists(schema: dict[str, Any], limit: int) -> dict[str, Any]:
     """Trim the unbounded schema lists to `limit`, recording what was withheld.
@@ -648,6 +687,11 @@ async def get_schema(
        "options": [<allowed value>, ...], # only for enumerated properties
        "comment": <one-line description>}
 
+    `options` lists longer than max(list_limit, 100) are sampled — only a
+    dozen enums are that long, faultInst.code (80,512 values) the largest — and
+    the entry gains `optionsTruncated: {returned, total, note}`.  A value absent
+    from a sampled list may still be valid: filter on it directly.
+
     Args:
         class_name: Exact ACI class name, e.g. "fvBD", "fvAEPg", "faultInst".
         ctx:        Injected FastMCP context (not a user-facing parameter).
@@ -657,9 +701,11 @@ async def get_schema(
                     This is the token-efficient path — ask only for the properties
                     you care about.  Unknown names are silently skipped.
         list_limit: How many `dnFormats` and `containedBy` entries to return
-                    (default 25, clamped to 1..500).  Only the handful of
-                    universal classes ever hit it; leave it alone unless a
-                    `*Truncated` marker tells you the sample was too small.
+                    (default 25, clamped to 1..500); property `options` use
+                    max(list_limit, 100).  Only the handful of universal
+                    classes and very long enums ever hit it; leave it alone
+                    unless a `*Truncated` marker tells you the sample was too
+                    small.
 
     Returns:
         Schema dict as described above, or an empty dict when the catalogue
@@ -680,7 +726,9 @@ async def get_schema(
     )
     if schema:
         catalog.annotate_relations(schema)
-        _bound_schema_lists(schema, max(1, min(list_limit, _SCHEMA_LIST_MAX)))
+        limit = max(1, min(list_limit, _SCHEMA_LIST_MAX))
+        _bound_schema_lists(schema, limit)
+        _bound_property_options(schema, max(limit, _SCHEMA_OPTIONS_FLOOR))
         await ctx.info(f"get_schema({class_name!r}) → OK")
     else:
         await ctx.warning(f"get_schema({class_name!r}) → not found")

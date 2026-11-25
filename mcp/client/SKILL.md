@@ -208,6 +208,13 @@ all end in the same relative name, which `rnFormat` gives you in full
 than hunting the matching entry. Pass `list_limit` (max 500) only if you truly
 need a wider sample — and never present the sample as the complete list.
 
+A property's `options` in `property_details` are sampled the same way, at
+max(`list_limit`, 100): only a dozen enums are longer, and `faultInst.code` has
+80,512 values. A sampled entry carries `optionsTruncated: {returned, total,
+note}`. A value missing from a sampled list may still be valid — filter on it
+directly, or `count(…, group_by="code")` to see which codes actually occur,
+instead of concluding it does not exist.
+
 ### `containedBy` — the parent class(es) in `pkg:Class` notation
 
 ```json

@@ -24,7 +24,7 @@ get_schema(
 | `class_name` | `str` | — | Exact ACI class name from `search_classes()`. **Case-sensitive** — see [Case sensitivity](#case-sensitivity). |
 | `include_property_details` | `bool` | `False` | Include `property_details` for **every** property. Prefer `properties_filter` unless you truly need all. |
 | `properties_filter` | `list[str]` | — | Include `property_details` only for these property names. The token-efficient path — unknown names are silently skipped, and the caller's order is preserved. |
-| `list_limit` | `int` | `25` | How many `dnFormats` and `containedBy` entries to return. Clamped to `1..500`. Only the seven universal classes ever reach it — see [Sampled lists](#sampled-lists). |
+| `list_limit` | `int` | `25` | How many `dnFormats` and `containedBy` entries to return. Clamped to `1..500`. Property `options` use max(`list_limit`, 100). Only the seven universal classes and a dozen very long enums ever reach it — see [Sampled lists](#sampled-lists). |
 
 ---
 
@@ -256,6 +256,16 @@ prefix, and the suffix is already `rnFormat` in full. Concatenate the parent DN
 with `rnFormat` rather than searching the list for a matching entry. Likewise a
 truncated `containedBy` means "attaches to nearly anything" — scope the query
 by the parent you care about instead of reading the list.
+
+**Enumerations are bounded too.** A property's `options` list in
+`property_details` is cut at max(`list_limit`, 100). Of the catalogue's 3,947
+distinct enums the median has 3 values and the 99th percentile 33; only 13
+exceed 100, and `faultInst.code` has 80,512, which made
+`get_schema("faultInst", properties_filter=["code"])` about 880 KB. The floor of
+100 keeps every ordinary enum whole even at the default `list_limit` of 25. A
+sampled property gains `optionsTruncated: {returned, total, note}`; a value
+missing from the sample may still be valid, so filter on it directly rather than
+treat the sample as the closed set.
 
 Raise `list_limit` (clamped to `1..500`) only when a `*Truncated` marker tells
 you the sample was too small. The bound is applied at the tool surface, not in

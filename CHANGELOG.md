@@ -229,6 +229,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Changed
 
+- **`get_schema` samples very long enumerations.** A property's `options` is
+  cut at max(`list_limit`, 100) and the entry gains `optionsTruncated:
+  {returned, total, note}`. `faultInst.code` enumerates 80,512 values, so
+  `get_schema("faultInst", properties_filter=["code"])` returned about 880 KB —
+  the largest tool result in agent-eval's tier F, on every server version — and
+  now returns about 5 KB. Only 13 of the catalogue's 3,947 enums exceed 100
+  values (median 3, 99th percentile 33), so ordinary enums stay whole at the
+  default `list_limit`. The note tells the agent that a value missing from the
+  sample may still be valid. `catalog.load_schema()` is unchanged; the bound is
+  applied at the tool surface like the `dnFormats` one.
 - **niwaki 1.8 → 2.2: the object model is the same, the catalogue is 10 MB
   lighter.** `niwaki>=2.2,<2.3`, still a single minor. The one thing that moved
   under this server is the private table it reads properties from: 2.1 replaced
