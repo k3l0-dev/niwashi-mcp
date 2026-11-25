@@ -22,6 +22,7 @@ around: `uvx niwashi-mcp` is the whole installation.
 | Page | Description |
 |---|---|
 | [Quickstart](getting-started/quickstart.md) | Install and run — up in 5 minutes |
+| [Reverse proxy](getting-started/reverse-proxy.md) | Running behind Caddy or nginx — `MCP_ALLOWED_HOSTS` and the `421` trap |
 
 ### Tools reference
 

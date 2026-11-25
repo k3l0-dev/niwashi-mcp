@@ -87,6 +87,9 @@ http://localhost:8000/mcp          # local
 https://your-host.example.com/mcp  # behind your own TLS terminator
 ```
 
+Behind your own TLS terminator on the same machine, list the proxy's public name
+in `MCP_ALLOWED_HOSTS` — see the [reverse proxy guide](docs/getting-started/reverse-proxy.md).
+
 #### Claude Desktop
 
 Edit `claude_desktop_config.json`:

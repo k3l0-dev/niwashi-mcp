@@ -143,6 +143,8 @@ proxy connects over loopback and forwards the public name. Caddy passes the
 MCP_ALLOWED_HOSTS=mcp.example.com
 ```
 
+The [reverse proxy guide](../getting-started/reverse-proxy.md) walks through the Caddy and nginx setup.
+
 Without it every proxied request, `/health` included, is answered `421`, which
 looks like a proxy fault; the startup log says so when the bind is loopback. A
 proxy on **another machine** reaches the server over a routable address and is
