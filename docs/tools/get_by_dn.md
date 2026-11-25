@@ -64,6 +64,19 @@ With `include_children` set, the object also carries a `_children` list:
 }
 ```
 
+### Secrets
+
+A credential, key, community string or session token reads `<redacted>` — in the object and in each `_children` entry, whatever `fields` asked for; an empty one too, so the marker does not say whether one is set. A DN that carries a secret has that segment cut (`.../community-<redacted>`). When something was withheld the object carries two more keys, absent otherwise:
+
+```json
+{"_class": "vnsCCred", "dn": "...", "name": "admin", "value": "<redacted>",
+ "_redacted": 1, "_note": "1 secret value(s) were withheld from these results by the server's policy ..."}
+```
+
+An audit or event record's `changeSet` and `descr` are scrubbed of the secrets they quote, on a best-effort basis; the `_note` says so.
+
+**A DN that names an object by a secret is refused**, not answered: `get_by_dn(".../community-public")` raises `SecretDnError` whether or not such a community exists — decided on the DN's shape before the APIC is asked — because "found" and "not found" would let a guess be checked. Reach the object through its class (`query("snmpCommunityP")`) or its parent's DN instead; it comes back redacted. See [Internals: Secret redaction](../internals/redaction.md).
+
 ### Child classes are checked
 
 The APIC embeds nothing for a class it does not know, and answers with the object and no `_children` — which reads as "this object has no children". So each class in `include_children` is checked against the catalogue before the request is built, exactly as [`query`](query.md#attribute-validation) checks it (an item may be comma-joined, `["fvSubnet,fvRsCtx"]`, and counts as the classes it names):
@@ -128,6 +141,7 @@ if obj.get("found") is False:
 
 | Exception | Condition |
 |---|---|
+| `SecretDnError` | `dn` names an object by a secret — an SNMP community profile, a login session, a JWT site. Raised on the DN's shape alone, before the APIC is called, so it is the same answer for a DN that exists and one that does not. |
 | `UnknownClassError` | A class in `include_children` is not in the catalogue. Raised before anything is sent. Not raised when attribute checking is relaxed (see [Child classes are checked](#child-classes-are-checked)). |
 | `UnknownAttributeError` | A name in `fields` is not a property of the returned object's class nor of any `include_children` class. Raised after the fetch. Not raised when attribute checking is relaxed (see [Field projection](#field-projection)). |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed DN string, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. Note: a DN that is well-formed but points to nothing does **not** raise — it returns `{"found": False, ...}` (see [Return value](#return-value)). |

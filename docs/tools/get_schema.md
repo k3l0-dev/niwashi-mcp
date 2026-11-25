@@ -95,7 +95,11 @@ Each entry carries only the fields the schema declares (`type` and `access` are 
 | `mandatory` | present when the property is required on create |
 | `default` | the default value, when declared |
 | `options` | allowed values — the exact strings the APIC accepts in `filters` and config |
+| `secret` | present (`true`) when the property holds a secret: [`query`](query.md#secrets) and [`get_by_dn`](get_by_dn.md#secrets) return it as `<redacted>`, and a filter, `order_by` or `group_by` on it is refused. On a class named by its secret (an SNMP community profile) `dn` and `rn` carry it too and are marked as well. |
+| `scrubbed` | present (`true`) on `changeSet` of the audit, event, fault and session records: free text that can quote a secret. It is returned scrubbed, on a best-effort basis, and is refused for filtering like a secret. |
 | `comment` | one-line description |
+
+The names of secret properties stay listed in `properties` — an agent that sees a property exist is less likely to look for it another way — and are labelled so it knows not to ask. No value is ever shown here. See [Internals: Secret redaction](../internals/redaction.md).
 
 Use `include_property_details=True` to dump every property at once — only when you genuinely need the full picture.
 

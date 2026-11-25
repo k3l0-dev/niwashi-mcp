@@ -220,6 +220,8 @@ sequenceDiagram
 
     Note over life: inside app_lifespan
     life->>life: load_dotenv on the resolved .env
+    life->>cat: verify_catalogue, fail startup if niwaki's private schema moved
+    life->>life: redact.verify_policy, fail startup if niwaki's secret policy moved
     life->>cat: descriptions_index
     cat->>cat: read the mo, prop_sig and class_prop tables, resolve label and comment pools
     cat-->>life: 15,239-entry search index, in memory

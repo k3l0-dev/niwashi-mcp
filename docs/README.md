@@ -53,6 +53,7 @@ around: `uvx niwashi-mcp` is the whole installation.
 | [Middleware stack](internals/middleware.md) | HealthMiddleware, OAuthDiscoveryMiddleware, ApiKeyMiddleware — stack order, SIGHUP hot-reload |
 | [Auth middleware](internals/auth.md) | API key validation, timing-safe comparison, rate limiting |
 | [Registry](internals/registry.md) | Catalogue adapter, search index, filter builder |
+| [Secret redaction](internals/redaction.md) | What the tools withhold from an agent, why, the request refusals that go with it, and what it cannot cover |
 | [APIC client](internals/apic-client.md) | Cookie auth, re-auth, query URL construction |
 | [Exception hierarchy](internals/exceptions.md) | Typed exception tree with usage context |
 | [Search algorithm](internals/search-algorithm.md) | Algorithm rationale, Rs/Rt penalty, measured gains |
