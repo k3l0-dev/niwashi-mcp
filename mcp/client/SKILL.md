@@ -92,6 +92,7 @@ under `results`, alongside the true size of the matching set:
 | `complete` | `false` only when `fetch_all=True` stopped short of `total_available` — it holds at most 5,000 objects per call, and it also stops early if the APIC ends its pages before the count it reported. Either way the result is partial |
 | `note` | Guidance string when `truncated`, when `complete` is `false`, when a name was sent unchecked (section 5, Attribute validation) or when `fields=[]` was passed; `null` otherwise |
 | `fields` | The projection applied, echoed back; `null` when `fields` was not passed (section 5, Keep answers small) |
+| `redacted` | **Absent unless the server withheld a secret** — then how many were (values, DN segments, text attributes). A withheld value reads `"<redacted>"`; `note` says so too (section 5, Secrets) |
 
 **`truncated: true` is a hard stop for any max/min/total/all-of conclusion** —
 and so is `complete: false`. See section 5's Pagination subsection and the
@@ -288,6 +289,8 @@ Per-property fields (only `type` and `access` are always present):
 | `naming` | present when the property is part of the DN (an identifier) |
 | `default` | the default value, when declared |
 | `options` | allowed values — the **exact strings** the APIC accepts in `filters` and config |
+| `secret` | `true` on a property that holds a secret — the server never returns its value and refuses to filter, order or group on it (section 5, Secrets) |
+| `scrubbed` | `true` on `changeSet` of the audit, event, fault and session records — free text that can quote a secret: returned scrubbed (best effort), and refused for filtering like a secret (section 5, Secrets) |
 | `comment` | one-line description |
 
 `options` removes the guesswork behind section 10: never guess an enum's casing —
@@ -455,7 +458,9 @@ query("fvTenant", rsp_subtree_include="health")
 ### Time range for log records — `time_range`
 
 Restricts log record queries by time window.
-Valid for: `faultRecord`, `aaaModLR`, `eventRecord`, `healthRecord`.
+Valid for: `faultRecord`, `aaaModLR`, `eventRecord`, `healthRecord`. Their
+`changeSet` and `descr` are scrubbed of secrets they quote (section 5, Secrets),
+and `changeSet` cannot be used in `filters`, `filter_expr` or `order_by`.
 
 ```python
 # Audit log last 24 hours
@@ -616,6 +621,64 @@ a strict refusal names a property you have good reason to believe exists on this
 fabric, say that the fabric may run a different release than the catalogue
 rather than guessing around it.
 
+### Secrets — withheld, never a filter
+
+An APIC returns some secrets in clear: the password of an L4-L7 device
+credential (`vnsCCred`, attribute `value`), the community of an SNMP trap
+destination (`snmpTrapDest`, `secName`), the community string that *is* an
+`snmpCommunityP`'s name, the token that names a login session
+(`aaaActiveUserSession`, `hashToken`). This server never hands you one. In
+`query` and `get_by_dn` — in the object, in each `_children` entry, and whatever
+`fields` you asked for — a secret value reads `"<redacted>"`:
+
+```python
+query("vnsCCred", fields=["name", "value"])
+# → results: [{"_class": "vnsCCred", "dn": "...", "name": "admin", "value": "<redacted>"}],
+#   "redacted": 1, "note": "1 secret value(s) were withheld ..."
+```
+
+- **It is the server's policy, not an empty value.** Report it as withheld by
+  the server — never as empty, missing or unknown. An *empty* secret is withheld
+  too, so `"<redacted>"` says nothing about whether one is set: do not tell the
+  user a credential is configured, or unset, from it.
+- **`redacted` / `_redacted` counts what was withheld** and is absent when
+  nothing was. `get_schema` marks each such property `"secret": true`; leave it
+  out of `filters` and `fields` rather than asking.
+- **Audit, event, fault and session records quote secrets in their own text.**
+  Creating a credential writes `value:<the password>` into the audit record's
+  `changeSet`; a login writes the session token into an event's `descr` and DN.
+  For `aaaModLR`, `eventRecord`, `faultRecord`, `aaaSessionLR` (and the other
+  record classes with a `changeSet`) the server **scrubs** the text rather than
+  withholding the record, so audit questions still work: the value of each secret
+  pair in `changeSet` — both formats, `prop:value, prop:value` and
+  `prop (Old: x, New: y)` — becomes `<redacted>`, a secret met in a DN (`dn`,
+  `affected`) is cut, and it is removed from `descr` too. `aaaSessionLR.sessionId`
+  is withheld outright. **This is best effort**: `note` says so when it applied,
+  and a secret in a form the scrubber does not recognise can remain, so never
+  present an audit or event record as proof that a secret was not configured or
+  changed. A `changeSet` that names a secret property but cannot be parsed is
+  replaced whole. `get_schema` marks `changeSet` `"scrubbed": true`, and it
+  **cannot be filtered, ordered or grouped on** (`SecretAttributeError`): use
+  `affected`, `user`, `created` or `descr` to find a record, then read it.
+- **A DN can carry a secret.** An SNMP community profile is named by its
+  community string (`.../community-<string>`), a login session by its token, a
+  JWT site by its key, and so is every object beneath them. Those DNs come back
+  with the secret cut out (`.../community-<redacted>`), wherever a DN appears: an
+  object's own `dn`, a `tDn`, an audit record's `affected`. The same goes for the
+  text of an object that quotes it, such as an audit record's `descr`. A DN with
+  `<redacted>` in it cannot be fetched or used as a `scope_dn`.
+- **Asking another way is refused, not answered.** A filter, `order_by`,
+  `filter_expr` operand or `group_by` on a secret attribute raises
+  **`SecretAttributeError`** — a match would confirm a guess, and `group_by`
+  would print the values as keys — and so does a `count` with such a `filters`.
+  A DN, `scope_dn`, filter value or `filter_expr` that names an object by its
+  secret raises **`SecretDnError`**, from `get_by_dn` too, **before the APIC is
+  asked and whether or not the object exists**, so "found" and "not found" cannot
+  be used to check a guess. Neither is governed by `NIWASHI_MCP_STRICT_ATTRIBUTES`.
+  Both are failures to answer, not answers of zero; do not rephrase to get round
+  them. To see which communities or credentials exist, `query` or `count` the
+  class itself — `count("snmpCommunityP")` is fine.
+
 ---
 
 ## 6. Shortcut: `get_by_dn` — fetch one object by DN
@@ -652,6 +715,11 @@ exist, you get an explicit not-found instead of a silent empty result:
 A not-found usually means a stale or mistyped DN — re-derive it from a fresh
 `query` result rather than reconstructing it from memory.
 
+Secrets are withheld here as in `query`: when something was, the object carries
+`"_redacted": <count>` and a `_note`, and the value reads `"<redacted>"`. A DN
+that names an object by a secret (`.../community-<string>`) is refused with
+`SecretDnError` rather than answered found or not found (section 5, Secrets).
+
 ---
 
 ## 7. Counting: `count` — how many, cheaply
@@ -670,6 +738,9 @@ Verify the class name with `search_classes` first — `count` raises the same
 `UnknownClassError` (with suggestions) as `query` for an unknown class, and
 checks attribute names in `filters` and `filter_expr` the same way, raising
 `UnknownAttributeError` for an unknown one (section 5, Attribute validation).
+It also refuses to count *by value* of a secret — `filters`, `filter_expr` or
+`group_by` on a secret attribute raises `SecretAttributeError` (section 5,
+Secrets); counting the class itself is fine.
 
 ### "How many X per Y?" — `group_by`
 
@@ -698,6 +769,9 @@ count("fabricNode", group_by="role")      # nodes per role
   tenant segment — fabric-level objects such as `topology/pod-1/node-101/...`,
   which do not belong to a tenant and must not be given one. An empty string *is*
   a value and keeps its own `""` group.
+- **`redacted`** appears beside `groups` only when a secret was withheld from the
+  objects tallied — a group key can then be a DN with `<redacted>` in it, never
+  the secret.
 - **When `complete` is `true`,** `sum(groups.values()) + ungrouped == count`.
 - **When `complete` is `false`, there is no breakdown.** `groups` and
   `ungrouped` are `null`, `count` is still the true total, and `note` says why:
@@ -1109,6 +1183,8 @@ a sample object without filters to observe the actual values in context.
 |---|---|---|
 | `query`/`count` raises "Unknown ACI class '...'" (`get_by_dn` too, for a class in `include_children`) | Wrong or nonexistent class name | The class does not exist — this is a failed lookup, not a zero result. Retry with one of the suggested closest matches or a fresh `search_classes` call; never report a count or existence answer from this error. |
 | `query`/`count`/`get_by_dn` raises "Unknown attribute '...' on ACI class '...'" (`UnknownAttributeError`) | The name is not a property of that class in the catalogue — a typo, wrong case, a property of another class, or (rarely) an attribute the catalogue's release lacks | Nothing was sent, so this is a failed lookup, not a zero result. Take one of the "Closest matches", or read `get_schema(class)` `properties`, correct the call and retry. Never report "none found" from this error |
+| `query`/`count` raises `SecretAttributeError`; `query`/`count`/`get_by_dn` raises `SecretDnError` | The request filters, orders or groups on a secret attribute, or names an object by its secret (an SNMP community, a session token, an API key in the DN). Refused on purpose, nothing was sent, whether or not the object exists | A failed lookup, not a zero. Do not rephrase to get round it. Drop that attribute or DN; to see which objects exist, `query` or `count` the class itself. Report the value as withheld by the server (section 5, Secrets) |
+| A value reads `"<redacted>"`, or `redacted` / `_redacted` is in the result | The server withheld a secret (credential, key, community, session token), or scrubbed one out of an audit or event record's text | Not an empty value and not a gap in the data: say the server withholds it. Never guess it, never report it as empty, set or unset, and never present a scrubbed record as proof that a secret was or was not configured |
 | `query` `note`, `count` `warnings` or a `get_by_dn` `_note` says "Sent anyway because strict attribute checking is off" | The operator relaxed attribute checking for a fabric on another release; the request went out with a name the catalogue does not know | An empty result (`[]`, or a count of `0`) next to it is not a zero — the name may be wrong. Verify it with `get_schema` or drop that filter before saying nothing matches |
 | `query` returns `results: []`, class is valid | Object absent from backend OR wrong filter *value* (names are validated, values are not) — this applies even to an abstract class (`isAbstract: true`): querying one returns the union of its concrete subclasses' instances, not an automatic `[]` | Remove filters first to confirm objects exist, then re-add filters |
 | `query` returns `truncated: true` | This call only returned part of the matching set (`returned < total_available`) | Partial data — do not conclude a maximum, minimum, total, or complete list from it. Re-run with `fetch_all=True`, or page with `page`/`limit` until `truncated` is `false` |

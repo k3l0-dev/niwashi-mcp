@@ -426,6 +426,80 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Security
 
+- **`query`, `get_by_dn` and `count` no longer hand an agent the secrets an APIC
+  returns in clear.** Measured on a 6.0(9c) lab fabric before the fix: the
+  password of an L4-L7 device credential (`vnsCCred.value`, 16 objects), the SNMP
+  trap community (`snmpTrapDest.secName`, 7), a community string that is both the
+  name and the DN of its `snmpCommunityP`, and the session tokens that name
+  `aaaActiveUserSession` objects were all returned as the APIC sent them, and
+  `count(group_by=...)` would have printed any attribute as a group key. Nothing
+  was redacted; the only "secure" in the source was a flag name in `catalog.py`.
+
+  **What is withheld.** A secret attribute reads `<redacted>` in every object,
+  children and subtree objects included, whatever `fields` asked for — and **empty
+  ones too**, so "set" and "unset" cannot be told apart. A DN that passes through a
+  secret (`community-`, `actsession-`, `delsession-`, `sitejwtpubkey-`) has that
+  segment cut wherever a DN appears: `dn`, `rn`, `tDn`, an audit record's
+  `affected`, inside `subj-[...]`. The policy is niwaki's own — the schema's
+  `secure` flag (169 properties), the curated `SECRET_VALUE_POSITIONS` (25) and
+  the secret-DN classes — so the SDK's `snapshot.take()` and this server agree.
+  `verify_policy()` runs at startup, after the catalogue check and before the APIC
+  session opens, and stops the server naming what moved: `niwaki._secrets` is
+  private and a copy of it would go stale silently.
+
+  **What goes beyond niwaki 2.2.** A curated position on an abstract class now
+  reaches its concrete subclasses (`snmpACommunityP.name` names a class no
+  response carries; `snmpCommSecP` is named by its community string too, and
+  niwaki's DN list lacked it). The DN is cut, where niwaki's snapshot only warns.
+  And four positions measured live and absent from niwaki 2.2 —
+  `aaaSessionLR.sessionId`, `aaaUserProfile.otpkey`, `pkiFabricSelfCAEp`'s two certificate-request
+  passphrases — are carried in a short supplement that a test drops when niwaki
+  2.3 absorbs it.
+
+  **Audit, event and session records.** The APIC writes secrets into its own logs:
+  `aaaModLR.changeSet` carried credential and community values, `eventRecord` the
+  OTP seed, session tokens and a trap community, `aaaSessionLR.sessionId` the
+  session token. These are scrubbed, not withheld, so audit questions still work:
+  `changeSet` is parsed in both formats (`prop:value, prop:value`, 12,437 of the
+  lab's 12,493, and `prop (Old: x, New: y)`), the value of each secret pair is
+  replaced using the class read from the `affected` DN (every secret property
+  name when none fits — over-masking, never raising), a secret met in a DN is cut
+  and then removed from the record's other text. Text that names a secret property
+  but cannot be parsed, or that still holds a secret once scrubbed, is replaced
+  whole. **This is best effort and the response says so.**
+
+  **Requests that would reveal one are refused**, in both
+  `NIWASHI_MCP_STRICT_ATTRIBUTES` modes and before the APIC is called:
+  `filters`, `order_by`, `filter_expr` operands and `group_by` on a secret
+  attribute, on `dn`/`rn` of a class named by a secret, or on `changeSet`
+  (`SecretAttributeError`); and any DN, `scope_dn`, filter value or `filter_expr`
+  that spells a secret RN segment (`SecretDnError`). `get_by_dn` refuses such a DN
+  on its shape alone, so "found" and "not found" cannot check a guess — an
+  existing and a missing DN get the identical answer. `filter_expr` operands are
+  found by shape, not by the typo check's conservative extractor, so a predicate
+  cannot hide one by how it is written.
+
+  **The agent is told, without being told what.** `query`'s envelope gains an
+  optional `redacted` count and a `note`; `get_by_dn` an optional `_redacted` and
+  `_note`; `count(group_by=...)` an optional `redacted`. All are absent when
+  nothing was withheld, so an ordinary object is byte-identical to what it was.
+  `get_schema` marks `"secret": true` on a secret property (names stay listed) and
+  `"scrubbed": true` on `changeSet`.
+
+  **Cost.** 1.4 microseconds an ordinary object, about 7 for an audit record whose
+  `changeSet` is parsed: 0.01 to 5 percent of what the same objects cost to fetch
+  from the lab APIC (0.2 to 24 ms each).
+
+  **Known limits**, documented in `docs/internals/redaction.md`: a fabric newer than
+  the catalogue (an unflagged secret in a class it lacks, covered only by a name
+  heuristic); a secret reused as a name elsewhere, which is visible as that name;
+  substring probes through the DN and free-text attributes of other classes
+  (`wcard` on an audit record's `affected` or `descr`); and free text in a form the
+  scrubber does not recognise. There is no opt-out. Every decision sits in one
+  module, `niwashi_mcp/redact.py`, whose interface follows what niwaki 2.3 plans
+  to publish as `niwaki.secrets`, so the switch is a change to that file and its
+  niwaki-coupled tests.
+
 - `fastmcp` floor raised from 3.4.5 to 3.4.10 for the 2026-10-23 advisories, and
   the lock now resolves 3.4.11 (`certifi` 2026.6.17 → 2026.11.20 came along in
   the same `uv lock`). The floor moves, not only the lock, because an

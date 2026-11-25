@@ -8,8 +8,9 @@ filter strings those two send over the wire.
 |---|---|
 | `catalog.py` | The data layer. Reads the ACI object model from the SQLite catalogue shipped inside the `niwaki` dependency |
 | `descriptions.py` | Scores `search_classes` against an in-memory index (see [search-algorithm.md](search-algorithm.md)) |
-| `filter.py` | Builds `query-target-filter` strings from a plain dict; extracts the `Class.attr` references from a raw `filter_expr` / `order_by` so they can be checked against the catalogue |
+| `filter.py` | Builds `query-target-filter` strings from a plain dict; extracts the `Class.attr` references from a raw `filter_expr` / `order_by` so they can be checked against the catalogue — conservatively (`filter_expr_attributes`) for the typo check, and exhaustively by shape (`dotted_references`) for the secret check |
 
+`niwashi_mcp/redact.py`, one level up, is the secret-redaction policy. It is not a registry module — it decides what the tools may return rather than what the object model is — but it reads the catalogue through two functions added here for it: `catalog.secure_properties()` (every property the schema flags `secure`, grouped by class, one 20 ms query) and `catalog.rn_formats()` (every class's RN template, to read the class an audit record is about from its `affected` DN). See [Secret redaction](redaction.md).
 ---
 
 ## What 2.0 changed
@@ -59,9 +60,12 @@ graph TD
     main -->|"via ApicClient query_class() / count_class()"| filt
 ```
 
-`catalog.py` is the only module in the codebase that imports `niwaki`. Every
-other module receives plain dicts, exactly as it did when the source was a
-directory of JSON files.
+`catalog.py` is the only module that reads niwaki's *catalogue*. Every other
+registry module receives plain dicts, exactly as it did when the source was a
+directory of JSON files. The one other reader of niwaki is
+[`redact.py`](redaction.md), which reads its secret-redaction policy
+(`niwaki._secrets`, private, guarded at startup) and two public names
+(`niwaki.catalog.concrete_subclasses`, `niwaki.snapshot.REDACTED`).
 
 ---
 

@@ -41,7 +41,11 @@ _QUERY_KEYS = {
 _COUNT_REQUIRED = {"class_name", "count", "scope_dn", "filters"}
 _COUNT_OPTIONAL = {
     "warnings", "group_by", "groups", "ungrouped", "complete", "note", "group_names",
+    "redacted",
 }
+# `query` adds `redacted` too, but as an optional key: the required set is what
+# every response carries, and a result with nothing withheld carries no such key.
+_QUERY_OPTIONAL = {"redacted"}
 
 
 def _output_schema(name: str) -> dict:
@@ -96,6 +100,7 @@ class TestTheAdvertisedOutputSchema:
         """The TypedDicts are the source of the schema; this fails if a key is
         added to one and the tool's return annotation is left on the old type."""
         assert set(QueryEnvelope.__required_keys__) == _QUERY_KEYS
+        assert set(QueryEnvelope.__optional_keys__) == _QUERY_OPTIONAL
         assert set(CountEnvelope.__required_keys__) == _COUNT_REQUIRED
         assert set(CountEnvelope.__optional_keys__) == _COUNT_OPTIONAL
 

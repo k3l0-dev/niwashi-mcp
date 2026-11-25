@@ -124,8 +124,9 @@ An **envelope dict** — not a bare list:
 | `complete` | `bool` | `False` only if `fetch_all=True` stopped short of `total_available` — at the 5,000-object cap, or because the APIC ended its pages before the `totalCount` it reported. A set of exactly 5,000 objects is complete. |
 | `note` | `str \| None` | Guidance text — set when truncated or capped, and when [relaxed attribute checking](#relaxing-the-check) sent a name the catalogue did not know (in `filters`, `order_by`, `include_children`, `filter_expr` or `fields`). When several apply they are joined into one string, the truncation or cap note first, never replacing it. |
 | `fields` | `list[str] \| None` | The projection that was applied, echoed as given; `None` when `fields` was not set. Added in this release: every envelope now carries it, `null` by default — the one change to an unprojected result. |
+| `redacted` | `int` | **Present only when the server withheld a secret** (see [Secrets](#secrets)): how many attribute values it replaced. Absent otherwise, so an ordinary result is byte-identical to what it was. The `note` says so too. |
 
-The envelope is a typed dict (`QueryEnvelope`), so the `outputSchema` the server advertises names these keys, marks all of them required, and admits `null` for `next_page`, `note` and `fields`. `results` items stay free-form objects: which attributes an object carries depends on its class.
+The envelope is a typed dict (`QueryEnvelope`), so the `outputSchema` the server advertises names these keys, marks the eight it always returns as required (`redacted` is optional), and admits `null` for `next_page`, `note` and `fields`. `results` items stay free-form objects: which attributes an object carries depends on its class.
 
 Any code written against the older (pre-envelope) shape of this doc needs updating: `result["results"][0]["dn"]`, not `result[0]["dn"]`.
 
@@ -137,8 +138,29 @@ Any code written against the older (pre-envelope) shape of this doc needs updati
 |---|---|
 | `UnknownClassError` | `class_name` is not in the catalogue — the single source of truth for whether an ACI class exists (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index, which is smaller than the validated universe). The 213 catalogue classes absent from the search index validate normally: 2.0 removed the two-tier fallback and the warning it used to emit on them. Also raised for an unknown class in `include_children`, or as the `Class` of a `Class.attr` operand in `filter_expr` or `order_by` (the same error, built the same way). |
 | `UnknownAttributeError` | An attribute in `filters`, `order_by` or `filter_expr` is not a property of its class in the catalogue, or a name in `fields` is not a property of `class_name` nor of any class in `include_children`. Carries `.class_name`, `.attribute`, `.suggestions` (the closest real property names — a case-only difference first) and `.catalogue_version`. Nothing has been sent to the APIC when it is raised. With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` it is not raised: see [Relaxing the check](#relaxing-the-check). |
+| `SecretAttributeError` | `filters`, `order_by` or a `filter_expr` operand uses an attribute that holds a secret, `dn`/`rn` of a class named by one, or an audit record's `changeSet`. Raised whatever `NIWASHI_MCP_STRICT_ATTRIBUTES` is set to, before the APIC is called. See [Secrets](#secrets). |
+| `SecretDnError` | `scope_dn`, a `filters` value or `filter_expr` spells a DN that names an object by a secret (`.../community-<string>`). Refused on its shape alone, whether or not the object exists. |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter *values* are always escaped, never rejected — this can only be raised by an identifier, not a value. |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
+
+---
+
+## Secrets
+
+An APIC returns some secrets in clear, and writes them into its own logs. `query` never hands one on:
+
+```python
+query("vnsCCred", fields=["name", "value"])
+# results: [{"_class": "vnsCCred", "dn": "...", "name": "admin", "value": "<redacted>"}],
+# "redacted": 1, "note": "1 secret value(s) were withheld from these results by the server's policy ..."
+```
+
+* **Values.** A schema-flagged or curated secret attribute reads `<redacted>` in every result, in each `_children` entry, and whatever `fields` asked for. **An empty secret is withheld too**, so the marker does not say whether one is set.
+* **DNs.** An SNMP community profile is named by its community string, a login session by its token. That segment is cut wherever a DN appears — `dn`, `rn`, `tDn`, an audit record's `affected`, inside `subj-[...]`: `.../community-<redacted>`.
+* **Free text.** On the audit, event, fault and session records, `changeSet` (both formats) and `descr` are scrubbed: the value of each secret pair, and any secret met in a DN, is replaced. **Best effort** — the `note` says so — and `changeSet` cannot be filtered, ordered or grouped on.
+* **Refused, not answered.** A predicate on a secret would confirm a guess, so `filters`, `order_by`, `filter_expr` and `count`'s `group_by` on a secret raise `SecretAttributeError`, and a DN or `scope_dn` that spells a secret raises `SecretDnError`.
+
+Both refusals hold with `NIWASHI_MCP_STRICT_ATTRIBUTES=false`: it relaxes a question about what the catalogue knows, and this is not one. [`get_schema`](get_schema.md#property-details) marks the properties (`"secret": true`, `"scrubbed": true`). The full policy, its sources and its limits are in [Internals: Secret redaction](../internals/redaction.md).
 
 ---
 

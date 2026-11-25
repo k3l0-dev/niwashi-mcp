@@ -168,6 +168,7 @@ Relaxed mode does not go quiet. The request is sent, and each unknown name is re
 
 - Read on **every call**, not at startup: a change takes effect on the next request, without a restart. Because a `SIGHUP` reload re-reads `.env` into the process environment, editing the variable there and sending `kill -HUP` applies it too.
 - The class named by `class_name` is outside this switch — an unknown one always raises `UnknownClassError`.
+- **The secret refusals are outside it too.** A filter, `order_by`, `filter_expr` operand or `group_by` on a secret attribute (`SecretAttributeError`), and a DN or `scope_dn` that names a secret object (`SecretDnError`), are refused in both modes. The switch relaxes a question about what the catalogue *knows*; whether an attribute is a secret is not that question, and relaxing it would reopen the oracle. There is no setting that turns redaction off. See [Secret redaction](../internals/redaction.md).
 
 ---
 

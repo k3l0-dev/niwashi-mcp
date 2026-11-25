@@ -56,6 +56,7 @@ Because the tally is the very same `total_available` that `query` reports, the t
 | `scope_dn` | `str \| null` | The scope DN, if one was supplied |
 | `filters` | `dict` | The filters that were applied |
 | `warnings` | `list[str]` | **Present only when [attribute checking is relaxed](#relaxing-the-check) and a name was sent unchecked** — one string per problem. Absent otherwise, so a default response is unchanged. |
+| `redacted` | `int` | **Present only with `group_by`, and only when a secret was cut out of the group value of some objects** (a DN or text that carried one): how many objects. Absent otherwise. See [Secrets](#secrets). |
 
 ---
 
@@ -153,12 +154,22 @@ It is added here and nowhere else. Fault objects returned by `query`, `get_by_dn
 
 ---
 
+## Secrets
+
+A count of one for `filters={"value": "guess"}` confirms the guess, and `group_by` prints values as keys. So a secret cannot be counted *by value*: `filters`, `filter_expr` and `group_by` on a secret attribute raise `SecretAttributeError`, and a `scope_dn` or filter value that spells a secret DN raises `SecretDnError`. Counting the class itself is fine — `count("snmpTrapDest")` — and so is grouping it by any other attribute.
+
+With `group_by`, objects are redacted **before** they are tallied, so a group key can never be a secret: `group_by="affected"` on audit records returns `.../community-<redacted>` as a key, and keys that become equal are counted together. `redacted` then says how many objects had a group value cut. It is not "every secret the fetch happened to hold": withholding a credential's password while grouping credentials by name changes nothing the caller reads, so it is not reported.
+
+---
+
 ## Raises
 
 | Exception | Condition |
 |---|---|
 | `UnknownClassError` | `class_name` is not in the catalogue (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index). The guard is identical to `query`'s, so the two tools can never disagree about whether a class is known. Also raised when a `filter_expr` operand names an unknown class. |
 | `UnknownAttributeError` | An attribute in `filters` or `filter_expr` is not a property of its class in the catalogue, or `group_by` is neither `"tenant"` nor an attribute of the class. Carries `.class_name`, `.attribute`, `.suggestions` and `.catalogue_version`. Nothing has been sent to the APIC when it is raised. With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` it is not raised; the problem becomes a `warnings` entry instead. |
+| `SecretAttributeError` | `filters`, `filter_expr` or `group_by` uses an attribute that holds a secret (or `dn`/`rn` of a class named by one, or an audit record's `changeSet`). Raised whatever `NIWASHI_MCP_STRICT_ATTRIBUTES` is set to. |
+| `SecretDnError` | `scope_dn`, a filter value or `filter_expr` spells a DN that names an object by a secret. |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter values are always escaped, never rejected. |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
 
