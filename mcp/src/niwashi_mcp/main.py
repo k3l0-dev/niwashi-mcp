@@ -108,7 +108,7 @@ from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
 from dotenv import load_dotenv
-from fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP, settings
 from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
 from mcp import MCPDeprecationWarning
@@ -462,6 +462,21 @@ async def app_lifespan(server: FastMCP):
 
 
 # ── Server ────────────────────────────────────────────────────────────────────
+
+# Since 4.2.5 FastMCP serves `subscriptions/listen` on 2026-07-28 connections by
+# default: a client that supports it holds one stream open per connection, for as
+# long as it stays connected, to be told when the tool list changes. This server
+# has five fixed tools and publishes no notification, so a stream would carry
+# nothing and occupy a connection (up to 1,024 per process) for nothing — behind
+# a proxy with idle timeouts it would also be cut and reopened forever. Off, the
+# server advertises `listChanged` and `resources.subscribe` as false and answers
+# `subscriptions/listen` with method-not-found, exactly as it did on 4.2.4.
+#
+# Set here, on the settings object, and not through FASTMCP_ENABLE_SUBSCRIPTIONS_LISTEN:
+# the variable is read when `fastmcp` is imported, which any caller that imported
+# it first (a test, an embedding host) would have already done. The setting is
+# read when the server is created, which is the next statement.
+settings.enable_subscriptions_listen = False
 
 mcp = FastMCP(
     name="niwashi-mcp",

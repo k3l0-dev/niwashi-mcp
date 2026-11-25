@@ -174,6 +174,59 @@ class TestParameterSchemas:
         assert advertised["get_schema"].parameters["properties"]["list_limit"]["default"] == 25
 
 
+class TestNoListenStreams:
+    """The server publishes no change notification, so it offers no stream for one.
+
+    FastMCP 4.2.5 turned `subscriptions/listen` on by default: a supporting client
+    holds a stream open for as long as it is connected. Five fixed tools never
+    change, so the stream would carry nothing and cost a connection.
+    """
+
+    @pytest.fixture
+    def capabilities(self, monkeypatch):
+        import asyncio
+
+        from fastmcp import Client
+        from fastmcp.server.lifespan import lifespan
+
+        from niwashi_mcp import main
+
+        @lifespan
+        async def stub(server):
+            yield {}
+
+        monkeypatch.setattr(main.mcp, "_lifespan", stub)
+
+        async def read(mode: str) -> tuple[str, dict]:
+            async with Client(main.mcp, mode=mode) as client:
+                return client.protocol_version, client.server_capabilities.model_dump(
+                    by_alias=True
+                )
+
+        return lambda mode: asyncio.run(read(mode))
+
+    def test_the_2026_07_28_era_advertises_no_subscription_and_no_list_changes(
+        self, capabilities
+    ):
+        """The era the stream belongs to: `resources.subscribe` and `listChanged`
+        are what tell a client it may open one."""
+        # "auto" is what negotiates the era through `server/discover`; pinning the
+        # version string skips that and yields no capabilities to read.
+        version, caps = capabilities("auto")
+
+        assert version == "2026-07-28", "the client did not negotiate the era under test"
+        assert caps["resources"]["subscribe"] is False
+        for capability in ("tools", "resources", "prompts"):
+            assert caps[capability]["listChanged"] is False, capability
+
+    def test_the_handshake_era_never_advertised_a_subscription(self, capabilities):
+        """Unaffected either way upstream; pinned so a change there is noticed."""
+        version, caps = capabilities("legacy")
+
+        assert version != "2026-07-28"
+        assert caps["resources"]["subscribe"] is False
+
+
 class TestServerIdentity:
     def test_the_server_announces_the_distribution_name(self):
         """It announced `aci-mcp` for five days after the 2.0 rename, because a
