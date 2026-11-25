@@ -137,8 +137,16 @@ async def _call(server, name: str, **arguments):
 
 
 @pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
 async def test_a_wrong_envelope_is_refused_so_the_checks_below_mean_something():
-    """Control: if the client never validated, every test below would pass vacuously."""
+    """Control: if nothing validated, every test below would pass vacuously.
+
+    FastMCP 4 no longer validates a tool's output on the server: the wrong
+    envelope goes out on the wire (with only a serialiser warning) and it is the
+    *client* that refuses it, by raising. FastMCP 3 turned the same return into a
+    tool error. So this asserts the client half; the tests below go through a
+    real `Client` precisely because that is where the validation now runs.
+    """
     bad = FastMCP("control")
 
     @bad.tool
@@ -146,10 +154,8 @@ async def test_a_wrong_envelope_is_refused_so_the_checks_below_mean_something():
         return {"results": [], "returned": "three"}  # type: ignore[typeddict-item]
 
     async with Client(bad) as client:
-        result = await client.call_tool("broken", {}, raise_on_error=False)
-
-    assert result.is_error
-    assert "total_available" in result.content[0].text
+        with pytest.raises(RuntimeError, match="total_available"):
+            await client.call_tool("broken", {}, raise_on_error=False)
 
 
 @pytest.mark.asyncio

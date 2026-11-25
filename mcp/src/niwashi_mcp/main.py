@@ -103,12 +103,14 @@ import json
 import logging
 import os
 import signal
+import warnings
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.server.lifespan import lifespan
+from mcp import MCPDeprecationWarning
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator
 
@@ -345,6 +347,20 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 logger = logging.getLogger("niwashi-mcp")
+
+# The tools report progress through `ctx.info` / `ctx.warning`, which ride the MCP
+# logging capability. The SDK deprecated that capability as of the 2026-07-28
+# revision (SEP-2577) and will drop it, so every such call warns. The calls are
+# kept for now — they are how a client that still supports logging sees what a
+# tool refused — and the warning is silenced so it does not fill the server log.
+# Known future work, not forgotten: the logging calls have to move to another
+# channel before the capability is removed upstream (see CHANGELOG). Scoped to
+# this one message so any other MCP deprecation still surfaces.
+warnings.filterwarnings(
+    "ignore",
+    message="The logging capability is deprecated",
+    category=MCPDeprecationWarning,
+)
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 

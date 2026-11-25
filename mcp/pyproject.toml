@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastmcp>=3.4.10,<4.0",
+    "fastmcp>=4.2.6,<5",
     "httpx>=0.27,<1.0",
     # Pinned to a single minor, not `<2.0`: this server reads the *private*
     # SQLite schema of niwaki's embedded catalogue (see registry/catalog.py —
@@ -34,10 +34,12 @@ dependencies = [
     # does; this pin keeps the resolver from getting there in the first place.
     "niwaki>=2.2,<2.3",
     "python-dotenv>=1.0,<2.0",
-    # Security floors for transitive packages on the /mcp request path: fastmcp
-    # alone only needs mcp>=1.24, so a uvx/pip install could resolve versions
-    # with known advisories (see CHANGELOG, Security).
-    "mcp>=1.30.0",
+    # Security floors for transitive packages on the /mcp request path, so a
+    # uvx/pip install cannot resolve versions with known advisories (see
+    # CHANGELOG, Security). mcp 2.2.0 is where the 2.x line fixes the same set
+    # 1.30.0 fixed on 1.x; fastmcp 4 itself requires 2.3.0, so this floor is the
+    # one it already imposes, kept direct because main.py imports mcp.types.
+    "mcp>=2.3,<3",
     "opentelemetry-api>=1.45.2",
 ]
 
@@ -71,6 +73,12 @@ testpaths = ["tests"]
 #   uv run pytest tests/live/ -m live
 # or override this default entirely with --override-ini addopts="".
 addopts = ["-m", "not live"]
+# The tools' `ctx.info` / `ctx.warning` calls ride the MCP logging capability,
+# deprecated upstream (SEP-2577). main.py silences it at runtime; pytest resets
+# the warning filters per test, so it is silenced here for the same reason.
+filterwarnings = [
+    "ignore:The logging capability is deprecated:mcp.shared.exceptions.MCPDeprecationWarning",
+]
 markers = [
     "live: requires a reachable real APIC (see tests/live/conftest.py)",
     "baseline: asserts behaviour equals tests/baseline/baseline.json (drift net)",
