@@ -40,7 +40,7 @@ file that can be malformed on its own.
 ```mermaid
 graph TD
     subgraph registry["registry/"]
-        cat["catalog.py\nload_schema()\nclass_exists()\ndescriptions_index()\napic_version()"]
+        cat["catalog.py\nload_schema()\nclass_exists()\nknown_properties()\ndescriptions_index()\napic_version()"]
         desc["descriptions.py\nsearch()"]
         filt["filter.py\nbuild_filter()"]
     end
@@ -327,6 +327,35 @@ filesystem (APFS, NTFS) `schemas_dir / "fvBd.json"` happily resolved to the real
 structurally impossible — `fvBd` simply does not match `fvBD`. The guard is now
 the storage engine, and a test pins the property so that adding `COLLATE NOCASE`
 some day fails loudly.
+
+### known_properties(), property_exists(), closest_properties()
+
+The attribute-level counterpart of `class_exists()`: APIC answers a filter on an
+invented attribute with `[]`, so the name can be checked first.
+
+`known_properties(class_name)` returns the class's wire names as a `frozenset`
+(empty for an unknown class, never an exception). For an **abstract** class it
+is the union of its own properties and those of all its concrete descendants,
+because a query on the abstract class returns instances of those descendants.
+`fvABD` declares 34 properties; with `fvBD`, `fvBDDef` and `fvSvcBD` the union
+is 54, and `hostBasedRouting` appears only in the union.
+
+Descendants are found through `inherits(class_id, ancestor)`, which holds each
+descendant's full ancestor chain in colon notation (`fv:ABD`). The colon name is
+`mo.class_pkg || ':' || mo.short_name`; `class_name` is `class_pkg ||
+short_name` (0 exceptions in 15 452), so the mapping needs no string parsing.
+The `subclass` table is deliberately not used: it lists direct children only,
+and 850 of its 14 973 entries name a class missing from `mo`, so a walk over it
+cannot cross those gaps. On this catalogue the walk and `inherits` agree on every
+concrete descendant of all 1 954 abstract classes, so this is robustness and one
+query instead of a recursion, not a different answer today.
+
+`property_exists()` is membership in that set, so for an abstract class it also
+accepts an attribute only a subclass carries, and the two functions cannot
+disagree. `closest_properties()` ranks a case-insensitive match first, then
+`difflib` matches (`description` finds `descr`). Results are cached by an
+`lru_cache(maxsize=512)`: the largest union measured is 4 475 names (`statsItem`,
+27-42 ms), so the bound keeps a long session from holding every class it probed.
 
 ### descriptions_index()
 

@@ -18,6 +18,7 @@ from niwashi_mcp.exceptions import (
     NiwashiMcpError,
     RegistryError,
     SchemaLoadError,
+    UnknownAttributeError,
     UnknownClassError,
 )
 
@@ -32,6 +33,7 @@ def test_all_exceptions_inherit_from_base():
         DescriptionsLoadError,
         SchemaLoadError,
         UnknownClassError,
+        UnknownAttributeError,
         FilterError,
         ApicError,
         ApicAuthError,
@@ -133,6 +135,70 @@ def test_unknown_class_error_no_suggestions():
 def test_unknown_class_error_includes_action_hint():
     exc = UnknownClassError("fvBd", ["fvBD"], 100)
     assert "search_classes" in str(exc)
+
+
+# ── UnknownAttributeError ─────────────────────────────────────────────────────
+
+
+def test_unknown_attribute_error_attributes():
+    exc = UnknownAttributeError("fvBD", "arpFlod", ["arpFlood"], "6.0(9c)")
+    assert exc.class_name == "fvBD"
+    assert exc.attribute == "arpFlod"
+    assert exc.suggestions == ["arpFlood"]
+    assert exc.catalogue_version == "6.0(9c)"
+
+
+def test_unknown_attribute_error_names_the_class_and_the_attribute():
+    message = str(UnknownAttributeError("fvBD", "arpFlod", ["arpFlood"], "6.0(9c)"))
+    assert "'arpFlod'" in message
+    assert "'fvBD'" in message
+
+
+def test_unknown_attribute_error_lists_every_suggestion():
+    message = str(
+        UnknownAttributeError("fvBD", "unk", ["unkMacUcastAct", "unkMcastAct"], "6.0(9c)")
+    )
+    assert "unkMacUcastAct" in message
+    assert "unkMcastAct" in message
+    assert "No close matches" not in message
+
+
+def test_unknown_attribute_error_no_suggestions():
+    exc = UnknownAttributeError("fvBD", "zzzz", [], "6.0(9c)")
+    assert exc.suggestions == []
+    assert "No close matches" in str(exc)
+
+
+def test_unknown_attribute_error_says_the_catalogue_may_be_the_wrong_release():
+    """The check is against one APIC release; the caller must be told that a
+    refusal is advice, not proof the fabric lacks the attribute."""
+    message = str(UnknownAttributeError("fvBD", "arpFlod", [], "6.0(9c)"))
+    assert "APIC 6.0(9c)" in message
+    assert "another release" in message
+    assert "legitimately" in message
+
+
+def test_unknown_attribute_error_with_an_unidentified_catalogue_does_not_print_unknown():
+    """`apic_version()` returns "unknown" when the manifest has no version; the
+    message must not claim the catalogue describes "APIC unknown"."""
+    message = str(UnknownAttributeError("fvBD", "x", [], "unknown"))
+    assert "APIC unknown" not in message
+    assert "another release" in message
+
+
+def test_unknown_attribute_error_includes_action_hint():
+    assert "get_schema('fvBD')" in str(UnknownAttributeError("fvBD", "x", [], "6.0(9c)"))
+
+
+def test_unknown_attribute_error_is_catchable_as_the_base():
+    with pytest.raises(NiwashiMcpError):
+        raise UnknownAttributeError("fvBD", "x", [], "6.0(9c)")
+
+
+def test_unknown_attribute_error_is_not_an_unknown_class_error():
+    """An agent handling "no such class" must not swallow "no such attribute"."""
+    assert not issubclass(UnknownAttributeError, UnknownClassError)
+    assert not issubclass(UnknownClassError, UnknownAttributeError)
 
 
 # ── FilterError ───────────────────────────────────────────────────────────────

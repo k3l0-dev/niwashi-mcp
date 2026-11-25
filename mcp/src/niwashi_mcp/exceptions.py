@@ -14,6 +14,7 @@ NiwashiMcpError
 │   ├── DescriptionsLoadError — niwaki catalogue missing, unreadable, or moved
 │   └── SchemaLoadError       — retained for compatibility; unreachable since 2.0
 ├── UnknownClassError         — class name not found in the descriptions registry
+├── UnknownAttributeError     — attribute not among the class's properties in the catalogue
 ├── FilterError               — invalid identifier or unsafe value in build_filter
 └── ApicError                 — base for APIC communication errors
     ├── ApicAuthError         — authentication failed (bad credentials or server error)
@@ -107,6 +108,51 @@ class UnknownClassError(NiwashiMcpError):
         super().__init__(
             f"Unknown ACI class '{class_name}' — not in the {registry_size}-class registry. "
             f"{hint} Call search_classes() to find the correct name."
+        )
+
+
+class UnknownAttributeError(NiwashiMcpError):
+    """Attribute name not among a known ACI class's properties in the catalogue.
+
+    The attribute-level counterpart of `UnknownClassError`: APIC answers a
+    filter on a misspelled or invented attribute with `[]` and no error, so the
+    name is checked against the catalogue before the request is sent. Carries
+    closest matches so the LLM can self-correct without a `get_schema()`
+    round-trip.
+
+    The check is against the catalogue, which describes one APIC release, and
+    a fabric on another release may legitimately carry the attribute. The
+    message says so, because the caller may decide to send the request anyway;
+    `catalogue_version` is a required argument rather than read from
+    `registry.catalog`, which imports this module and would make a cycle.
+    """
+
+    def __init__(
+        self,
+        class_name: str,
+        attribute: str,
+        suggestions: list[str],
+        catalogue_version: str,
+    ) -> None:
+        self.class_name = class_name
+        self.attribute = attribute
+        self.suggestions = suggestions
+        self.catalogue_version = catalogue_version
+        hint = (
+            f"Closest matches: {', '.join(suggestions)}"
+            if suggestions
+            else "No close matches found."
+        )
+        described = (
+            f"APIC {catalogue_version}"
+            if catalogue_version and catalogue_version != "unknown"
+            else "an APIC release this server cannot identify"
+        )
+        super().__init__(
+            f"Unknown attribute '{attribute}' on ACI class '{class_name}'. "
+            f"{hint} Call get_schema('{class_name}') to list its attributes. "
+            f"The catalogue describes {described}; a fabric on another release "
+            f"may legitimately have this attribute."
         )
 
 

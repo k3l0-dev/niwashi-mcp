@@ -38,6 +38,7 @@ Two traps this module exists to avoid
 
 from __future__ import annotations
 
+import difflib
 import json
 import sqlite3
 import threading
@@ -202,6 +203,12 @@ _REQUIRED_TABLES: dict[str, frozenset[str]] = {
     "label_pool": frozenset({"id", "text"}),
     "type_pool": frozenset({"id", "value"}),
     "enum": frozenset({"id", "content"}),
+    # `inherits` is the transitive ancestor list, one row per (descendant, ancestor):
+    # `class_id` is the descendant's `mo.id`, `ancestor` is in `pkg:Class` colon
+    # notation. `known_properties` reads it to find an abstract class's concrete
+    # subclasses. Quiet failure if it moved: the union silently shrinks to the
+    # class's own properties and `query()` would refuse valid attributes.
+    "inherits": frozenset({"class_id", "ancestor"}),
 }
 
 _REQUIRED_MANIFEST_KEYS = frozenset({"prop_flags", "apic_version"})
@@ -210,6 +217,15 @@ _REQUIRED_MANIFEST_KEYS = frozenset({"prop_flags", "apic_version"})
 # stable object in the model and exercises every decode path at once: a pooled
 # label, a zlib+JSON `residual`, a zlib+JSON `dn_formats`, and the prop join.
 _PROBE_CLASS = "fvBD"
+
+# Anchor for the abstract-union path, which the probe above never reaches: it
+# reads `inherits`, whose `ancestor` column is a colon-notation string. Were
+# that repurposed, every column would still exist and every query would still
+# run, but an abstract class's union would silently collapse to its own
+# properties and valid attributes would be refused. `fvABD` is abstract (34
+# own properties) and `fvBD` descends from it; no property name is pinned, only
+# that the union is strictly wider than the class's own list.
+_PROBE_ABSTRACT_CLASS = "fvABD"
 
 
 def verify_catalogue() -> None:
@@ -275,6 +291,17 @@ def verify_catalogue() -> None:
         raise DescriptionsLoadError(
             f"niwaki {version}'s catalogue resolves '{_PROBE_CLASS}' but {broken} "
             f"came back empty — the stored encoding changed. Pin niwaki>=1.8,<1.9."
+        )
+
+    # Read through the uncached collector: a cached union from an earlier, healthy
+    # catalogue would let a damaged one pass.
+    own = load_schema(_PROBE_ABSTRACT_CLASS).get("properties") or []
+    if len(_collect_properties(_PROBE_ABSTRACT_CLASS)) <= len(own):
+        raise DescriptionsLoadError(
+            f"niwaki {version}'s catalogue resolves '{_PROBE_ABSTRACT_CLASS}' but its "
+            f"concrete subclasses add no properties to its {len(own)} own — the "
+            f"'inherits' table no longer carries colon-notation ancestors. "
+            f"Pin niwaki>=1.8,<1.9."
         )
 
 
@@ -367,6 +394,129 @@ def class_exists(class_name: str) -> bool:
     rather than a hand-written comparison.
     """
     return bool(_query("SELECT 1 FROM mo WHERE class_name = ?", (class_name,)))
+
+
+def _collect_properties(class_name: str) -> frozenset[str]:
+    """Wire names a query against ``class_name`` may meet, read straight from SQL.
+
+    Uncached on purpose: ``verify_catalogue`` calls this directly so its probe
+    reads the database, not a result remembered from an earlier, healthy one.
+
+    Resolution, which is not obvious from the table names:
+
+    * ``prop.class_id`` is ``mo.id``, and a subclass's rows already include the
+      properties it inherits (measured: all 34 of abstract ``fvABD``'s are also
+      on concrete ``fvBD``). Own properties are therefore one indexed lookup.
+    * ``inherits(class_id, ancestor)`` holds, for each descendant, its **full**
+      ancestor chain, with ``ancestor`` in colon notation (``fv:ABD``). That is
+      the class's ``mo.class_pkg || ':' || mo.short_name``, which is what lets
+      the subquery turn ``fvABD`` into ``fv:ABD`` without parsing the name
+      (``class_name`` is exactly ``class_pkg || short_name``, 0 exceptions in
+      15,452, so the two notations differ only by the colon).
+    * The ``subclass`` table is **not** used. It lists direct children only,
+      for abstract classes only, and 850 of its 14,973 entries name a class
+      absent from ``mo`` (``cloud:EpP`` among them), so finding every
+      descendant means a recursive walk that cannot cross those gaps.
+      ``inherits`` carries the whole chain on the descendant itself, so one
+      query answers it. Measured on this catalogue the two agree on every
+      concrete descendant of all 1,954 abstract classes; the only class a walk
+      misses is the abstract ``cloudANWParams`` (its parent ``cloud:AParamPol``
+      is one of the gaps), which contributes no properties of its own to a
+      union. That is luck of this release, not a property of the walk.
+
+    The descendant half is applied to every class rather than only to abstract
+    ones. APIC returns subclass instances for any class query, and a concrete
+    class with concrete children is a catalogue change this code should not
+    have to be edited for. It costs one scan of ``inherits`` (no index on
+    ``ancestor``; ~1.3 ms for its 45,496 rows), paid once per class by the
+    cache in ``known_properties``.
+
+    Only concrete descendants contribute: an abstract one has no instances, and
+    its properties are repeated on every concrete class beneath it anyway.
+    """
+    rows = _query(
+        "SELECT p.wire_name FROM prop p JOIN mo c ON c.id = p.class_id "
+        "WHERE c.class_name = ? "
+        "UNION "
+        "SELECT p.wire_name FROM prop p "
+        "JOIN mo d ON d.id = p.class_id AND d.is_abstract = 0 "
+        "JOIN inherits i ON i.class_id = d.id "
+        "WHERE i.ancestor = "
+        "(SELECT class_pkg || ':' || short_name FROM mo WHERE class_name = ?)",
+        (class_name, class_name),
+    )
+    return frozenset(r[0] for r in rows)
+
+
+# Bounded because the key space is the whole catalogue: 15,452 classes, and an
+# abstract class's union is large (measured: `statsItem` 4,475 names, 27-42 ms
+# to build; `fvABD` 54 names, 1.4 ms). A session touches a handful of classes, so
+# 512 holds a long working set while capping the worst case at a few thousand
+# short strings per entry instead of letting every class ever probed stay
+# resident. Unknown classes are cached too (as the empty set), which is correct
+# — the catalogue is immutable for the life of the process.
+@lru_cache(maxsize=512)
+def known_properties(class_name: str) -> frozenset[str]:
+    """Wire names of every property ``class_name`` can carry; empty if unknown.
+
+    For a concrete class this is its own properties. For an **abstract** class
+    it is the union of its own and those of all its concrete subclasses,
+    because a query against an abstract class returns instances of those
+    subclasses, and they carry attributes the abstract class never declares
+    (``fvABD`` declares 34; with its concrete descendants ``fvBD``, ``fvBDDef``
+    and ``fvSvcBD`` the union is 54, including ``hostBasedRouting``).
+
+    An unknown class returns an empty frozenset rather than raising: an empty
+    set cannot be mistaken for "this class has properties", and the caller has
+    already been through ``class_exists`` / ``UnknownClassError``. Do not use
+    emptiness to mean "no restriction" — the two are different answers.
+
+    Names are wire names only — the catalogue's readable aliases are never read
+    (see the module docstring).
+    """
+    return _collect_properties(class_name)
+
+
+def property_exists(class_name: str, wire_name: str) -> bool:
+    """Whether ``wire_name`` is a property of ``class_name``, case-sensitive.
+
+    Defined as membership in :func:`known_properties`, so for an abstract class
+    it also accepts attributes only a concrete subclass carries. That is a
+    deliberate choice, not a shortcut: the two functions must never disagree,
+    or ``query()`` could accept an attribute that ``closest_properties`` then
+    cannot suggest, or reject one that ``known_properties`` lists. Preferring
+    the wider set errs towards letting a valid filter through.
+
+    A single indexed ``prop`` lookup costs ~0.001 ms, so the cache is not what
+    makes this cheap for concrete classes; it is there for the abstract union,
+    which is built once and then answered by a set lookup.
+
+    Returns ``False`` for an unknown class, and for any attribute on it.
+    """
+    return wire_name in known_properties(class_name)
+
+
+def closest_properties(class_name: str, name: str, n: int = 5) -> list[str]:
+    """Up to ``n`` property names of ``class_name`` nearest to ``name``.
+
+    For correcting a typo or a guess before the request is sent: an unknown
+    attribute in a filter is syntactically valid, reaches the APIC, and comes
+    back as ``[]`` with no error.
+
+    A case-insensitive match is listed first — the commonest slip is ``Name``
+    or ``arpflood`` for ``arpFlood`` — followed by :mod:`difflib`'s nearest
+    names at its default 0.6 cutoff, which also reaches a readable name
+    (``description`` -> ``descr``, ratio 0.625). Returns ``[]`` for an unknown
+    class or when nothing is close; the caller says so rather than guessing.
+    ``name`` itself is included when it is a real property.
+    """
+    if n < 1:
+        return []
+    names = sorted(known_properties(class_name))
+    lowered = name.lower()
+    folded = [p for p in names if p.lower() == lowered and p != name]
+    near = difflib.get_close_matches(name, names, n=n)
+    return (folded + [p for p in near if p not in folded])[:n]
 
 
 def _project_property(row: sqlite3.Row, bits: dict[str, int]) -> dict[str, Any]:

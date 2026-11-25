@@ -50,6 +50,15 @@ classDiagram
         Raised by query() and count()
     }
 
+    class UnknownAttributeError {
+        +str class_name
+        +str attribute
+        +list~str~ suggestions
+        +str catalogue_version
+        Attribute absent from the class's catalogue properties
+        Raised by callers of registry/catalog.py property helpers
+    }
+
     class FilterError {
         Invalid class name or attribute key
         Raised by build_filter()
@@ -91,6 +100,7 @@ classDiagram
     NiwashiMcpError <|-- AuthenticationError
     NiwashiMcpError <|-- RegistryError
     NiwashiMcpError <|-- UnknownClassError
+    NiwashiMcpError <|-- UnknownAttributeError
     NiwashiMcpError <|-- FilterError
     NiwashiMcpError <|-- ApicError
 
@@ -116,6 +126,7 @@ Module paths below are relative to `mcp/src/niwashi_mcp/`.
 | `DescriptionsLoadError` | `registry/catalog.py` | The niwaki catalogue (`catalog.db`) is not present at the expected path inside the installed `niwaki` package; or its `manifest` table has no `prop_flags` row; or `prop_flags` no longer declares every flag the adapter reads |
 | `SchemaLoadError` | *nothing* | Defined and importable, but unreachable — see below |
 | `UnknownClassError` | `main.py` — `query()` and `count()` tools | `catalog.class_exists(class_name)` returned `False`: the name is absent from the catalogue's class table (15,452 entries), case included |
+| `UnknownAttributeError` | *callers of* `registry/catalog.py` `property_exists()` / `known_properties()` | An attribute name is not among the class's wire-name properties (for an abstract class, the union with its concrete subclasses). Defined and tested; the tools do not raise it yet |
 | `FilterError` | `registry/filter.py` `_validate_ident()` | Class name or attribute key does not match `^[A-Za-z][A-Za-z0-9]*$`. Filter *values* are escaped, never rejected — a value cannot raise this |
 | `ApicAuthError` | `apic/client.py` | `authenticate()`: the login POST came back non-2xx. `_send()`: the request was still 401/403 after a re-authentication round-trip |
 | `ApicConnectionError` | `apic/client.py` | `httpx.TimeoutException` or `httpx.ConnectError`. `authenticate()` has no retry loop and raises on the first failure; the read path (`query_class()`, `get_by_dn()`, `count_class()`, all through `_request_json()`) raises only once the retry budget is exhausted |
@@ -156,6 +167,21 @@ New code should not catch `SchemaLoadError`: the clause would compile, and never
 Validation itself runs against the catalogue's class table, which holds **15,452** classes. The 213-class difference is the set of classes that carry no label, no comment and no usable property label: there is nothing to index for them, so `search_classes()` cannot reach them — but `query()` and `count()` accept them, because they exist. A class in that gap therefore never raises `UnknownClassError`, even though `search_classes()` will not find it.
 
 Case is part of the check. SQLite's default `BINARY` collation makes it structural rather than a hand-written comparison: `fvBd` does not resolve to `fvBD`, and never silently returns the wrong class's results.
+
+---
+
+## UnknownAttributeError and the catalogue's release
+
+`UnknownClassError` says a class does not exist. `UnknownAttributeError` says less: the attribute is not in a catalogue that describes **one** APIC release (`catalog.apic_version()`, e.g. `6.0(9c)`), and a fabric on another release may legitimately have it. The message states this, so a caller that gets the error can decide whether to refuse or to send the request anyway.
+
+| Attribute | Value |
+|---|---|
+| `class_name` | The class the attribute was looked up on, verbatim |
+| `attribute` | The name the caller supplied, verbatim |
+| `suggestions` | Up to 5 closest property names, from `catalog.closest_properties()` — may be empty |
+| `catalogue_version` | The APIC release the catalogue was generated from. A required argument: `exceptions.py` cannot import `registry.catalog` (which imports it), so the caller passes `catalog.apic_version()` |
+
+What counts as "among the class's properties" is `catalog.known_properties()`: the class's own wire names, plus, for an abstract class, those of its concrete subclasses (resolved through the catalogue's `inherits` table; see [registry.md](registry.md)). `property_exists()` is defined as membership in that set, so the two cannot disagree.
 
 ---
 

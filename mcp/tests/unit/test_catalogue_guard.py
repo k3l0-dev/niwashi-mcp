@@ -136,6 +136,51 @@ class TestStructuralDamage:
         assert "no 'type_pool' table" in str(excinfo.value)
 
 
+class TestInheritsDamage:
+    """`inherits` feeds `known_properties`' abstract-class union.
+
+    It is the one table read for a purpose the startup probe on `fvBD` never
+    touches, so it needs its own structural and functional guard. The quiet
+    failure is the dangerous one: were `ancestor` stored without the colon,
+    every query would still run and every concrete class would still be
+    right, but an abstract class's union would silently shrink to its own
+    properties and valid attributes would be refused.
+    """
+
+    def test_it_is_a_required_table(self):
+        assert catalog._REQUIRED_TABLES["inherits"] == {"class_id", "ancestor"}
+
+    def test_a_dropped_table_is_named(self, broken_catalogue):
+        broken_catalogue("DROP TABLE inherits")
+        with pytest.raises(DescriptionsLoadError, match="no 'inherits' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE inherits RENAME COLUMN ancestor TO parent")
+        with pytest.raises(DescriptionsLoadError, match="ancestor"):
+            catalog.verify_catalogue()
+
+    def test_a_changed_ancestor_notation_is_caught(self, broken_catalogue):
+        """Structurally intact; every ancestor `fv:ABD` becomes `fvABD`."""
+        broken_catalogue("UPDATE inherits SET ancestor = replace(ancestor, ':', '')")
+        with pytest.raises(DescriptionsLoadError, match="inherits"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_table_is_caught(self, broken_catalogue):
+        broken_catalogue("DELETE FROM inherits")
+        with pytest.raises(DescriptionsLoadError, match="inherits"):
+            catalog.verify_catalogue()
+
+    def test_a_cached_union_cannot_mask_the_damage(self, broken_catalogue):
+        """The functional check must read the database, not a union remembered
+        from the healthy catalogue — `known_properties` is lru_cached."""
+        assert "hostBasedRouting" in catalog.known_properties("fvABD")  # primes the cache
+        broken_catalogue("DELETE FROM inherits")
+        with pytest.raises(DescriptionsLoadError, match="inherits"):
+            catalog.verify_catalogue()
+        catalog.known_properties.cache_clear()
+
+
 class TestManifestDamage:
     def test_a_missing_manifest_key_is_named(self, broken_catalogue):
         broken_catalogue("DELETE FROM manifest WHERE key='apic_version'")
