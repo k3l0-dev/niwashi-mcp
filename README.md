@@ -18,7 +18,7 @@ so any LLM can reach all 15,452 classes with no hardcoded class knowledge.</p>
 [![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm%20NC-blue)](LICENSE)
 [![Commercial License](https://img.shields.io/badge/license-Commercial-orange)](LICENSE-COMMERCIAL.md)
 [![Python](https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastMCP](https://img.shields.io/badge/FastMCP-3.4+-00C896)](https://github.com/jlowin/fastmcp)
+[![FastMCP](https://img.shields.io/badge/FastMCP-4.2+-00C896)](https://github.com/jlowin/fastmcp)
 <br/>
 
 ![Cisco ACI](https://img.shields.io/badge/Cisco-ACI-1BA0D7?style=flat-square&logo=cisco&logoColor=white)

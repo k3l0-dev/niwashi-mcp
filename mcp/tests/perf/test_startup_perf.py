@@ -108,9 +108,9 @@ class TestFootprint:
 
         The catalogue connection holds the string pools; the tokenised search
         index holds ~15,239 entries. Measured in a fresh interpreter that has
-        imported the server and warmed the index: ~198 MB, of which ~160 MB is
-        the catalogue and the index and ~38 MB the server's own import tree
-        (FastMCP and the MCP SDK).
+        imported the server and warmed the index: ~210 MB on FastMCP 4.2.6 (~198 MB
+        on 3.4.11), of which ~160 MB is the catalogue and the index and the rest
+        the server's own import tree (FastMCP and the MCP SDK).
 
         The ceiling matters because a deployment with a memory limit gets a
         SIGKILL, not an exception — CPython does not read cgroup limits, so the
@@ -142,7 +142,7 @@ class TestFootprint:
         rss = raw / 1e6 if sys.platform == "darwin" else raw / 1e3
 
         assert rss < 500, (
-            f"resident set is {rss:.0f} MB. Measured at ~198 MB; this allows 2.5x "
+            f"resident set is {rss:.0f} MB. Measured at ~210 MB; this allows ~2.4x "
             f"for interpreter and platform differences. Past it, a 512 MB "
             f"container limit is a coin toss."
         )

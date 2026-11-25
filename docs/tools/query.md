@@ -126,7 +126,7 @@ An **envelope dict** — not a bare list:
 | `fields` | `list[str] \| None` | The projection that was applied, echoed as given; `None` when `fields` was not set. Added in this release: every envelope now carries it, `null` by default — the one change to an unprojected result. |
 | `redacted` | `int` | **Present only when the server withheld a secret** (see [Secrets](#secrets)): how many attribute values it replaced. Absent otherwise, so an ordinary result is byte-identical to what it was. The `note` says so too. |
 
-The envelope is a typed dict (`QueryEnvelope`), so the `outputSchema` the server advertises names these keys, marks the eight it always returns as required (`redacted` is optional), and admits `null` for `next_page`, `note` and `fields`. `results` items stay free-form objects: which attributes an object carries depends on its class.
+The envelope is a typed dict (`QueryEnvelope`), so the `outputSchema` the server advertises names these keys, marks the eight it always returns as required (`redacted` is optional), and admits `null` for `next_page`, `note` and `fields`. `results` items stay free-form objects: which attributes an object carries depends on its class. The server also checks every response against the type before returning it — strictly, and refusing a key the type does not declare — so a defect in the envelope surfaces as a tool error naming the key at fault, not as an answer a client may or may not accept.
 
 Any code written against the older (pre-envelope) shape of this doc needs updating: `result["results"][0]["dn"]`, not `result[0]["dn"]`.
 
