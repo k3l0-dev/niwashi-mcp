@@ -82,10 +82,20 @@ query() return shape
   An envelope, not a bare list:
     {"results": [...], "returned": <int>, "total_available": <int>,
      "truncated": <bool>, "next_page": <int|None>, "complete": <bool>,
-     "note": <str|None>, "fields": <list[str]|None>}
+     "note": <str|None>, "fields": <list[str]|None>,
+     "redacted": <int>}              # only when something was withheld
   A `truncated: true` response must never be read as a maximum, minimum,
   total, or complete list — re-run with fetch_all=True or page to exhaustion
   first. See the FULL-FABRIC AGGREGATION section of the server instructions.
+
+Secrets
+-------
+  query, get_by_dn and count never hand an agent a secret. Credentials, keys,
+  community strings and session tokens are replaced by "<redacted>" in every
+  object returned (children and subtree objects included), a DN that carries one
+  has that part cut out, and a filter, order_by or group_by on a secret
+  attribute — or a DN that names a secret object — is refused. The policy is
+  niwaki's own; see registry/redaction.py and docs/internals/redaction.md.
 """
 
 import asyncio
@@ -107,13 +117,15 @@ from niwashi_mcp.apic.version import check_fabric_version
 from niwashi_mcp.exceptions import (
     ConfigurationError,
     NiwashiMcpError,
+    SecretAttributeError,
+    SecretDnError,
     UnknownAttributeError,
     UnknownClassError,
 )
 from niwashi_mcp.middleware.auth import ApiKeyMiddleware, KeyStore, load_api_keys
 from niwashi_mcp.middleware.health import HealthMiddleware
 from niwashi_mcp.middleware.oauth import OAuthDiscoveryMiddleware
-from niwashi_mcp.registry import catalog
+from niwashi_mcp.registry import catalog, redaction
 from niwashi_mcp.registry.descriptions import search as desc_search
 from niwashi_mcp.registry.filter import (
     filter_expr_attributes,
@@ -365,6 +377,10 @@ async def app_lifespan(server: FastMCP):
     # so a mismatch is a refused startup naming what moved, never a fabric
     # answered from silently empty fields.
     catalog.verify_catalogue()
+    # Right after, because the policy resolves against the catalogue; and before
+    # the backend connects, because a server that cannot say which values are
+    # secret must not be one an APIC session is open behind.
+    redaction.verify_policy()
 
     descriptions = catalog.descriptions_index()
     logger.info(
@@ -488,7 +504,7 @@ COUNTING — to answer "how many X?" call count(class_name, filters, scope_dn).
 FULL-FABRIC AGGREGATION — a single default query() page is NOT the whole
     fabric.  query() returns an envelope: {"results": [...], "returned",
     "total_available", "truncated", "next_page", "complete", "note",
-    "fields"}.  For "which X has the most/least Y", "how many X in total",
+    "fields"} — plus "redacted" when something was withheld (see SECRETS).  For "which X has the most/least Y", "how many X in total",
     "list all X", or "max/min across the fabric" questions, a response with
     truncated=true must never be used to state a maximum, minimum, total, or
     complete list — get the rest first.  Use count() for a pure tally; use
@@ -543,6 +559,20 @@ RELATION INTEGRITY — never report what an object points to without reading
 CLEAN CONFIG — pass config_only=True to query() or get_by_dn() to drop the ~40
     operational/internal attributes and keep only the intended configuration,
     ideal for comparison, drift detection, and backup.
+
+SECRETS — this server never hands you a secret, and says so when it holds one
+    back.  Credentials, keys, community strings and session tokens come back as
+    "<redacted>" in query(), get_by_dn() and the children inside them; a DN that
+    contains one (an SNMP community profile is named by its community string, a
+    login session by its token) comes back with that part cut out.  The
+    envelope's "redacted" (get_by_dn: "_redacted") counts what was withheld and
+    is absent when nothing was.  This is policy, not an error: report such a
+    value as withheld by the server — never as empty, missing or unknown.  An
+    attribute that is empty is shown empty, and means unset.  Do not try to
+    recover a secret: a filter, order_by or group_by on a secret attribute is
+    refused (SecretAttributeError), and so is any DN, scope_dn or filter value
+    that names a secret object (SecretDnError) — whether or not the object
+    exists.  get_schema marks such properties "secret": true; leave them out.
 
 GROUNDING — every specific fact in your final answer (a property name, a
     configured value, a DN template, a relation target, a count) must come
@@ -669,7 +699,9 @@ async def get_schema(
                         relation as the source declares it, as above
       properties     — sorted list of all available attribute names
       property_details — compact per-property constraints; present ONLY when
-                        include_property_details=True or properties_filter is set
+                        include_property_details=True or properties_filter is set.
+                        A property that holds a secret is marked `"secret": true`
+                        (see below)
       isAbstract     — True when the class cannot be directly instantiated
       isConfigurable — True when objects can be created/modified via APIC
       className      — short name without package prefix, e.g. "BD"
@@ -685,7 +717,16 @@ async def get_schema(
        "naming": true,                    # only when the property is part of the DN
        "default": <value>,                # only when the schema declares one
        "options": [<allowed value>, ...], # only for enumerated properties
+       "secret": true,                    # only when the property holds a secret
        "comment": <one-line description>}
+
+    `secret` marks a property whose value this server never returns: query() and
+    get_by_dn() show it as "<redacted>", and a filter, order_by or group_by on it
+    is refused (SecretAttributeError) because the answer would reveal it. On a
+    class named by its secret (an SNMP community profile) `dn` and `rn` are marked
+    too: the DN comes back with the secret cut out. The name stays listed so you
+    know the property exists; do not ask for what it holds. No value is ever shown
+    here.
 
     `options` lists longer than max(list_limit, 100) are sampled — only a
     dozen enums are that long, faultInst.code (80,512 values) the largest — and
@@ -726,6 +767,7 @@ async def get_schema(
     )
     if schema:
         catalog.annotate_relations(schema)
+        redaction.mark_secret_properties(schema, class_name)
         limit = max(1, min(list_limit, _SCHEMA_LIST_MAX))
         _bound_schema_lists(schema, limit)
         _bound_property_options(schema, max(limit, _SCHEMA_OPTIONS_FLOOR))
@@ -912,6 +954,9 @@ class QueryEnvelope(TypedDict):
     complete: bool
     note: str | None
     fields: list[str] | None
+    # present only when a secret was withheld, so a result with none is
+    # byte-identical to what it was before secrets were redacted
+    redacted: NotRequired[int]
 
 
 class CountEnvelope(TypedDict):
@@ -930,6 +975,9 @@ class CountEnvelope(TypedDict):
     note: NotRequired[str | None]
     # only for group_by="code", and only the codes the catalogue defines
     group_names: NotRequired[dict[str, str]]
+    # only with group_by, and only when a secret was cut out of the group value
+    # of some objects: how many
+    redacted: NotRequired[int]
 
 
 # ── Field projection ──────────────────────────────────────────────────────────
@@ -1029,6 +1077,55 @@ def _append_note(note: str | None, extra: str) -> str:
     return f"{note} {extra}" if note else extra
 
 
+def _withheld_note(count: int) -> str:
+    """Tell the agent that secrets were held back, without saying which.
+
+    The marker already says *where* (the attribute that reads "<redacted>");
+    this says that it was the server's doing and not an empty value, and that
+    asking another way is refused rather than merely unanswered.
+    """
+    return (
+        f"{count} secret value(s) were withheld from these results by the "
+        f"server's policy (credentials, keys, community strings, session tokens) "
+        f"and appear as {redaction.REDACTED!r}; a DN that carried one is shown "
+        "with that part cut out. This is not an empty value. They cannot be "
+        "recovered through this server: a filter, order_by or group_by on a "
+        "secret attribute is refused."
+    )
+
+
+async def _refuse_secrets(
+    tool: str,
+    ctx: Context,
+    class_name: str,
+    *,
+    filters: dict[str, str] | None = None,
+    order_by: str | None = None,
+    filter_expr: str | None = None,
+    scope_dn: str | None = None,
+    group_by: str | None = None,
+) -> None:
+    """Refuse a request that would reveal a secret — in every attribute mode.
+
+    Runs before the attribute check and before anything is logged or sent, and
+    is not governed by ``NIWASHI_MCP_STRICT_ATTRIBUTES``: that switch relaxes a
+    question about what the catalogue knows, this is not one. The log line
+    carries the refusal's message, which never quotes what the agent sent.
+    """
+    try:
+        redaction.check_request(
+            class_name,
+            filters=filters,
+            order_by=order_by,
+            filter_expr=filter_expr,
+            scope_dn=scope_dn,
+            group_by=group_by,
+        )
+    except (SecretAttributeError, SecretDnError) as exc:
+        await ctx.warning(f"{tool}({class_name!r}) refused — {exc}")
+        raise
+
+
 @mcp.tool(title="Query ACI objects", annotations=_FABRIC_READ)
 async def query(
     class_name: str,
@@ -1058,6 +1155,11 @@ async def query(
     against the catalogue, and refuses the request before it reaches the APIC
     when one is unknown. The error names the closest real ones.
 
+    Secrets are never returned. A credential, key, community string or session
+    token comes back as "<redacted>" — in every result, in each "_children"
+    entry, and whatever `fields` asked for — and a DN that carries one has that
+    part cut out. See "redacted" below.
+
     Executes a GET against the APIC class or subtree endpoint.
     The APIC filter string is built automatically from `filters`.
     Providing `scope_dn` issues a subtree query rooted at that DN,
@@ -1075,7 +1177,9 @@ async def query(
         ctx:        Injected FastMCP context (not a user-facing parameter).
         filters:    Attribute filters as {attribute: value} pairs.
                     Attribute names must match properties from get_schema();
-                    an unknown name raises UnknownAttributeError.
+                    an unknown name raises UnknownAttributeError, and an
+                    attribute marked `secret` there raises SecretAttributeError
+                    (a match on it would confirm a guess).
                     Example: {"name": "servers"}  →  eq(fvBD.name,"servers")
                     Multiple entries are combined with APIC and() syntax.
         scope_dn:   DN of a parent object to scope the subtree query.
@@ -1088,7 +1192,8 @@ async def query(
                           page-size. Not used when fetch_all=True, which pages
                           at its own fixed size of 200 whatever `limit` is.
         order_by:         APIC ordering expression, e.g. "faultInst.severity|desc".
-                          The attribute is checked against the class in the term.
+                          The attribute is checked against the class in the term;
+                          a secret one is refused.
         include_children: Child class names to embed in each result in one call,
                           e.g. ["fvSubnet", "fvRsCtx"].  Each returned object
                           will contain a "_children" list of child attribute dicts.
@@ -1101,7 +1206,9 @@ async def query(
                           via and() when both are provided. Each Class.attr
                           operand is checked against the catalogue; quoted
                           values are never inspected, and anything that is not
-                          recognisably Class.attr is sent as written.
+                          recognisably Class.attr is sent as written. An operand
+                          that is a secret attribute is refused, however the
+                          predicate is written.
         rsp_subtree_include: Inline subtree categories to include in the same
                           response, e.g. "faults", "health", "audit-logs",
                           "faults,no-scoped", "faults,required".
@@ -1153,7 +1260,10 @@ async def query(
                                         # the APIC ended its pages early)
            "note": <str|None>,          # guidance, present only when truncated or
                                         # capped, or when a name was sent unchecked
-           "fields": <list[str]|None>}  # the projection applied, None when `fields` was not set
+           "fields": <list[str]|None>,  # the projection applied, None when `fields` was not set
+           "redacted": <int>}           # ABSENT unless something was withheld: how
+                                        # many secret values, DN segments and text
+                                        # attributes were replaced; "note" says so too
         Each dict in "results" contains all APIC attributes for the object
         plus a "_class" key with the ACI class name. The "dn" attribute is
         always present and encodes the full object path. When
@@ -1165,7 +1275,24 @@ async def query(
         names the catalogue did not know — an empty result may then mean the
         name is wrong, not that nothing matches.
 
+        A withheld secret reads "<redacted>" where its value would be, and
+        "redacted" counts them. That is the server's policy, not an empty value;
+        an attribute that is genuinely empty is shown empty. The same applies
+        inside "_children", and to a DN that passes through a secret (an SNMP
+        community profile is named by its community string): the segment becomes
+        "community-<redacted>". The secret is also removed from the other text of
+        an object that quotes it, such as an audit record's descr.
+
     Raises:
+        SecretAttributeError: `filters`, `order_by` or `filter_expr` uses an
+                           attribute that holds a secret. Refused whatever
+                           NIWASHI_MCP_STRICT_ATTRIBUTES is set to, before the
+                           APIC is called: the answer would reveal the value.
+        SecretDnError:     `scope_dn`, a filter value or `filter_expr` spells a
+                           DN that names an object by a secret (a community
+                           string, session token or API key is part of it).
+                           Refused on its shape, existing or not, so a guess
+                           cannot be checked.
         UnknownClassError: class_name is not in the catalogue — includes the
                            closest matches so the caller can self-correct
                            without another search_classes() round-trip. The
@@ -1212,6 +1339,15 @@ async def query(
         await ctx.warning(f"query called with unknown class {class_name!r}")
         raise UnknownClassError(class_name, suggestion_names, len(descriptions))
 
+    await _refuse_secrets(
+        "query",
+        ctx,
+        class_name,
+        filters=filters,
+        order_by=order_by,
+        filter_expr=filter_expr,
+        scope_dn=scope_dn,
+    )
     attribute_warnings = await _enforce_attributes(
         "query",
         ctx,
@@ -1276,6 +1412,11 @@ async def query(
         projected_classes = frozenset([class_name, *child_classes])
         objects = [_project(obj, keep, projected_classes) for obj in objects]
 
+    # After the projection, so what is counted is what the agent receives, and
+    # whatever `fields` asked for: a secret that was asked for by name is
+    # still the marker, and one that was projected away is not announced.
+    objects, withheld = redaction.redact_objects(objects)
+
     returned = len(objects)
 
     # `truncated` must be measured against what the caller has *consumed*, not
@@ -1332,8 +1473,11 @@ async def query(
 
     if fields_note:
         note = _append_note(note, fields_note)
+    if withheld:
+        note = _append_note(note, _withheld_note(withheld))
+        await ctx.info(f"query({class_name!r}) → {withheld} secret(s) withheld")
 
-    return {
+    envelope: QueryEnvelope = {
         "results": objects,
         "returned": returned,
         "total_available": result.total_available,
@@ -1343,6 +1487,9 @@ async def query(
         "note": note,
         "fields": list(fields) if fields is not None else None,
     }
+    if withheld:
+        envelope["redacted"] = withheld
+    return envelope
 
 
 @mcp.tool(title="Fetch one ACI object by DN", annotations=_FABRIC_READ)
@@ -1362,6 +1509,14 @@ async def get_by_dn(
     workflow (search_classes → get_schema → query) instead.
 
     Issues GET /api/mo/{dn}.json against the APIC.
+
+    Secrets are never returned: a credential, key, community string or session
+    token reads "<redacted>", in the object and in each "_children" entry,
+    whatever `fields` asked for. A DN that is itself named by a secret — an SNMP
+    community profile (`.../community-<string>`), a login session, a JWT site —
+    is refused outright, without asking the APIC, whether or not the object
+    exists: a found / not-found answer would let a guess be checked. Reach such
+    an object through its class or its parent's DN instead.
 
     Args:
         dn:               Full Distinguished Name, e.g. "uni/tn-OT/BD-servers".
@@ -1395,6 +1550,11 @@ async def get_by_dn(
         unknown name — a field, or a class in include_children — is not
         refused: the object carries a "_note" key saying so.
 
+        When a secret was withheld the object also carries "_redacted": how many
+        values, DN segments and text attributes were replaced (the key is absent
+        otherwise), and "_note" says so. A withheld value reads "<redacted>"; that
+        is the server's policy, not an empty value.
+
         When no object exists at that DN, a structured not-found dict:
           {"found": False, "dn": <dn>, "message": <explanation>}
         The APIC returns an empty result for a missing DN; this makes that
@@ -1402,6 +1562,9 @@ async def get_by_dn(
         is a stale or mistyped DN — re-verify it via search_classes → query.
 
     Raises:
+        SecretDnError:    `dn` names an object by a secret. Raised on the DN's
+                          shape alone, before the APIC is called, so the answer
+                          is the same for a DN that exists and one that does not.
         UnknownClassError: a class in `include_children` is not in the
                           catalogue — includes the closest matches. Raised
                           before the APIC is called.
@@ -1415,6 +1578,14 @@ async def get_by_dn(
     """
     descriptions: dict = ctx.lifespan_context["descriptions"]
     backend: ApicClient = ctx.lifespan_context["backend"]
+
+    # First, before anything is logged or sent: whether the object exists is
+    # the one thing a refusal must not depend on (see SecretDnError).
+    try:
+        redaction.check_dn(dn)
+    except SecretDnError as exc:
+        await ctx.warning(f"get_by_dn refused — {exc}")
+        raise
 
     # An unknown class in include_children is embedded as nothing: the object
     # comes back with no `_children`, which reads as "it has none". The class
@@ -1452,10 +1623,7 @@ async def get_by_dn(
         }
     await ctx.info(f"get_by_dn({dn!r}) → {obj.get('_class')}")
     if fields is None:
-        # No envelope to carry a note here — the object is the whole answer — so
-        # it rides on the object under a synthetic key, like `_class`. Copied
-        # rather than set in place: `obj` is the backend's.
-        return {**obj, "_note": note} if note else obj
+        return _with_disclosure(*redaction.redact_object(obj), note)
 
     # The class is only known now, from the object the DN resolved to — which
     # is why this cannot fail before the APIC is called as query()'s check does.
@@ -1483,12 +1651,31 @@ async def get_by_dn(
             "to receive every attribute.",
         )
 
-    projected = _project(
-        obj, frozenset(fields), frozenset([object_class, *child_classes])
+    # Projected first, then redacted, as in query(): what is counted is what is
+    # returned, and a secret named in `fields` is still the marker.
+    projected, withheld = redaction.redact_object(
+        _project(obj, frozenset(fields), frozenset([object_class, *child_classes]))
     )
+    return _with_disclosure(projected, withheld, note)
+
+
+def _with_disclosure(
+    obj: dict[str, Any], withheld: int, note: str | None
+) -> dict[str, Any]:
+    """The `get_by_dn` answer: the object, and the keys that explain what was done to it.
+
+    There is no envelope to carry a note here — the object is the whole answer —
+    so it rides on the object under synthetic keys, like `_class`. Copied rather
+    than set in place: `obj` may be the backend's. An object that needed no
+    explanation is returned as it is.
+    """
+    extras: dict[str, Any] = {}
+    if withheld:
+        note = _append_note(note, _withheld_note(withheld))
+        extras["_redacted"] = withheld
     if note:
-        projected["_note"] = note
-    return projected
+        extras["_note"] = note
+    return {**obj, **extras} if extras else obj
 
 
 # ── count: group_by ───────────────────────────────────────────────────────────
@@ -1633,6 +1820,7 @@ async def _group_counts(
     objects: list[dict[str, Any]] = []
     fetched = 0
     withheld: str | None = None
+    secrets_withheld = 0
     if total > _MAX_OBJECTS:
         withheld = (
             f"{total} objects match, more than the {_MAX_OBJECTS} one fetch_all "
@@ -1650,7 +1838,21 @@ async def _group_counts(
             filter_expr=filter_expr,
             fetch_all=True,
         )
-        objects = result.objects
+        # Redacted before it is tallied, so a group key can never be a secret:
+        # a DN that passes through one (group_by="affected" on audit records),
+        # or text that quotes one, is already cut when it becomes a key. Keys
+        # that become equal are counted together, which is what they now are.
+        # What is reported is what that changed in the answer — the objects
+        # whose group value was cut — not every secret the fetch happened to
+        # hold: a credential's password withheld while grouping it by name
+        # alters nothing the agent reads.
+        objects, _ = redaction.redact_objects(result.objects)
+        if not from_dn:
+            secrets_withheld = sum(
+                1
+                for before, after in zip(result.objects, objects, strict=True)
+                if before.get(group_by) != after.get(group_by)
+            )
         fetched = len(objects)
         if not result.complete:
             withheld = (
@@ -1692,6 +1894,8 @@ async def _group_counts(
         "complete": True,
         "note": None,
     }
+    if secrets_withheld:
+        breakdown["redacted"] = secrets_withheld
     # A fault code on its own says little, and an agent that is handed only
     # "F0546: 60" names it from memory. Where the catalogue defines the rule,
     # say so. Only the codes it knows are listed, and only when there are any,
@@ -1722,6 +1926,12 @@ async def count(
     Attribute names in `filters` and `filter_expr` are checked against the
     catalogue exactly as query() checks them, and an unknown one is refused.
 
+    A secret cannot be counted *by value*: `filters`, `filter_expr` and
+    `group_by` on an attribute that holds a secret are refused, because a count
+    of one for `{"value": "guess"}` would confirm the guess and the groups would
+    print the values as keys. Counting a class that has secrets is fine —
+    `count("snmpTrapDest")` — and so is grouping it by any other attribute.
+
     The most frequent verification need — "how many BDs / EPGs / subnets?" —
     answered in a single cheap request that transfers one object instead of the
     whole matching set. Filtering and scoping behave exactly as in query(), and
@@ -1746,7 +1956,9 @@ async def count(
                      name, which then wins. Unlike a plain count this fetches
                      every matching object to tally it, so narrow with
                      filters/scope_dn on a large class. Leave unset for the
-                     plain count; the response is then unchanged.
+                     plain count; the response is then unchanged. A secret
+                     attribute is refused; a group key that would carry one
+                     inside a DN or text is cut ("community-<redacted>").
 
     Returns:
         A dict:
@@ -1777,6 +1989,9 @@ async def count(
         defined in the schema. Do not supply a name for such a code from memory; query
         one object of it and read its own `rule` and `descr`. The key is
         absent when no code resolves and for any other group_by.
+        With `group_by`, when the group value of some objects carried a secret
+        (inside a DN or text) and was cut, the dict also gains "redacted": how
+        many objects that was true of. The key is absent otherwise.
         When complete, sum(groups.values()) + ungrouped == count. Objects
         that carry no value for the attribute (for "tenant": a DN with no
         tenant segment, i.e. fabric-level objects) are counted in `ungrouped`,
@@ -1791,6 +2006,11 @@ async def count(
         (NIWASHI_MCP_STRICT_ATTRIBUTES=false), a "warnings" list is added.
 
     Raises:
+        SecretAttributeError: `filters`, `filter_expr` or `group_by` uses an
+                           attribute that holds a secret. Refused whatever
+                           NIWASHI_MCP_STRICT_ATTRIBUTES is set to.
+        SecretDnError:     `scope_dn`, a filter value or `filter_expr` spells a
+                           DN that names an object by a secret.
         UnknownClassError: class_name is not in the catalogue — the same
                            guard query() applies, from the same single source
                            of truth, so the two tools can never disagree about
@@ -1821,6 +2041,15 @@ async def count(
         await ctx.warning(f"count called with unknown class {class_name!r}")
         raise UnknownClassError(class_name, suggestion_names, len(descriptions))
 
+    await _refuse_secrets(
+        "count",
+        ctx,
+        class_name,
+        filters=filters,
+        filter_expr=filter_expr,
+        scope_dn=scope_dn,
+        group_by=group_by or None,
+    )
     attribute_warnings = await _enforce_attributes(
         "count",
         ctx,
