@@ -500,30 +500,77 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   to publish as `niwaki.secrets`, so the switch is a change to that file and its
   niwaki-coupled tests.
 
-- `fastmcp` floor raised from 3.4.5 to 3.4.10 for the 2026-10-23 advisories, and
-  the lock now resolves 3.4.11 (`certifi` 2026.6.17 → 2026.11.20 came along in
-  the same `uv lock`). The floor moves, not only the lock, because an
-  installation from the published package resolves from `pyproject.toml` and
-  ignores `uv.lock` — a lock bump alone would leave `uvx niwashi-mcp` free to
-  resolve a release the advisories cover.
-- Lock moved for the transitive packages under fastmcp's transport and auth
-  stack. Reached on `/mcp`: `mcp` 1.28.1 → 1.30.0 fixes GHSA-84m7-p3x7-pcfv
-  (unbounded session accumulation in the StreamableHTTP transport), and
-  `opentelemetry-api` 1.44.0 → 1.45.2 fixes GHSA-mf5v-w3w3-f6cg (quadratic
-  `traceparent` parsing) and GHSA-xcq7-p3pf-p88h (unbounded `tracestate`).
-  fastmcp extracts `traceparent` and `tracestate` from each tool call's
-  request metadata, so a caller who reaches `/mcp` reaches that parser. With
-  `mcp` 1.30 an idle stateful session closes after 30 minutes and a server
-  holds at most 10,000 sessions; a client whose session has expired gets a 404
-  and re-initialises.
-  Pulled in but not reached by niwashi, which configures no fastmcp auth
-  provider and uses its own API-key middleware: `dnspython` 2.8.0 → 2.9.2
-  (GHSA-45c3-73f7-pv4m, GHSA-vvf4-9x63-8xvv; only `email-validator` loads it,
-  and no wire or zone parsing runs), `authlib` 1.7.2 → 1.9.10 (empty HMAC key
-  acceptance, GHSA-8m4g-j4wp-wgcg; the JWT and OAuth paths are not used),
-  `joserfc` 1.7.4 → 1.8.0 (GHSA-9pg5-8c7x-5hfx, GHSA-jpxq-7h8p-2q76) and
-  `pyjwt` 2.13.0 → 2.15.1 (GHSA-42vr-xj54-vc7v). `python-dotenv` 1.2.2 → 1.2.4
-  is a direct dependency bumped in the same lock.
+- **24 published advisories in the locked dependencies are fixed** (#38).
+  `pip-audit` reported 35 findings on 7 packages; on the exported lock it now
+  reports none. Each advisory was checked against how this server actually uses
+  the package, and the floors in `pyproject.toml` were raised where it matters,
+  so a `uvx`/`pip` install cannot resolve below them.
+
+  **Reachable by this server:**
+
+  - **certifi 2026.11.20** — [GHSA-6q48-6c7w-9gw2](https://github.com/advisories/GHSA-6q48-6c7w-9gw2)
+    (critical): the bundle trusted emSign root CAs whose intermediate CA keys
+    were compromised. `ApicClient` verifies the APIC's TLS certificate against
+    this bundle when `APIC_VERIFY_SSL` is on, so a certificate minted from those
+    keys could have impersonated the APIC and received the APIC password at
+    login.
+  - **opentelemetry-api ≥ 1.45.2** (new direct floor) —
+    [GHSA-mf5v-w3w3-f6cg](https://github.com/advisories/GHSA-mf5v-w3w3-f6cg)
+    (quadratic-time `traceparent` parsing) and
+    [GHSA-xcq7-p3pf-p88h](https://github.com/advisories/GHSA-xcq7-p3pf-p88h)
+    (unbounded `tracestate` parsing). fastmcp extracts trace context from the
+    request metadata on every tool call and tool listing, so a caller able to
+    reach `/mcp` could burn CPU with a crafted header. `/mcp` requires an API key
+    except on a loopback development bind, which bounds who that caller can be.
+  - **fastmcp ≥ 3.4.10** (3.4.11 locked) —
+    [GHSA-7xgj-8392-5q4r](https://github.com/advisories/GHSA-7xgj-8392-5q4r)
+    (medium): authorization added by component transforms was skipped on direct
+    calls. This server defines no per-tool authorization, so the practical
+    exposure was nil; the floor closes it for any future use.
+
+  **Defence in depth — present in the dependency tree, not on this server's
+  paths:**
+
+  - **mcp ≥ 1.30.0** (new direct floor) —
+    [GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv)
+    (unbounded StreamableHTTP session accumulation). The server runs
+    `stateless_http=True`, so it holds no sessions and was not exposed in its
+    shipped configuration; the floor keeps a stateful deployment safe. The same
+    release fixes four client- or OAuth-side issues this server does not use:
+    [GHSA-qx49-fqc8-xw99](https://github.com/advisories/GHSA-qx49-fqc8-xw99) (high,
+    OAuth client credentials sent to a server-chosen authorization server),
+    [GHSA-w4fh-qvv9-3v23](https://github.com/advisories/GHSA-w4fh-qvv9-3v23)
+    (bearer tokens for another resource server accepted),
+    [GHSA-5h93-6whr-6q8j](https://github.com/advisories/GHSA-5h93-6whr-6q8j)
+    (cross-origin redirects carrying headers) and
+    [GHSA-rwrf-2pqf-9j8j](https://github.com/advisories/GHSA-rwrf-2pqf-9j8j)
+    (server-chosen `$ref` URLs fetched while validating tool results).
+  - **authlib 1.9.10, joserfc 1.8.0, pyjwt 2.15.1** — fastmcp's OAuth and JWT
+    stack. niwashi authenticates callers with its own API-key middleware and
+    configures no fastmcp auth provider, so none of these ran here. Fixed:
+    authlib [GHSA-6v38-4h7w-rj9h](https://github.com/advisories/GHSA-6v38-4h7w-rj9h)
+    (critical, empty JWS signatures accepted),
+    [GHSA-7vr2-2fgp-9w7p](https://github.com/advisories/GHSA-7vr2-2fgp-9w7p)
+    (high, HMAC forgery with prefixed public keys),
+    [GHSA-c5mf-xmp2-59rc](https://github.com/advisories/GHSA-c5mf-xmp2-59rc),
+    [GHSA-fch4-3c6x-j4gc](https://github.com/advisories/GHSA-fch4-3c6x-j4gc),
+    [GHSA-q686-2qmg-hqc7](https://github.com/advisories/GHSA-q686-2qmg-hqc7),
+    [GHSA-x4rv-c3wx-4cr8](https://github.com/advisories/GHSA-x4rv-c3wx-4cr8) and
+    [GHSA-jj7h-c3hg-m23x](https://github.com/advisories/GHSA-jj7h-c3hg-m23x);
+    pyjwt [GHSA-p4g4-x82p-q773](https://github.com/advisories/GHSA-p4g4-x82p-q773)
+    (high, DER public keys accepted as HMAC secrets),
+    [GHSA-pxh4-856f-4h89](https://github.com/advisories/GHSA-pxh4-856f-4h89)
+    (high, empty HMAC key via an `oct` JWK),
+    [GHSA-2gx3-rcp4-g85q](https://github.com/advisories/GHSA-2gx3-rcp4-g85q) and
+    [GHSA-jwrc-g2q2-pq5p](https://github.com/advisories/GHSA-jwrc-g2q2-pq5p);
+    joserfc [GHSA-jpxq-7h8p-2q76](https://github.com/advisories/GHSA-jpxq-7h8p-2q76)
+    (high, CPU exhaustion via JWE recipients) and
+    [GHSA-9pg5-8c7x-5hfx](https://github.com/advisories/GHSA-9pg5-8c7x-5hfx).
+  - **dnspython 2.9.2** — [GHSA-45c3-73f7-pv4m](https://github.com/advisories/GHSA-45c3-73f7-pv4m)
+    and [GHSA-vvf4-9x63-8xvv](https://github.com/advisories/GHSA-vvf4-9x63-8xvv)
+    (high, CPU and memory exhaustion in DNS wire and zone parsing). Pulled in
+    only by email-validator; no DNS parsing runs in this server.
+- `python-dotenv` 1.2.2 → 1.2.4 (direct dependency), and the dev tools `pytest` 9.2.0, `pytest-asyncio` 1.5.0 and `ruff` 0.17.6, bumped in the same lock; no advisory involved.
 
 ---
 
