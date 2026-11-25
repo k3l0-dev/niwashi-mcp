@@ -203,6 +203,22 @@ mkdir -p .opencode/skills/niwashi-mcp
 cp mcp/client/SKILL.md .opencode/skills/niwashi-mcp/SKILL.md
 ```
 
+### From the server itself (experimental)
+
+The server publishes the same file as an MCP resource,
+`skill://niwashi-mcp-query/SKILL.md`, next to a `skill://niwashi-mcp-query/_manifest`
+that gives its size and SHA-256 — and, on the 2026-07-28 protocol, through the
+Skills extension (`skills/list`, `skills/get`). A client that fetches skills from
+the server it is connected to needs no copy; one that does not never asks, and the
+five tools are unaffected. This is FastMCP 4.2's implementation of a **draft**
+extension (SEP-2640): the URI scheme and the wire format may change in a FastMCP
+release, and a client has to know to ask for it. Until yours does, use one of the
+copies above.
+
+The skill ships inside the package (`niwashi_mcp/skills/niwashi-mcp-query/`), so
+it is there with `uvx` and no checkout. It is a copy of `mcp/client/SKILL.md`, and
+a test and the wheel smoke check fail if the two differ.
+
 ---
 
 ## Running from a checkout

@@ -14,10 +14,17 @@ turns the schema into a contract, and a contract can be wrong: a key declared
 non-null that is sometimes null, or required and sometimes absent, fails *at
 runtime* in the client's validator, on exactly the return path nobody tried.
 
-So both halves are asserted here. The schema must name the keys, and every
-return path must validate against it end to end — through a real in-memory MCP
-client, because that is what runs the validator. Calling the tool function
-directly, as the other integration tests do, never touches the schema.
+FastMCP 4 no longer validates a tool's output on the server, so the server does
+it itself: `query` and `count` check their envelope against its TypedDict before
+returning (`main._guarded`), and a slip is a tool error instead of a response a
+client may or may not choke on. A key the TypedDict does not declare would
+otherwise be dropped by serialisation without a trace.
+
+So all of it is asserted here. The schema must name the keys, the guard must
+refuse a wrong envelope, and every return path must validate against the schema
+end to end — through a real in-memory MCP client, because that is what a caller
+sees. Calling the tool function directly, as the other integration tests do,
+never touches the schema.
 """
 
 from __future__ import annotations
@@ -26,10 +33,12 @@ import asyncio
 import json
 
 import pytest
-from fastmcp import Client, FastMCP
+from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
 
 from niwashi_mcp import main
+from niwashi_mcp.apic.client import QueryResult
 from niwashi_mcp.main import CountEnvelope, QueryEnvelope
 from tests.conftest import StubBackend
 from tests.integration.test_tools import _WIDE_IMDATA
@@ -136,20 +145,53 @@ async def _call(server, name: str, **arguments):
     return result
 
 
+class _SlippedBackend(StubBackend):
+    """A backend whose answers break the envelope the tools build from them.
+
+    `QueryResult.complete` is a bool and `count_class` returns an int; both are
+    copied into the envelope as they come, so a backend that gets either wrong
+    is how a real slip reaches the wire.
+    """
+
+    async def query_class(self, *args, **kwargs):
+        result = await super().query_class(*args, **kwargs)
+        return QueryResult(
+            objects=result.objects,
+            total_available=result.total_available,
+            complete=None,  # type: ignore[arg-type]
+        )
+
+    async def count_class(self, *args, **kwargs):
+        return str(await super().count_class(*args, **kwargs))  # type: ignore[return-value]
+
+
 @pytest.mark.asyncio
-async def test_a_wrong_envelope_is_refused_so_the_checks_below_mean_something():
-    """Control: if the client never validated, every test below would pass vacuously."""
-    bad = FastMCP("control")
+@pytest.mark.parametrize(
+    ("tool", "key"), [("query", "complete"), ("count", "count")]
+)
+async def test_a_wrong_envelope_is_refused_so_the_checks_below_mean_something(
+    monkeypatch, catalogue_index, tool, key
+):
+    """Control: if nothing validated, every test below would pass vacuously.
 
-    @bad.tool
-    async def broken() -> QueryEnvelope:
-        return {"results": [], "returned": "three"}  # type: ignore[typeddict-item]
+    This goes through the real tools, served in memory, with a backend that
+    answers with the wrong type. FastMCP 3 refused such a return on the server;
+    FastMCP 4 sends it, so the refusal here is the server's own guard — and the
+    key it names is the one at fault.
+    """
 
-    async with Client(bad) as client:
-        result = await client.call_tool("broken", {}, raise_on_error=False)
+    @lifespan
+    async def slipped(server):
+        yield {"descriptions": catalogue_index, "backend": _SlippedBackend(_WIDE_IMDATA)}
+
+    monkeypatch.setattr(main.mcp, "_lifespan", slipped)
+    monkeypatch.delenv("NIWASHI_MCP_STRICT_ATTRIBUTES", raising=False)
+
+    result = await _call(main.mcp, tool, class_name="fvBD")
 
     assert result.is_error
-    assert "total_available" in result.content[0].text
+    text = result.content[0].text
+    assert "breaks its own schema" in text and f"{key}:" in text
 
 
 @pytest.mark.asyncio
@@ -260,3 +302,98 @@ async def test_get_by_dn_projection_and_not_found_both_validate(served):
     }
     assert not missing.is_error, missing.content
     assert missing.structured_content["found"] is False
+
+
+# ── the guard itself ──────────────────────────────────────────────────────────
+
+
+def _query_envelope(**overrides):
+    base = {
+        "results": [{"dn": "uni/tn-A", "_class": "fvTenant"}],
+        "returned": 1, "total_available": 1, "truncated": False,
+        "next_page": None, "complete": True, "note": None, "fields": None,
+    }
+    return {**base, **overrides}
+
+
+def _count_envelope(**overrides):
+    base = {"class_name": "fvBD", "count": 2, "scope_dn": None, "filters": {}}
+    return {**base, **overrides}
+
+
+class TestTheGuard:
+    def test_a_conforming_envelope_comes_back_as_the_same_object(self):
+        """Only the verdict is wanted. Returning the validated copy would double
+        the memory of a 5,000-object answer for nothing."""
+        for tool, guard, envelope in (
+            ("query", main._QUERY_GUARD, _query_envelope(redacted=3)),
+            ("count", main._COUNT_GUARD, _count_envelope(group_by="tenant", complete=True)),
+        ):
+            assert main._guarded(tool, guard, envelope) is envelope
+
+    @pytest.mark.parametrize(
+        ("tool", "guard", "envelope"),
+        [
+            ("query", "_QUERY_GUARD", _query_envelope(surprise=1)),
+            ("count", "_COUNT_GUARD", _count_envelope(surprise=1)),
+        ],
+    )
+    def test_a_key_the_typed_dict_does_not_declare_is_refused(self, tool, guard, envelope):
+        """FastMCP's serialisation would drop it silently; the client would never
+        learn the server meant to say something."""
+        with pytest.raises(ToolError, match=r"surprise: Extra inputs are not permitted"):
+            main._guarded(tool, getattr(main, guard), envelope)
+
+    @pytest.mark.parametrize(
+        "envelope",
+        [
+            _query_envelope(returned="1"),    # a string where the client wants an integer
+            _query_envelope(returned=True),   # and a bool is not an integer on the wire
+            _query_envelope(truncated=None),  # null where the schema says boolean
+            _query_envelope(next_page="2"),
+            _query_envelope(results=["not an object"]),
+        ],
+    )
+    def test_a_wrongly_typed_value_is_refused_without_coercion(self, envelope):
+        with pytest.raises(ToolError, match="breaks its own schema"):
+            main._guarded("query", main._QUERY_GUARD, envelope)
+
+    def test_a_missing_required_key_is_refused(self):
+        envelope = _count_envelope()
+        del envelope["filters"]
+
+        with pytest.raises(ToolError, match=r"filters: Field required"):
+            main._guarded("count", main._COUNT_GUARD, envelope)
+
+    def test_the_message_names_the_keys_and_never_the_values(self):
+        """For `results` the value is the whole answer, and it can run to 5,000
+        objects: it must not be echoed into an error."""
+        envelope = _query_envelope(
+            results=[{"dn": "uni/tn-A"}, "LEAKED-VALUE"], returned="LEAKED-COUNT"
+        )
+
+        with pytest.raises(ToolError) as caught:
+            main._guarded("query", main._QUERY_GUARD, envelope)
+
+        message = str(caught.value)
+        assert "returned:" in message and "results.1:" in message
+        assert "LEAKED" not in message and "uni/tn-A" not in message
+
+    def test_a_flood_of_identical_problems_is_summarised(self):
+        envelope = _query_envelope(results=["x"] * 50)
+
+        with pytest.raises(ToolError) as caught:
+            main._guarded("query", main._QUERY_GUARD, envelope)
+
+        assert "(and 45 more)" in str(caught.value)
+        assert len(str(caught.value)) < 700
+
+    def test_the_guards_declare_exactly_the_keys_the_typed_dicts_do(self):
+        """The guards subclass the advertised types, so they can only drift if
+        someone redeclares a key — which this fails on."""
+        for advertised, guard in (
+            (QueryEnvelope, main._QueryEnvelopeGuard),
+            (CountEnvelope, main._CountEnvelopeGuard),
+        ):
+            assert guard.__required_keys__ == advertised.__required_keys__
+            assert guard.__optional_keys__ == advertised.__optional_keys__

@@ -18,7 +18,7 @@ so any LLM can reach all 15,452 classes with no hardcoded class knowledge.</p>
 [![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm%20NC-blue)](LICENSE)
 [![Commercial License](https://img.shields.io/badge/license-Commercial-orange)](LICENSE-COMMERCIAL.md)
 [![Python](https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastMCP](https://img.shields.io/badge/FastMCP-3.4+-00C896)](https://github.com/jlowin/fastmcp)
+[![FastMCP](https://img.shields.io/badge/FastMCP-4.2+-00C896)](https://github.com/jlowin/fastmcp)
 <br/>
 
 ![Cisco ACI](https://img.shields.io/badge/Cisco-ACI-1BA0D7?style=flat-square&logo=cisco&logoColor=white)
@@ -186,6 +186,16 @@ how to read a schema, how DNs are built, and when to reach for each tool.
 | OpenCode | `cp mcp/client/SKILL.md ~/.config/opencode/skills/niwashi-mcp-query/SKILL.md` (or `.opencode/skills/…` per project). The directory name must match the skill's `name:` field, and it must sit beside the server declaration — tools without the skill is the failure this file exists to prevent |
 | Anything else | Paste it into the system prompt or context file |
 
+**Experimental — the server also serves it.** The same file is published as an
+MCP resource, `skill://niwashi-mcp-query/SKILL.md` (with a `skill://niwashi-mcp-query/_manifest`
+carrying its size and SHA-256), and, on the 2026-07-28 protocol, through the
+Skills extension's `skills/list` and `skills/get`. A client that reads skills from
+the server it is connected to needs no copy at all; one that does not simply never
+asks, and the five tools are unaffected. It rides FastMCP 4.2's implementation of
+a draft extension (SEP-2640), so the URI scheme and the wire format may change in
+a FastMCP release, and a client has to know to ask for it — until yours does, copy
+the file as above.
+
 Then ask:
 
 > *"List all tenants configured in this fabric."*
@@ -282,6 +292,7 @@ Per-tool reference with worked examples: [`docs/tools/`](docs/tools/).
 | `MCP_API_KEYS` | | — | Comma-separated bearer tokens. Unset means no authentication (development only) |
 | `MCP_HOST` | | `127.0.0.1` | Interface to bind. Loopback by default; a routable value requires `MCP_API_KEYS` |
 | `MCP_ALLOW_NO_AUTH` | | `false` | `true` accepts a routable bind with `MCP_API_KEYS` unset. Refused otherwise |
+| `MCP_ALLOWED_HOSTS` | | — | Comma-separated hostnames accepted in the `Host` header besides loopback names. Set it to your public name when a reverse proxy on the same machine forwards it, or every proxied request is answered `421` |
 | `NIWASHI_MCP_ENV_FILE` | | — | Explicit path to the `.env` file to load |
 
 **Hot reload:** send `SIGHUP` to the process to reload `MCP_API_KEYS` from the
@@ -303,6 +314,9 @@ Full reference: [`docs/configuration/settings.md`](docs/configuration/settings.m
   complete discovery before they hold a token
 - Loopback bind by default — a routable `MCP_HOST` without `MCP_API_KEYS` is
   refused at startup, not merely warned about
+- `Host` and `Origin` validation on requests that arrive on loopback, against
+  DNS rebinding — behind a reverse proxy on the same machine, list its public
+  name in `MCP_ALLOWED_HOSTS`
 - API keys reloadable via `SIGHUP`
 
 Vulnerability disclosure policy: [SECURITY.md](SECURITY.md).

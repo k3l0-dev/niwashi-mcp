@@ -9,6 +9,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Added
 
+- **The server publishes its own ACI skill (experimental).** `mcp/client/SKILL.md`
+  — the object-model guide an agent needs beside the five tools — had to be
+  copied next to the client configuration by hand. It is now also served as the
+  MCP resource `skill://niwashi-mcp-query/SKILL.md`, with a
+  `skill://niwashi-mcp-query/_manifest` giving its size and SHA-256, and through
+  the Skills extension's `skills/list` and `skills/get` on the 2026-07-28
+  protocol. A client that fetches skills from the server it is connected to
+  needs no copy; one that does not never asks, and the five tools are unaffected.
+
+  **Experimental**, and not to be relied on across FastMCP releases: it rides
+  FastMCP 4.2's implementation of a draft extension (SEP-2640), so the URI scheme
+  and the wire format may change without a deprecation period. The file is
+  package data in `niwashi_mcp/skills/niwashi-mcp-query/` (FastMCP requires the
+  folder to carry the skill's name) and is loaded at import, so a wheel that lost
+  it refuses to start. It is a copy of `client/SKILL.md`, which stays the file
+  that is edited and tested; a test fails, naming the `cp` to run, when the two
+  differ by a byte, and `scripts/wheel_smoke.py` makes the same check on the
+  built wheel. The deprecated resource-only providers are not used.
+
+- **`MCP_ALLOWED_HOSTS` names the hosts a reverse proxy may forward.**
+  Comma-separated, patterns allowed (`*.example.com`), read after the `.env` is
+  loaded. See Security: the `Host` header is now validated, and a proxy on the
+  same machine has to be listed. Unset, nothing changes for any other deployment.
+
 - **`get_schema` reports each relation's cardinality and how it names its
   target.** `relationTo[*].cardinality` was `""` on all 2,992 entries and the
   docs told agents not to branch on it: the relation dicts in the catalogue's
@@ -229,6 +253,71 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Changed
 
+- **FastMCP 3.4.11 → 4.2.6, and the MCP SDK 1.30 → 2.3.** `fastmcp>=4.2.6,<5` and
+  `mcp>=2.3,<3` (which FastMCP 4 requires; Python 3.12 and the other floors are
+  unchanged). The five tools, their names, parameters, annotations and results
+  are as they were; what moved is underneath, and each piece was checked rather
+  than assumed:
+
+  - **A schema slip in `query` or `count` is a tool error again.** FastMCP 3
+    validated a tool's return against its output schema; FastMCP 4 does not — it
+    serialises through the annotated type and sends the result, so a wrongly
+    typed value goes out with only a serialiser warning, and a key the TypedDict
+    does not declare is dropped without a trace. `query` and `count` now check
+    their envelope against its TypedDict before returning: strict (the wire is
+    JSON and a client does not coerce), undeclared keys refused, one pydantic
+    `TypeAdapter` built at import. A failure names the keys at fault, never their
+    values, and says it is a server defect. The advertised schema is unchanged
+    and still tolerates a key a newer server adds. Cost, on 5,000 objects of 40
+    attributes: 4.6 ms for the check, 12.0 → 16.8 ms for the tool function,
+    151 → 155 ms through an in-memory client — against seconds at the APIC.
+    `get_by_dn`, `search_classes` and `get_schema` return free-form shapes with
+    no typed envelope and are not covered.
+  - **Three protocol eras are served.** Checked over raw HTTP against a running
+    server: `initialize` on 2025-06-18 and 2025-11-25, and the 2026-07-28 era,
+    which has no handshake — `server/discover` and a per-request envelope — all
+    list the five tools and answer one call to each; `initialize` proposing
+    2026-07-28 negotiates 2025-11-25. `claude -p` (Claude Code 2.1.329) connected,
+    followed `search_classes` → `get_schema` → `count` and answered the live
+    count.
+  - **No listen streams.** FastMCP 4.2.5 serves `subscriptions/listen` by
+    default, and a client that supports it holds a stream open for as long as it
+    is connected. Five fixed tools publish no change notification, so a stream
+    would carry nothing and cost a connection (1,024 per process). It is off, so
+    the server advertises `listChanged` and `resources.subscribe` as false and
+    answers `subscriptions/listen` with method-not-found, as it did on 4.2.4.
+    Set on the settings object before the server is created, not through
+    `FASTMCP_ENABLE_SUBSCRIPTIONS_LISTEN`, which is read when `fastmcp` is
+    imported and loses to anything that imported it first.
+  - **Known future work: the tools' progress messages ride a deprecated
+    capability.** `ctx.info` and `ctx.warning` use the MCP logging capability,
+    which the SDK deprecated for the 2026-07-28 revision (SEP-2577) and will
+    remove. The calls are kept — they are how a client that still supports
+    logging sees what a tool refused — and the one warning they raise is silenced
+    (at runtime and under pytest, scoped to that message so other MCP
+    deprecations still surface). They will have to move to another channel before
+    the capability goes upstream.
+  - **About 12 MB more resident memory**: a fresh interpreter that imports the
+    server and warms the index peaks at ~210 MB, from ~198 MB. The footprint
+    test used to read the peak of the *whole pytest process*, which is whatever
+    every other test left behind — 488 to 516 MB against a 500 MB limit on the
+    same code, failing on some runs of 3.4.11. It now measures a fresh
+    interpreter, as the cold-start test beside it does, and the 500 MB budget
+    means what it said.
+  - The contract test read tool hints as attributes (`readOnlyHint`), which MCP
+    SDK v2 renames behind a deprecation bridge. It reads them through their wire
+    form, `model_dump(by_alias=True)`, which is what a client receives.
+
+- **Behind a reverse proxy on the same machine, set `MCP_ALLOWED_HOSTS`.** A
+  deployment that terminates TLS in Caddy, nginx or Traefik on the server host
+  reaches this process over loopback and forwards its public name in the `Host`
+  header; with the new `Host` validation (see Security) every such request,
+  `/health` included, is now answered `421 Misdirected Request` until the name is
+  listed: `MCP_ALLOWED_HOSTS=mcp.example.com`. The startup log says so when the
+  bind is loopback and the list is empty. A proxy on another machine, a LAN
+  deployment with `MCP_HOST=0.0.0.0` and API keys, and every client on the
+  machine itself are unaffected.
+
 - **Dev tooling moved to pytest 9.2.0, pytest-asyncio 1.5.0 and ruff 0.17.6.**
   Ruff reports no findings under the existing rule selection. pytest-asyncio
   1.5 warns when `asyncio_default_fixture_loop_scope` is unset, so it is set to
@@ -442,6 +531,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   on a secret attribute, or a value spelling a secret DN, is refused before any
   request is made, so the APIC never has the value to echo.
 
+- **`serverInfo.version` reported FastMCP's version, not niwashi-mcp's.** The
+  server was built without a version and FastMCP fills the field with its own, so
+  every client saw `niwashi-mcp` next to `4.2.6` (`3.4.11` before the move) on
+  both protocol eras, and a bug report quoting what the server announced named
+  the wrong package's release. It is read from the installed distribution's
+  metadata, so `pyproject.toml` stays the one place a release is numbered; a
+  source tree that was never installed reports `0+unknown`.
+
 - **`fetch_all` capped a "fetch everything" call at 500 objects, not the 5,000
   it advertised.** It paged by the caller's `limit` and stopped after 25 pages,
   so the default `limit=20` ended a call at 25 x 20 = 500 objects and reported
@@ -476,6 +573,76 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   not on what was kept.
 
 ### Security
+
+- **The `Host` and `Origin` headers are validated, against DNS rebinding.** A
+  server on loopback is not out of a web page's reach: the page makes the
+  victim's browser resolve its own name to `127.0.0.1` after it has loaded, then
+  talks to the server as if it were same-origin. Loopback allows authentication
+  to be off, and a `SIGHUP` reload on a loopback bind may empty the key set later,
+  so there may be nothing else to stop it. The one thing the page cannot hide is
+  the `Host` header, which still carries its own domain; FastMCP's
+  `host_origin_protection="auto"` checks it and is now on.
+
+  A request that **arrives on a loopback address** must name `localhost`,
+  `127.0.0.1`, `::1` or a host in `MCP_ALLOWED_HOSTS`, or it is answered `421`; a
+  cross-origin `Origin` is answered `403`. A request that arrives on a routable
+  address is left alone unless `MCP_ALLOWED_HOSTS` is set, in which case the list
+  applies on every address — so a LAN deployment with `MCP_HOST=0.0.0.0` and API
+  keys is unchanged. Measured on a real server, with the proxy's `Host` header set
+  by hand: the loopback bind refused an unlisted `Host` (421), served `127.0.0.1`, served the public name once listed
+  and refused another; a `0.0.0.0` bind reached over the LAN address was not
+  validated without a list and was with one. It applies whether or not
+  `MCP_API_KEYS` is set, because the key set can change at runtime and the guard
+  must not depend on it. **Action required behind a same-host reverse proxy**: see
+  Changed. `MCP_ALLOWED_ORIGINS` is not added: only a browser sends an `Origin`,
+  and none is a documented client.
+
+- **The FastMCP 4.2.6 / MCP 2.3 move closes one published advisory and the
+  hardening that came with it.** Checked against GitHub's advisory database and
+  the FastMCP repository's own advisory list (which is ahead of it): of the 25
+  advisories published for `fastmcp`, **one** is open on 3.4.11 and fixed only on the
+  4.x line, and 4.2.6 is outside the range of every one. For the MCP SDK, the
+  advisories the old `mcp>=1.30.0` floor covered are fixed on 2.x at 2.2.0, so
+  `mcp>=2.3` (which FastMCP 4 requires) keeps all of them closed. None of the
+  locked packages has a published advisory at its locked version.
+
+  **Reachable by this server:** none. niwashi authenticates callers with its own
+  API-key middleware, configures no FastMCP auth provider, OAuth proxy, OpenAPI
+  provider or task worker, and runs no FastMCP client. Listed because the project
+  names every advisory a bump fixes, with whether it reached it:
+
+  - **fastmcp 4.2.4** — [GHSA-78c8-3jhx-5mg7](https://github.com/advisories/GHSA-78c8-3jhx-5mg7)
+    (medium): the OAuth proxy could redeem one authorization code, or one refresh
+    token, twice when two token requests arrived concurrently. Affects fastmcp
+    2.13.0 to 4.2.3, so 3.4.11 was affected and the 3.x line has no fix. Not
+    reached: no `OAuthProxy` or `OIDCProxy` exists here.
+  - **fastmcp 4.1.7, 4.2.1 and 4.2.5 — security fixes with no advisory assigned**
+    (named in the release notes only): `joserfc` and `Authlib` floors raised and
+    raw-string redirect URIs normalised before validation (4.1.7); JWTs with a
+    future `nbf` rejected, OAuth consent remembered per redirect URI and scope
+    set, issuer binding for pre-registered clients, `required_scopes` kept when a
+    custom token verifier is given, and the `opentelemetry-api` floor raised past
+    the traceparent ReDoS already named below, GHSA-mf5v-w3w3-f6cg (4.2.1);
+    CIMD clients can no longer widen the scopes a server allows, redirect URIs
+    must match an exact pattern's query and root path, a reused rotated refresh
+    token ends its grant, and OpenAPI tools stop forwarding MCP transport headers
+    (4.2.5). All of it is OAuth or OpenAPI code. Not reached.
+  - **fastmcp 4.1.0, relevant to the new skill resource** —
+    [GHSA-pwp3-fpg3-p53c](https://github.com/advisories/GHSA-pwp3-fpg3-p53c) (low):
+    skill providers read a `SKILL.md` that was a symlink pointing outside its
+    folder. Fixed on 3.4.9 and on 4.1.0, so it never applied to 3.4.11 and is
+    closed in 4.2.6; the skill here is loaded from package data, not from a
+    folder a user controls.
+  - **mcp 2.2.0** — the same five the 1.30.0 floor covered, fixed on 2.x at 2.2.0:
+    [GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv),
+    [GHSA-qx49-fqc8-xw99](https://github.com/advisories/GHSA-qx49-fqc8-xw99),
+    [GHSA-w4fh-qvv9-3v23](https://github.com/advisories/GHSA-w4fh-qvv9-3v23),
+    [GHSA-5h93-6whr-6q8j](https://github.com/advisories/GHSA-5h93-6whr-6q8j) and
+    [GHSA-rwrf-2pqf-9j8j](https://github.com/advisories/GHSA-rwrf-2pqf-9j8j).
+    Explained in the entry below; the floor is now 2.3.
+  - **authlib, keyring and their dependencies leave the tree.** FastMCP 4 no
+    longer pulls `authlib`, so the seven `authlib` advisories listed below stop
+    being carried at all, not merely patched.
 
 - **`query`, `get_by_dn` and `count` no longer hand an agent the secrets an APIC
   returns in clear.** Measured on a 6.0(9c) lab fabric before the fix: the
@@ -573,7 +740,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
     request metadata on every tool call and tool listing, so a caller able to
     reach `/mcp` could burn CPU with a crafted header. `/mcp` requires an API key
     except on a loopback development bind, which bounds who that caller can be.
-  - **fastmcp ≥ 3.4.10** (3.4.11 locked) —
+  - **fastmcp ≥ 3.4.10** (3.4.11 locked; since moved to ≥ 4.2.6, see above) —
     [GHSA-7xgj-8392-5q4r](https://github.com/advisories/GHSA-7xgj-8392-5q4r)
     (medium): authorization added by component transforms was skipped on direct
     calls. This server defines no per-tool authorization, so the practical
@@ -582,7 +749,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   **Defence in depth — present in the dependency tree, not on this server's
   paths:**
 
-  - **mcp ≥ 1.30.0** (new direct floor) —
+  - **mcp ≥ 1.30.0** (new direct floor; since moved to ≥ 2.3, see above) —
     [GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv)
     (unbounded StreamableHTTP session accumulation). The server runs
     `stateless_http=True`, so it holds no sessions and was not exposed in its

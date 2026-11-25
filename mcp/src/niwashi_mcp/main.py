@@ -44,6 +44,11 @@ Environment variables (read from .env at startup)
   MCP_PORT         HTTP port the server listens on (default: 8000)
   MCP_ALLOW_NO_AUTH  "true" to permit a routable bind with MCP_API_KEYS unset.
                    Refused otherwise: this process holds APIC credentials.
+  MCP_ALLOWED_HOSTS  Comma-separated hostnames accepted in the Host header in
+                   addition to localhost, 127.0.0.1 and ::1 (patterns such as
+                   *.example.com work). Required when a reverse proxy on the
+                   same machine forwards its public name; without it such
+                   requests are answered 421. Unset by default.
   NIWASHI_MCP_STRICT_ATTRIBUTES
                    "false" to send a request even when its attribute names are
                    not in the catalogue, flagging them in the result instead of
@@ -103,14 +108,20 @@ import json
 import logging
 import os
 import signal
+import warnings
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
 from dotenv import load_dotenv
-from fastmcp import Context, FastMCP
+from fastmcp import Context, FastMCP, settings
+from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
+from fastmcp.skills import Skill
+from fastmcp.skills.provider import SkillCatalogProvider
+from mcp import MCPDeprecationWarning
 from mcp.types import ToolAnnotations
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, ConfigDict, TypeAdapter, ValidationError
 
 from niwashi_mcp import redact
 from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
@@ -346,6 +357,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("niwashi-mcp")
 
+# The tools report progress through `ctx.info` / `ctx.warning`, which ride the MCP
+# logging capability. The SDK deprecated that capability as of the 2026-07-28
+# revision (SEP-2577) and will drop it, so every such call warns. The calls are
+# kept for now — they are how a client that still supports logging sees what a
+# tool refused — and the warning is silenced so it does not fill the server log.
+# Known future work, not forgotten: the logging calls have to move to another
+# channel before the capability is removed upstream (see CHANGELOG). Scoped to
+# this one message so any other MCP deprecation still surfaces.
+warnings.filterwarnings(
+    "ignore",
+    message="The logging capability is deprecated",
+    category=MCPDeprecationWarning,
+)
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 
@@ -446,9 +471,59 @@ async def app_lifespan(server: FastMCP):
 
 # ── Server ────────────────────────────────────────────────────────────────────
 
+# Since 4.2.5 FastMCP serves `subscriptions/listen` on 2026-07-28 connections by
+# default: a client that supports it holds one stream open per connection, for as
+# long as it stays connected, to be told when the tool list changes. This server
+# has five fixed tools and publishes no notification, so a stream would carry
+# nothing and occupy a connection (up to 1,024 per process) for nothing — behind
+# a proxy with idle timeouts it would also be cut and reopened forever. Off, the
+# server advertises `listChanged` and `resources.subscribe` as false and answers
+# `subscriptions/listen` with method-not-found, exactly as it did on 4.2.4.
+#
+# Set here, on the settings object, and not through FASTMCP_ENABLE_SUBSCRIPTIONS_LISTEN:
+# the variable is read when `fastmcp` is imported, which any caller that imported
+# it first (a test, an embedding host) would have already done. The setting is
+# read when the server is created, which is the next statement.
+settings.enable_subscriptions_listen = False
+
+
+# The operating guide an agent needs beside the five tools, served as an MCP
+# resource (`skill://niwashi-mcp-query/SKILL.md`) so a client that supports
+# skills can fetch it from the server it is already connected to, instead of the
+# user copying a file next to the configuration. EXPERIMENTAL: FastMCP 4.2 ships
+# this under the draft Skills extension (SEP-2640), and its API and wire format
+# may change in a release without notice. Nothing else depends on it — the five
+# tools work the same for a client that never asks.
+#
+# The file is package data: the folder is named after the skill, as the Agent
+# Skills spec and FastMCP require, and it is loaded here, at import, so a wheel
+# that lost it refuses to start instead of serving no skill. It is a copy of
+# `mcp/client/SKILL.md`, which stays the one people read and edit; a test
+# fails when the two differ, and `scripts/wheel_smoke.py` checks the built wheel.
+_SKILL = Skill.from_package("niwashi_mcp", "skills/niwashi-mcp-query")
+
+
+def _own_version() -> str:
+    """This distribution's version, as installed — what `serverInfo.version` says.
+
+    Left unset, FastMCP reports *its own* version there, so every client saw
+    "4.2.6" next to the name "niwashi-mcp" and a bug report quoted the wrong
+    package. Read from the installed metadata so the single place a release is
+    numbered, `pyproject.toml`, stays the only one. A source tree that was never
+    installed has no metadata; that is reported as unknown rather than as
+    another package's version.
+    """
+    try:
+        return version("niwashi-mcp")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
 mcp = FastMCP(
     name="niwashi-mcp",
+    version=_own_version(),
     lifespan=app_lifespan,
+    providers=[SkillCatalogProvider([_SKILL])],
     instructions="""
 You are an assistant for querying a Cisco ACI fabric through its APIC REST API.
 
@@ -989,6 +1064,66 @@ class CountEnvelope(TypedDict):
     redacted: NotRequired[int]
 
 
+# ── Envelope guard ────────────────────────────────────────────────────────────
+#
+# FastMCP 3 validated a tool's return against its output schema before sending
+# it, so an envelope that broke its own contract became a tool error. FastMCP 4
+# does not: it serialises the return through the annotated type and sends what
+# comes out. A wrongly typed value goes out on the wire with only a serialiser
+# warning, and a key the TypedDict does not declare is dropped without a word —
+# the client never sees it, and nothing here notices.
+#
+# The guard puts the check back, where the data is built. It is not the
+# advertised schema: that stays open to unknown keys, so a key added by a newer
+# server never makes an older client's validator reject the whole answer. This
+# one forbids them, because here an unknown key means the code and the TypedDict
+# have drifted apart. Strict, because the wire is JSON and a client's validator
+# does not coerce: `"3"` for an integer, or `true` for one, is a refusal there
+# and must be one here.
+#
+# Built once, at import. A 5,000-object result validates in about 5 ms against
+# the ~13 ms FastMCP spends serialising the same envelope.
+
+
+class _QueryEnvelopeGuard(QueryEnvelope):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+
+
+class _CountEnvelopeGuard(CountEnvelope):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+
+
+_QUERY_GUARD = TypeAdapter(_QueryEnvelopeGuard)
+_COUNT_GUARD = TypeAdapter(_CountEnvelopeGuard)
+
+# A broken envelope can carry thousands of identical problems, one per result.
+_GUARD_PROBLEMS_SHOWN = 5
+
+
+def _guarded[E](tool: str, guard: TypeAdapter[Any], envelope: E) -> E:
+    """Return ``envelope`` unchanged, or refuse it as a tool error.
+
+    The validated copy is discarded: only the verdict is wanted, and the original
+    is what the tool returns. The message names the keys at fault but never the
+    values, which for ``results`` would be the whole answer.
+    """
+    try:
+        guard.validate_python(envelope, strict=True)
+    except ValidationError as exc:
+        errors = exc.errors(include_input=False, include_url=False)
+        shown = "; ".join(
+            f"{'.'.join(map(str, e['loc'])) or 'envelope'}: {e['msg']}"
+            for e in errors[:_GUARD_PROBLEMS_SHOWN]
+        )
+        more = len(errors) - _GUARD_PROBLEMS_SHOWN
+        raise ToolError(
+            f"{tool} built a response that breaks its own schema — {shown}"
+            + (f" (and {more} more)" if more > 0 else "")
+            + ". This is a server defect, not a problem with the request."
+        ) from exc
+    return envelope
+
+
 # ── Field projection ──────────────────────────────────────────────────────────
 
 # What a projection never removes. `dn` is how the object is addressed again,
@@ -1517,7 +1652,7 @@ async def query(
     }
     if withheld:
         envelope["redacted"] = withheld
-    return envelope
+    return _guarded("query", _QUERY_GUARD, envelope)
 
 
 @mcp.tool(title="Fetch one ACI object by DN", annotations=_FABRIC_READ)
@@ -2144,7 +2279,7 @@ async def count(
     warnings = [*attribute_warnings, *warnings]
     if warnings:
         response["warnings"] = warnings
-    return response
+    return _guarded("count", _COUNT_GUARD, response)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -2167,6 +2302,18 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _allowed_hosts() -> list[str] | None:
+    """The hostnames ``MCP_ALLOWED_HOSTS`` adds to the Host header allowlist.
+
+    Comma-separated like ``MCP_API_KEYS``. ``None`` when unset or blank, which is
+    not the same as an empty list: FastMCP treats a list, even a useless one, as
+    an explicit allowlist and then validates the Host header on every bind,
+    where ``None`` leaves it to ``auto``.
+    """
+    names = [name.strip() for name in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",")]
+    return [name for name in names if name] or None
 
 
 async def _serve() -> None:
@@ -2264,12 +2411,35 @@ async def _serve() -> None:
         Middleware(ApiKeyMiddleware, key_store=key_store),
     ]
 
+    # DNS rebinding: a web page can make a victim's browser resolve its own name
+    # to 127.0.0.1 and then talk to this server as if it were same-origin, with
+    # no key to present when authentication is off (loopback allows that, and a
+    # SIGHUP reload can switch it off later). The only thing that gives it away
+    # is the Host header, which still names the attacker's domain. "auto" checks
+    # it, and Origin, on any request that arrives on a loopback address, and on
+    # every request once an allowlist is given; a server reached over a routable
+    # address is left alone. The Host must then be localhost, a loopback address
+    # or one of MCP_ALLOWED_HOSTS — which is what a reverse proxy on the same
+    # machine has to be told, since it forwards the public name.
+    allowed_hosts = _allowed_hosts()
+    if allowed_hosts:
+        logger.info("Host header allowlist: %s (plus loopback)", ", ".join(allowed_hosts))
+    elif _is_loopback(bind_host):
+        logger.info(
+            "Host header protection is on for loopback requests: only localhost, "
+            "127.0.0.1 and ::1 are accepted. Behind a reverse proxy that forwards "
+            "its public name, set MCP_ALLOWED_HOSTS to that name, or every proxied "
+            "request is answered 421 Misdirected Request."
+        )
+
     await mcp.run_http_async(
         host=bind_host,
         port=port,
         stateless_http=True,
         json_response=True,
         middleware=middleware,
+        host_origin_protection="auto",
+        allowed_hosts=allowed_hosts,
     )
 
 

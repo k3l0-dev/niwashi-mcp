@@ -25,6 +25,7 @@ graph LR
         E8["MCP_HOST"]
         E9["MCP_ALLOW_NO_AUTH"]
         E10["NIWASHI_MCP_STRICT_ATTRIBUTES"]
+        E11["MCP_ALLOWED_HOSTS"]
     end
 
     subgraph shell["process environment only"]
@@ -44,6 +45,7 @@ graph LR
         S3["uvicorn bind address"]
         S4["startup guard<br/>routable bind + no keys = refused"]
         S5["query / count<br/>attribute validation mode"]
+        S6["Host / Origin guard<br/>DNS-rebinding protection"]
     end
 
     E1 --> A1
@@ -56,6 +58,7 @@ graph LR
     E8 --> S4
     E9 --> S4
     E10 --> S5
+    E11 --> S6
     X1 --> env
 ```
 
@@ -86,6 +89,7 @@ graph LR
 | `MCP_API_KEYS` | Production: **Yes** | — | Comma-separated list of pre-shared bearer tokens. Empty = authentication disabled (development only). Re-readable at runtime with `SIGHUP` — but a reload that would empty the set on a routable bind is **refused**, not applied. |
 | `MCP_HOST` | No | `127.0.0.1` | Interface the server binds. Loopback by default, so a fresh install is not reachable from the network. Set it to `0.0.0.0` or a specific address to expose the server — see the guard below. |
 | `MCP_ALLOW_NO_AUTH` | No | `false` | `true` accepts a routable bind with `MCP_API_KEYS` unset. Any other value leaves the refusal in place. |
+| `MCP_ALLOWED_HOSTS` | No | — | Comma-separated hostnames accepted in the `Host` header in addition to `localhost`, `127.0.0.1` and `::1`. **Required behind a reverse proxy on the same machine** that forwards its public name — see [The Host guard](#the-host-guard). Patterns work (`*.example.com`); a port in the request is ignored. |
 
 ### The bind guard
 
@@ -111,6 +115,43 @@ which is the safe reading when in doubt.
 The guard runs once, at startup. The `SIGHUP` reload path cannot undo it: a
 reload that would leave the key set empty on a routable bind is refused and the
 previous keys are kept.
+
+### The Host guard
+
+A server on loopback is not out of reach of a web page. With **DNS rebinding**, a
+page makes the victim's browser resolve its own name to `127.0.0.1` after loading
+and then talks to the server as if it were same-origin — and a loopback server
+with authentication off, which loopback allows, has nothing to stop it. The one
+thing the page cannot hide is the `Host` header, which still carries its own
+domain. The server therefore validates `Host` and `Origin` (FastMCP's
+`host_origin_protection="auto"`):
+
+- A request that **arrived on a loopback address** must name `localhost`,
+  `127.0.0.1`, `::1` or a host listed in `MCP_ALLOWED_HOSTS`, or it is answered
+  `421 Misdirected Request`. A cross-origin `Origin` is answered `403`.
+- A request that arrived on a **routable address** is not checked, unless
+  `MCP_ALLOWED_HOSTS` is set, in which case the list applies on every address. A
+  LAN deployment with `MCP_HOST=0.0.0.0` and `MCP_API_KEYS` therefore keeps
+  working with no change: its clients reach it by names the server cannot know.
+
+**Behind a reverse proxy on the same machine** — Caddy, nginx, Traefik — the
+proxy connects over loopback and forwards the public name. Caddy passes the
+`Host` header through unchanged; nginx does so only with
+`proxy_set_header Host $host;`. That name is not on the default list, so list it:
+
+```dotenv
+MCP_ALLOWED_HOSTS=mcp.example.com
+```
+
+Without it every proxied request, `/health` included, is answered `421`, which
+looks like a proxy fault; the startup log says so when the bind is loopback. A
+proxy on **another machine** reaches the server over a routable address and is
+unaffected.
+
+It applies whether or not `MCP_API_KEYS` is set, on purpose: a `SIGHUP` reload
+on a loopback bind may legitimately empty the key set later, and the guard must
+not depend on a state that can change under it. `MCP_ALLOWED_HOSTS=*` matches
+every name and turns the `Host` check off; do not set it on a loopback bind.
 
 ### Generating API keys
 
@@ -222,6 +263,9 @@ APIC_VERIFY_SSL=false
 MCP_HOST=127.0.0.1
 MCP_PORT=8000
 MCP_API_KEYS=abc123xyz,def456uvw
+
+# Optional — only behind a reverse proxy on this machine; its public name
+# MCP_ALLOWED_HOSTS=mcp.example.com
 
 # Optional — uncomment only for a fabric newer than the catalogue
 # NIWASHI_MCP_STRICT_ATTRIBUTES=false
