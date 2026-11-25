@@ -284,6 +284,7 @@ def _strict_attributes() -> bool:
     value = os.environ.get("NIWASHI_MCP_STRICT_ATTRIBUTES", "true")
     return value.strip().lower() not in {"false", "0", "no", "off"}
 
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -423,9 +424,12 @@ SHORTCUT — skip discovery when you already have an exact DN:
 COUNTING — to answer "how many X?" call count(class_name, filters, scope_dn).
     It returns a tally without transferring the objects — far cheaper than
     fetching everything just to measure the result set.  count() only gives
-    a scalar tally, never a ranking: "how many subnets in total" is count();
+    a tally, never a ranking: "how many subnets in total" is count();
     "which BD has the most subnets" is argmax and needs the actual objects —
     call query(..., fetch_all=True) and aggregate locally over "results".
+    "How many X per tenant / severity / state" is count(..., group_by="tenant"
+    or an attribute of X); if it returns complete=false there is no breakdown
+    — narrow the query, never infer one.
     If count() or query() cannot run at all — an unknown class name, an
     unreachable object, a malformed filter — that is a failure to answer,
     not an answer of zero.  Never restate a tool error as a count or as
@@ -829,9 +833,11 @@ class CountEnvelope(TypedDict):
     filters: dict[str, str]
     warnings: NotRequired[list[str]]
     group_by: NotRequired[str]
-    groups: NotRequired[dict[str, int]]
+    # null, not partial, when the breakdown could not be produced exactly
+    groups: NotRequired[dict[str, int] | None]
+    ungrouped: NotRequired[int | None]
     complete: NotRequired[bool]
-    note: NotRequired[str]
+    note: NotRequired[str | None]
 
 
 # ── Field projection ──────────────────────────────────────────────────────────
@@ -1319,6 +1325,176 @@ async def get_by_dn(
     return projected
 
 
+# ── count: group_by ───────────────────────────────────────────────────────────
+
+# The one pseudo-attribute `group_by` accepts besides a class's real properties.
+# A tenant is not an attribute of the objects it owns, only a segment of their
+# DN, so "per tenant" cannot be asked for by naming an attribute.
+_TENANT_KEY = "tenant"
+
+# Page size handed to the backend for the group_by fetch. Pinned at query()'s
+# own ceiling so the walk takes the fewest requests that ceiling allows; it is
+# deliberately not exposed, since a breakdown has no use for a smaller page.
+_GROUP_FETCH_PAGE = 200
+
+
+def _tenant_of(dn: str) -> str | None:
+    """Tenant named by the DN's own ``tn-<name>`` path segment, else None.
+
+    Segments are split on "/" only outside square brackets. A DN embeds other
+    DNs as relation targets and keys (``uni/epp/fv-[uni/tn-A/ap-B/epg-C]/...``,
+    ``.../rsdomAtt-[uni/phys-X]``), and splitting through them would hand an
+    endpoint-policy object to tenant A merely because it *mentions* an EPG
+    there. Such an object is not in a tenant's subtree, so it stays unassigned.
+    A name is anything after ``tn-``, so ``AnyToEp-tn-A-r-...`` (a segment that
+    merely contains "tn-") never matches.
+    """
+    depth = 0
+    start = 0
+    for i, ch in enumerate(dn + "/"):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif ch == "/" and depth == 0:
+            segment = dn[start:i]
+            if segment.startswith("tn-") and len(segment) > len("tn-"):
+                return segment[len("tn-"):]
+            start = i + 1
+    return None
+
+
+def _unknown_group_by(class_name: str, group_by: str) -> UnknownAttributeError | None:
+    """The error for a ``group_by`` the catalogue does not know, else None.
+
+    A real property of the class always wins over the ``tenant`` pseudo-key: 20
+    classes (``pingExecTn``, ``oamExec``, ...) carry a genuine ``tenant``
+    attribute, and quietly answering from the DN instead would give those
+    callers a different number than the attribute they named.
+    """
+    if group_by == _TENANT_KEY or catalog.property_exists(class_name, group_by):
+        return None
+    suggestions = catalog.closest_properties(class_name, group_by)
+    if group_by.casefold() == _TENANT_KEY:
+        suggestions.insert(0, _TENANT_KEY)
+    return UnknownAttributeError(
+        class_name, group_by, suggestions[:5], catalog.apic_version()
+    )
+
+
+def _tally(
+    objects: list[dict[str, Any]], group_by: str, from_dn: bool
+) -> tuple[dict[str, int], int]:
+    """Count ``objects`` per value of ``group_by``.
+
+    Returns ``(groups, ungrouped)``. ``groups`` is ordered by descending count,
+    ties broken by key so two identical fabrics always serialise identically.
+    ``ungrouped`` counts the objects that carry no value at all: the attribute
+    is absent (an abstract class whose subclasses do not all declare it, or a
+    name the catalogue does not know) or, for the tenant pseudo-key, the DN has
+    no ``tn-`` segment (fabric-level objects).
+
+    The missing case is a separate count rather than a ``None`` key because a
+    JSON object key is a string, and every string — "null", "None", "" — is a
+    value some attribute can really hold. An empty string, by contrast, IS a
+    value (``descr`` is "" on most objects) and keeps its own group, "".
+    """
+    tallies: dict[str, int] = {}
+    ungrouped = 0
+    for obj in objects:
+        raw = _tenant_of(obj.get("dn") or "") if from_dn else obj.get(group_by)
+        if raw is None:
+            ungrouped += 1
+        else:
+            key = str(raw)
+            tallies[key] = tallies.get(key, 0) + 1
+    ordered = dict(sorted(tallies.items(), key=lambda kv: (-kv[1], kv[0])))
+    return ordered, ungrouped
+
+
+async def _group_counts(
+    backend: ApicClient,
+    ctx: Context,
+    *,
+    class_name: str,
+    filters: dict[str, str],
+    scope_dn: str,
+    filter_expr: str | None,
+    group_by: str,
+    from_dn: bool,
+    total: int,
+) -> dict[str, Any]:
+    """The group_by half of a count: fetch, tally, and refuse a partial answer.
+
+    The APIC cannot group, and the client cannot ask it for one attribute of
+    each object (it can only strip operational attributes, `config_only`, which
+    would also strip the very ones people group by: operState, severity, ...).
+    So every matching object is fetched in full and tallied here; `total` is
+    the cheap `count_class` figure the caller already holds, and is what the
+    tally is checked against.
+
+    A breakdown that does not account for every object is worse than none: a
+    partial one reads as a finding ("only 3 tenants have faults") when it is
+    just where the fetch stopped. So when the fetch hit its safety cap, or
+    fetched a number of objects different from `total`, the groups are
+    withheld and the reason given — never an empty or partial dict standing in
+    for an answer.
+    """
+    result = await backend.query_class(
+        class_name=class_name,
+        filters=filters,
+        scope_dn=scope_dn,
+        limit=_GROUP_FETCH_PAGE,
+        filter_expr=filter_expr,
+        fetch_all=True,
+    )
+    fetched = len(result.objects)
+
+    withheld: str | None = None
+    if not result.complete:
+        withheld = (
+            f"Only {fetched} of {total} objects could be fetched before the "
+            f"safety cap, so a breakdown by {group_by!r} would be partial; "
+            "`groups` and `ungrouped` are null rather than shown as an answer. "
+            "`count` is the true total. Narrow the query with filters or "
+            "scope_dn (for example one tenant at a time, scope_dn="
+            "'uni/tn-<name>') and group each narrower set."
+        )
+    elif fetched != total:
+        withheld = (
+            f"The APIC counted {total} matching objects but {fetched} were "
+            "fetched, so the set changed while it was being read (or a page "
+            f"was missed) and a breakdown by {group_by!r} would not add up to "
+            "`count`; `groups` and `ungrouped` are null. Retry, and if it "
+            "keeps happening narrow the query with filters or scope_dn."
+        )
+    if withheld is not None:
+        await ctx.warning(
+            f"count({class_name!r}, group_by={group_by!r}) withheld — "
+            f"{fetched} fetched, {total} counted"
+        )
+        return {
+            "group_by": group_by,
+            "groups": None,
+            "ungrouped": None,
+            "complete": False,
+            "note": withheld,
+        }
+
+    groups, ungrouped = _tally(result.objects, group_by, from_dn)
+    await ctx.info(
+        f"count group_by={group_by!r} → {len(groups)} group(s), "
+        f"{ungrouped} ungrouped"
+    )
+    return {
+        "group_by": group_by,
+        "groups": groups,
+        "ungrouped": ungrouped,
+        "complete": True,
+        "note": None,
+    }
+
+
 @mcp.tool(title="Count ACI objects", annotations=_FABRIC_READ)
 async def count(
     class_name: str,
@@ -1326,12 +1502,14 @@ async def count(
     filters: _JsonDict | None = None,
     scope_dn: str | None = None,
     filter_expr: str | None = None,
+    group_by: str | None = None,
 ) -> CountEnvelope:
     """Count ACI objects of a class without transferring them.
 
     Answers "how many X?" — a pure tally. It does NOT answer "which X has the
     most/least Y?" (ranking/argmax): that needs the actual objects, so use
-    query(..., fetch_all=True) plus local aggregation instead.
+    query(..., fetch_all=True) plus local aggregation instead. "How many X per
+    Y?" — per tenant, per severity, per state — is answered by `group_by`.
 
     ⚠ PREREQUISITE — like query(), verify the class name with search_classes()
     (and its filter attributes with get_schema()) before calling this tool.
@@ -1353,6 +1531,14 @@ async def count(
         filter_expr: Raw APIC filter string for predicates beyond equality;
                      combined with `filters` via and() when both are provided.
                      Each Class.attr operand is checked, as in query().
+        group_by:    Break the count down per value of this attribute, e.g.
+                     "severity" on faultInst. The special value "tenant"
+                     groups by the tenant in each object's DN (its `tn-<name>`
+                     segment) — unless the class has a real attribute of that
+                     name, which then wins. Unlike a plain count this fetches
+                     every matching object to tally it, so narrow with
+                     filters/scope_dn on a large class. Leave unset for the
+                     plain count; the response is then unchanged.
 
     Returns:
         A dict:
@@ -1366,6 +1552,24 @@ async def count(
         "warnings": a list of strings, one per unverified name. The key is
         absent otherwise. A count of zero next to a warning may mean the name
         is wrong, not that nothing matches.
+        With `group_by`, the same dict plus:
+          {"group_by": <the attribute asked for>,
+           "groups": {<value>: <int>, ...},  # descending count, ties by value
+           "ungrouped": <int>,               # objects with no value to group on
+           "complete": <bool>,
+           "note": <str|None>}               # a string only when not complete
+        When complete, sum(groups.values()) + ungrouped == count. Objects
+        that carry no value for the attribute (for "tenant": a DN with no
+        tenant segment, i.e. fabric-level objects) are counted in `ungrouped`,
+        never as a group, so no real value can collide with them; an empty
+        string is a real value and keeps its own "" group.
+        If complete is False the breakdown could not be produced exactly —
+        the fetch hit its safety cap, or the objects changed while being
+        read — and `groups` and `ungrouped` are null: partial groups are
+        never returned as an answer. `count` stays the true APIC total, and
+        `note` says how to narrow the query. When `group_by` names an
+        attribute the catalogue does not know and attribute checking is off
+        (NIWASHI_MCP_STRICT_ATTRIBUTES=false), a "warnings" list is added.
 
     Raises:
         UnknownClassError: class_name is not in the catalogue — the same
@@ -1375,7 +1579,10 @@ async def count(
                            class in a `filter_expr` operand.
         UnknownAttributeError: an attribute in `filters` or `filter_expr` is
                            not a property of its class in the catalogue —
-                           the same check, from the same source, as query().
+                           the same check, from the same source, as query() —
+                           or `group_by` is neither "tenant" nor an attribute
+                           of the class. Includes the closest matches. Raised
+                           before any request is sent.
         FilterError:       `class_name` or a `filters` key contains characters
                            outside the expected ACI identifier format (see
                            registry.filter.build_filter). Filter values are
@@ -1403,6 +1610,25 @@ async def count(
         filters=filters,
         filter_expr=filter_expr,
     )
+    # An empty group_by is "not provided", the reading scope_dn gets below, and
+    # the plain count it falls back to is exactly what was asked for.
+    warnings: list[str] = []
+    derive_tenant = False
+    if group_by:
+        problem = _unknown_group_by(class_name, group_by)
+        if problem is not None:
+            await ctx.warning(
+                f"count called with unknown group_by {group_by!r} on {class_name!r}"
+            )
+            if _strict_attributes():
+                raise problem
+            warnings.append(
+                f"{problem} NIWASHI_MCP_STRICT_ATTRIBUTES is off, so the count "
+                f"ran anyway; objects without {group_by!r} are in `ungrouped`."
+            )
+        derive_tenant = group_by == _TENANT_KEY and not catalog.property_exists(
+            class_name, _TENANT_KEY
+        )
 
     await ctx.info(
         f"count({class_name!r}, filters={filters!r}, scope={scope_dn!r})"
@@ -1420,10 +1646,25 @@ async def count(
         "scope_dn": scope_dn,
         "filters": filters or {},
     }
+    if group_by:
+        response.update(
+            await _group_counts(
+                backend,
+                ctx,
+                class_name=class_name,
+                filters=filters or {},
+                scope_dn=scope_dn or "",
+                filter_expr=filter_expr,
+                group_by=group_by,
+                from_dn=derive_tenant,
+                total=total,
+            )
+        )
     # Present only when there is something to say, so a default run is
-    # byte-identical to what it was before the check existed.
-    if attribute_warnings:
-        response["warnings"] = attribute_warnings
+    # byte-identical to what it was before the checks existed.
+    warnings = [*attribute_warnings, *warnings]
+    if warnings:
+        response["warnings"] = warnings
     return response
 
 

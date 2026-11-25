@@ -39,7 +39,7 @@ _QUERY_KEYS = {
     "next_page", "complete", "note", "fields",
 }
 _COUNT_REQUIRED = {"class_name", "count", "scope_dn", "filters"}
-_COUNT_OPTIONAL = {"warnings", "group_by", "groups", "complete", "note"}
+_COUNT_OPTIONAL = {"warnings", "group_by", "groups", "ungrouped", "complete", "note"}
 
 
 def _output_schema(name: str) -> dict:
@@ -203,6 +203,43 @@ async def test_count_validates(served):
     assert result.structured_content == {
         "class_name": "fvBD", "count": 2, "scope_dn": None, "filters": {},
     }
+
+
+@pytest.mark.asyncio
+async def test_count_group_by_validates_when_complete(served):
+    result = await _call(served, "count", class_name="fvBD", group_by="tenant")
+
+    assert not result.is_error, result.content
+    assert result.structured_content["complete"] is True
+    assert result.structured_content["groups"] == {"OT": 2}
+    assert result.structured_content["ungrouped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_count_group_by_validates_when_capped_with_null_groups(
+    monkeypatch, catalogue_index
+):
+    """The incomplete path returns `groups`/`ungrouped`/`note` as JSON null or a
+    string. Declaring them non-nullable in `CountEnvelope` made FastMCP refuse
+    this very response at the client — the honest "could not tally" became a
+    tool error. Only a round trip through a real Client catches that."""
+
+    @lifespan
+    async def capped(server):
+        yield {
+            "descriptions": catalogue_index,
+            "backend": StubBackend(_WIDE_IMDATA, cap_at=1),
+        }
+
+    monkeypatch.setattr(main.mcp, "_lifespan", capped)
+    monkeypatch.delenv("NIWASHI_MCP_STRICT_ATTRIBUTES", raising=False)
+    result = await _call(main.mcp, "count", class_name="fvBD", group_by="tenant")
+
+    assert not result.is_error, result.content
+    body = result.structured_content
+    assert body["complete"] is False
+    assert body["groups"] is None and body["ungrouped"] is None
+    assert body["count"] == 2 and isinstance(body["note"], str)
 
 
 @pytest.mark.asyncio
