@@ -22,8 +22,9 @@ from that and are kept throughout:
   leak, and the policy redacts by position, not by value.
 
 The lab fabric these were written against holds 16 `vnsCCred` with a non-empty
-`value`, 7 `snmpTrapDest` with a `secName`, an `snmpCommunityP`, and several
-`aaaActiveUserSession`. A class the fabric has none of is skipped, not passed.
+`value`, 7 `snmpTrapDest` with a `secName`, an `snmpCommunityP`, several
+`aaaActiveUserSession`, and audit and event records that quote all of those in
+their `changeSet`. A class the fabric has none of is skipped, not passed.
 
 Run with:  uv run pytest tests/live/test_live_redaction.py -m live
 """
@@ -100,19 +101,15 @@ async def test_a_curated_secret_the_apic_echoes_in_clear_is_withheld(
 
     sent = [o.get(attribute) for o in raw]
     shown = [o.get(attribute) for o in envelope["results"]]
-    set_before = sum(1 for s in sent if s)
-    unset_before = len(sent) - set_before
     marker = shown.count(REDACTED)
-    empty = shown.count("")
-    neither = len(shown) - marker - empty
+    other = len(shown) - marker
     leaked = _how_many_appear(_distinctive(secrets, raw, expected_in=(attribute,)), envelope)
     withheld = envelope["redacted"]
     said_so = "withheld" in (envelope["note"] or "")
 
-    assert neither == 0, "an attribute is neither the marker nor empty"
-    assert marker == set_before, "not every set value was withheld"
-    assert empty == unset_before, "an unset value was not left unset"
-    assert withheld == set_before, "the count does not match what was withheld"
+    assert other == 0, "an attribute is not the marker"
+    assert marker == len(sent), "set and unset values must both be withheld"
+    assert withheld == len(sent), "the count does not match what was withheld"
     assert leaked == 0, "a secret is in the envelope"
     assert said_so, "the note does not say anything was withheld"
 
@@ -250,6 +247,159 @@ async def test_an_audit_record_of_a_community_does_not_quote_it(live_client, ctx
     assert segments_left == 0, "a community is still in a DN"
     assert words_left == 0, "an audit record still quotes the community in its text"
     assert withheld >= len(raw.objects), "fewer withheld than there are records"
+
+
+# ── audit, event and session records ──────────────────────────────────────────
+
+# Where the lab's APIC was measured to write a secret into its own records. The
+# properties whose name alone says secret (`value` and `name` are not among them:
+# they are generic, and only secret on a credential and a community).
+_SECRET_PAIR = re.compile(
+    r"(?:^|, )(otpkey|secName|authPass|hashToken|currCertReqPassphrase|oldCertReqPassphrase)"
+    r"(?::(.*?)(?=, [A-Za-z][A-Za-z0-9]*:|$)| \(Old: (.*?), New: (.*?)\)(?=, |$))"
+)
+_SECRET_SEGMENT = re.compile(r"(?:community|actsession|delsession|sitejwtpubkey)-[^/\]]+")
+_RECORD_CLASSES = ("aaaModLR", "eventRecord", "aaaSessionLR")
+_SOURCES = (
+    ("vnsCCred", "value"), ("snmpTrapDest", "secName"), ("snmpCommunityP", "name"),
+    ("aaaActiveUserSession", "hashToken"), ("aaaDeletedUserSession", "hashToken"),
+    ("aaaUser", "otpkey"), ("aaaUserProfile", "otpkey"),
+)
+
+
+_NAMED_BY_SECRET = ("snmpCommunityP", "aaaActiveUserSession", "aaaDeletedUserSession")
+
+
+async def _known_secrets(live_client) -> set[str]:
+    """The values at known secret positions on the lab, whose appearing in a record is a leak.
+
+    Read from the objects that hold them, and kept only when found *nowhere else*
+    in what those objects say: a secret that is also a name on the fabric (the
+    lab's trap community is its policy's name, and a user's) is visible there by
+    design, and its turning up in a record is no evidence of a leak.
+    """
+    allowed: dict[str, set[tuple[str, str]]] = {}
+    corpus: list[tuple[str, dict]] = []
+    for class_name, attribute in _SOURCES:
+        raw = (await live_client.query_class(class_name, {}, fetch_all=True)).objects
+        corpus += [(class_name, o) for o in raw]
+        named_by_it = ("dn", "rn") if class_name in _NAMED_BY_SECRET else ()
+        for secret in _values(raw, attribute):
+            if len(secret) >= 6:
+                allowed.setdefault(secret, set()).update(
+                    (class_name, a) for a in (attribute, *named_by_it)
+                )
+    return {
+        secret
+        for secret, positions in allowed.items()
+        if not any(
+            isinstance(v, str) and secret in v
+            for class_name, o in corpus
+            for k, v in o.items()
+            if (class_name, k) not in positions
+        )
+    }
+
+
+def _pair_values(text: str) -> set[str]:
+    """Values the records' own text gives for the secret properties, by an independent reading."""
+    values = set()
+    for match in _SECRET_PAIR.finditer(text):
+        values |= {v.strip() for v in match.groups()[1:] if v and v.strip() not in ("", "N/A")}
+    return values
+
+
+@pytest.mark.parametrize("class_name", _RECORD_CLASSES)
+async def test_no_record_returned_through_the_tools_holds_a_value_at_a_known_secret_position(
+    live_client, ctx, class_name
+):
+    raw = await _raw(live_client, class_name)
+    secrets = await _known_secrets(live_client)
+    if class_name == "aaaSessionLR":
+        secrets |= _distinctive(_values(raw, "sessionId"), raw, expected_in=("sessionId",))
+    # Not the values the records' own pairs give: those are checked by position
+    # below (`pairs_left`), because a community that is also a policy's name turns
+    # up, legitimately, in other records' DNs and text.
+    tokens = {m[1] for o in raw for k in ("dn", "affected") if (m := re.search(r"(?:act|del)session-([^/\]]+)", o.get(k, "")))}
+    secrets |= tokens
+    # A secret that is also the name of something else on the fabric — a policy,
+    # an SNMPv3 user, a tenant — shows up as that name in the records' DNs, and is
+    # no evidence of a leak. What is left of a DN once its secret segments are
+    # taken out says whether the string is a name there.
+    named_elsewhere = {
+        secret
+        for secret in secrets
+        if any(secret in _SECRET_SEGMENT.sub("", o.get(k, "")) for o in raw for k in ("dn", "affected"))
+    }
+    secrets -= named_elsewhere
+
+    envelope = await query(class_name, ctx, fetch_all=True)
+
+    shown = envelope["results"]
+    # Not "the same set": the tools' own logins write new session and event records.
+    returned_most = len(shown) >= len(raw) * 0.95
+    in_raw = sum(1 for o in raw if any(secret in json.dumps(o) for secret in secrets))
+    in_shown = sum(1 for o in shown if any(secret in json.dumps(o) for secret in secrets))
+    segments_left = sum(
+        1
+        for o in shown
+        for key in ("dn", "affected")
+        if re.search(r"(?:actsession|delsession|community|sitejwtpubkey)-(?!<redacted>)[^/\]]", o.get(key, ""))
+    )
+    pairs_left = sum(
+        1
+        for o in shown
+        for key in ("changeSet", "descr")
+        for match in _SECRET_PAIR.finditer(o.get(key, ""))
+        if any(v and REDACTED not in v and v.strip() not in ("", "N/A") for v in match.groups()[1:])
+    )
+    sessions_left = (
+        sum(1 for o in shown if o.get("sessionId") not in (None, REDACTED))
+        if class_name == "aaaSessionLR"
+        else 0
+    )
+
+    assert returned_most, "the redacted query returned far fewer records than the APIC holds"
+    assert in_shown == 0, "a record still holds a value at a known secret position"
+    assert segments_left == 0, "a secret RN segment is still in a DN"
+    assert pairs_left == 0, "a secret pair in a changeSet kept its value"
+    assert sessions_left == 0, "a sessionId was returned"
+    if in_raw == 0 and class_name != "aaaSessionLR":
+        pytest.skip(f"no {class_name} on the lab fabric quotes a known secret, so nothing was exercised")
+
+
+async def test_the_lab_records_that_quote_a_secret_are_the_ones_that_were_scrubbed(live_client, ctx):
+    """The positive half: there was something to scrub, and the tools did scrub it."""
+    raw = await _raw(live_client, "eventRecord")
+    quoting = {o["id"] for o in raw if _pair_values(o.get("changeSet", ""))}
+    if not quoting:
+        pytest.skip("no eventRecord on the lab fabric quotes a secret property in its changeSet")
+
+    envelope = await query("eventRecord", ctx, fetch_all=True)
+
+    shown = {o["id"]: o for o in envelope["results"]}
+    present = sum(1 for i in quoting if i in shown)
+    scrubbed = sum(1 for i in quoting if REDACTED in shown.get(i, {}).get("changeSet", ""))
+    announced = "best-effort" in (envelope["note"] or "")
+
+    assert present >= len(quoting) * 0.95, "the records that quote a secret did not come back"
+    assert scrubbed == present, "a record that quoted a secret has no marker in its changeSet"
+    assert announced, "the note does not say that free text is scrubbed on a best-effort basis"
+
+
+async def test_audit_text_cannot_be_probed(live_client, ctx):
+    refusals = 0
+    for call in (
+        query("aaaModLR", ctx, filter_expr='wcard(aaaModLR.changeSet,"value")', limit=1),
+        query("eventRecord", ctx, filters={"changeSet": "x"}, limit=1),
+        query("aaaModLR", ctx, order_by="aaaModLR.changeSet", limit=1),
+        count("eventRecord", ctx, group_by="changeSet"),
+    ):
+        with pytest.raises(SecretAttributeError):
+            await call
+        refusals += 1
+
+    assert refusals == 4
 
 
 # ── the oracles ───────────────────────────────────────────────────────────────

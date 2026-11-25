@@ -6,7 +6,8 @@ This is the 2.0 data layer. It replaces reading 15,452 raw jsonmeta files
 that ships inside the ``niwaki`` dependency — which is what makes the server
 installable with ``uvx`` instead of requiring a git checkout.
 
-**This module is the only place in the codebase that knows niwaki exists.** It
+**This module is the only place in the codebase that reads niwaki's catalogue** (``niwashi_mcp.redact``
+also reads niwaki's secret-redaction policy, and nothing else of it). It
 reproduces ``registry.schema`` and ``registry.descriptions`` output exactly, so
 the swap is invisible to every caller. Keeping the knowledge here is what makes
 the migration reviewable and the rollback cheap.
@@ -840,7 +841,7 @@ def secure_properties() -> Mapping[str, frozenset[str]]:
 
     The ``secure`` flag marks what the APIC itself never echoes back on a read
     (BGP and NTP passwords, KMS keys, pre-shared keys, ...). It is the
-    mechanical half of the redaction policy; ``registry.redaction`` adds the
+    mechanical half of the redaction policy; ``niwashi_mcp.redact`` adds the
     positions the flag misses. A class lists the properties it inherits, because
     ``class_prop`` rows are expanded down the hierarchy (see
     ``_collect_properties``), so an abstract parent's flag is already on every
@@ -867,6 +868,24 @@ def secure_properties() -> Mapping[str, frozenset[str]]:
     ):
         grouped.setdefault(class_name, set()).add(wire)
     return MappingProxyType({c: frozenset(props) for c, props in grouped.items()})
+
+
+@lru_cache(maxsize=1)
+def rn_formats() -> Mapping[str, str]:
+    """``{wire class name: rnFormat}`` for every class that has one, read once.
+
+    The reverse of what a DN is: given the last relative name of a DN, which
+    classes could it be? ``niwashi_mcp.redact`` asks that to read the class an audit
+    record is about from its ``affected`` DN. 15,000 rows, one query, kept.
+    """
+    return MappingProxyType(
+        dict(
+            _query(
+                "SELECT class_name, rn_format FROM mo "
+                "WHERE rn_format IS NOT NULL AND rn_format != ''"
+            )
+        )
+    )
 
 
 # Labels that appear in virtually every ACI class and carry no discriminating

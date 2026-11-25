@@ -31,16 +31,18 @@ from tests.conftest import StubBackend, make_ctx
 
 SECRET = "zzsecret"
 TOKEN = "zztoken"
+OTP = "zzotpseed"
+SESSION_ID = "zzsession+id/x=="
 GUESS = "zzguess"
 COMMUNITY_DN = f"uni/fabric/snmpp-default/community-{SECRET}"
 SESSION_DN = f"uni/ac/actsession-{TOKEN}"
 
 _IMDATA = [
     {"vnsCCred": {"attributes": {
-        "dn": "uni/tn-a/lDevVip-D/cCred-admin", "name": "admin", "value": SECRET,
+        "dn": "uni/tn-a/lDevVip-D/cDev-C/cCred", "name": "admin", "value": SECRET,
         "modTs": "2026-01-01T00:00:00.000+00:00"}}},
     {"vnsCCred": {"attributes": {
-        "dn": "uni/tn-a/lDevVip-E/cCred-admin", "name": "admin", "value": ""}}},
+        "dn": "uni/tn-a/lDevVip-E/cDev-C/cCred", "name": "admin", "value": ""}}},
     {"snmpTrapDest": {"attributes": {
         "dn": "uni/fabric/snmpp-default/trapdest-10.0.0.1-port-162",
         "host": "10.0.0.1", "port": "162", "secName": SECRET}}},
@@ -60,6 +62,25 @@ _IMDATA = [
         "changeSet": "name (Old: N/A, New: servers)"}}},
     {"aaaActiveUserSession": {"attributes": {
         "dn": SESSION_DN, "hashToken": TOKEN, "name": "admin"}}},
+    {"eventRecord": {"attributes": {
+        "dn": f"subj-[{SESSION_DN}]/evt-1", "affected": SESSION_DN, "code": "E4208341",
+        "descr": f"ActiveUserSession {TOKEN} created",
+        "changeSet": f"hashToken:{TOKEN}, name:admin, userdom:all"}}},
+    {"eventRecord": {"attributes": {
+        "dn": "subj-[uni/userext/user-bob]/evt-2", "affected": "uni/userext/user-bob",
+        "code": "E4204979", "descr": "bob created",
+        "changeSet": f"name:bob, otpkey:{OTP}, userdom:all"}}},
+    {"eventRecord": {"attributes": {
+        "dn": "subj-[uni/userext/user-bob]/evt-3", "affected": "uni/userext/user-bob",
+        "code": "E4204980", "descr": "bob modified",
+        "changeSet": f"otpkey (Old: {OTP}, New: x), descr (Old: , New: hello)"}}},
+    {"eventRecord": {"attributes": {
+        "dn": "subj-[uni/tn-OT/BD-servers]/evt-4", "affected": "uni/tn-OT/BD-servers",
+        "code": "E4204981", "descr": "BD servers created",
+        "changeSet": "name:servers, arpFlood:no, userdom:all"}}},
+    {"aaaSessionLR": {"attributes": {
+        "dn": "subj-[uni/userext]/sess-7", "id": "7", "sessionId": SESSION_ID,
+        "descr": "[user admin] From-10.0.0.1-client-type-REST-Success"}}},
     {"fvBD": {
         "attributes": {
             "dn": "uni/tn-OT/BD-servers", "name": "servers", "descr": "prod", "arpFlood": "no"},
@@ -67,7 +88,7 @@ _IMDATA = [
             {"fvSubnet": {"attributes": {
                 "dn": "uni/tn-OT/BD-servers/subnet-[10.0.1.1/24]", "ip": "10.0.1.1/24"}}},
             {"vnsCCred": {"attributes": {
-                "dn": "uni/tn-OT/BD-servers/cCred-x", "name": "x", "value": SECRET}}},
+                "dn": "uni/tn-OT/BD-servers/cCred", "name": "x", "value": SECRET}}},
         ],
     }},
     {"fvBD": {"attributes": {"dn": "uni/tn-OT/BD-clients", "name": "clients", "arpFlood": "yes"}}},
@@ -123,18 +144,18 @@ class TestQueryWithholdsValues:
         traps = await query("snmpTrapDest", ctx)
 
         by_dn = {o["dn"]: o for o in creds["results"]}
-        assert by_dn["uni/tn-a/lDevVip-D/cCred-admin"]["value"] == REDACTED
-        assert by_dn["uni/tn-a/lDevVip-D/cCred-admin"]["name"] == "admin"
+        assert by_dn["uni/tn-a/lDevVip-D/cDev-C/cCred"]["value"] == REDACTED
+        assert by_dn["uni/tn-a/lDevVip-D/cDev-C/cCred"]["name"] == "admin"
         assert traps["results"][0]["secName"] == REDACTED
         assert traps["results"][0]["host"] == "10.0.0.1"
         assert SECRET not in json.dumps([creds, traps])
 
-    async def test_an_empty_credential_stays_empty_and_is_not_counted(self, ctx):
+    async def test_an_empty_credential_is_withheld_too_so_set_and_unset_look_alike(self, ctx):
         creds = await query("vnsCCred", ctx, fetch_all=True)
 
-        unset = next(o for o in creds["results"] if o["dn"].endswith("lDevVip-E/cCred-admin"))
-        assert unset["value"] == ""
-        assert creds["redacted"] == 1, "only the one non-empty credential was withheld"
+        unset = next(o for o in creds["results"] if o["dn"].endswith("lDevVip-E/cDev-C/cCred"))
+        assert unset["value"] == REDACTED
+        assert creds["redacted"] == 2, "the set credential and the unset one"
 
     async def test_the_envelope_says_something_was_withheld_without_saying_what(self, ctx):
         envelope = await query("snmpTrapDest", ctx)
@@ -152,7 +173,7 @@ class TestQueryWithholdsValues:
     async def test_projecting_a_secret_field_returns_the_marker(self, ctx):
         envelope = await query("vnsCCred", ctx, fields=["name", "value"], fetch_all=True)
 
-        assert {o["value"] for o in envelope["results"]} == {REDACTED, ""}
+        assert {o["value"] for o in envelope["results"]} == {REDACTED}
         assert SECRET not in json.dumps(envelope)
 
     async def test_a_secret_projected_away_is_neither_present_nor_announced(self, ctx):
@@ -279,6 +300,14 @@ _ATTRIBUTE_PROBES = {
                                     "filter_expr": f'eq(snmpTrapDest.secName,"{GUESS}")'}),
     "query-filter_expr-spaced": ("query", {"class_name": "snmpTrapDest",
                                            "filter_expr": f'eq( snmpTrapDest.secName , "{GUESS}" )'}),
+    "query-changeSet-filter": ("query", {"class_name": "aaaModLR",
+                                         "filters": {"changeSet": GUESS}}),
+    "query-changeSet-wcard": ("query", {"class_name": "eventRecord",
+                                        "filter_expr": 'wcard(eventRecord.changeSet,"otpkey:zz")'}),
+    "query-changeSet-order_by": ("query", {"class_name": "aaaModLR",
+                                           "order_by": "aaaModLR.changeSet"}),
+    "count-changeSet-group_by": ("count", {"class_name": "eventRecord", "group_by": "changeSet"}),
+    "query-sessionId": ("query", {"class_name": "aaaSessionLR", "filters": {"sessionId": GUESS}}),
     "query-the-community-name": ("query", {"class_name": "snmpCommunityP",
                                            "filters": {"name": GUESS}}),
     "query-dn-of-a-secret-class": ("query", {"class_name": "snmpCommunityP",
@@ -361,13 +390,101 @@ async def test_asking_for_the_class_instead_is_the_way_and_it_works(ctx):
     assert (await query("vnsCCred", ctx, filters={"name": "admin"}))["returned"] == 2
 
 
+# ── free text ─────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestAuditEventAndSessionRecords:
+    """The APIC writes secrets into its own logs; the tools scrub them on the way out."""
+
+    async def test_an_audit_record_of_a_community_is_scrubbed_in_its_changeset(self, ctx):
+        envelope = await query("aaaModLR", ctx)
+
+        audited = next(o for o in envelope["results"] if "community" in o["affected"])
+        assert audited["changeSet"] == f"name (Old: {REDACTED}, New: {REDACTED})"
+
+    async def test_an_event_record_loses_the_otp_seed_in_both_changeset_formats(self, ctx):
+        envelope = await query("eventRecord", ctx, fetch_all=True)
+
+        by_code = {o["code"]: o for o in envelope["results"]}
+        assert by_code["E4204979"]["changeSet"] == f"name:bob, otpkey:{REDACTED}, userdom:all"
+        assert by_code["E4204980"]["changeSet"] == (
+            f"otpkey (Old: {REDACTED}, New: {REDACTED}), descr (Old: , New: hello)"
+        )
+        assert OTP not in json.dumps(envelope)
+
+    async def test_an_event_record_of_a_session_loses_the_token_in_dn_affected_and_text(self, ctx):
+        envelope = await query("eventRecord", ctx, fetch_all=True)
+
+        event = next(o for o in envelope["results"] if o["code"] == "E4208341")
+        assert event["dn"] == f"subj-[uni/ac/actsession-{REDACTED}]/evt-1"
+        assert event["affected"] == f"uni/ac/actsession-{REDACTED}"
+        assert event["descr"] == f"ActiveUserSession {REDACTED} created"
+        assert event["changeSet"] == f"hashToken:{REDACTED}, name:admin, userdom:all"
+
+    async def test_the_session_log_loses_the_session_id_whatever_characters_it_has(self, ctx):
+        envelope = await query("aaaSessionLR", ctx)
+
+        (record,) = envelope["results"]
+        assert record["sessionId"] == REDACTED and record["id"] == "7"
+        assert SESSION_ID not in json.dumps(envelope)
+
+    async def test_an_ordinary_event_record_is_byte_identical(self, ctx):
+        envelope = await query("eventRecord", ctx, fetch_all=True)
+        raw = await _raw("eventRecord")
+
+        plain = next(o for o in envelope["results"] if o["code"] == "E4204981")
+        assert json.dumps(plain) == json.dumps(next(o for o in raw if o["code"] == "E4204981"))
+
+    async def test_the_agent_is_told_the_text_is_scrubbed_on_a_best_effort_basis(self, ctx):
+        envelope = await query("eventRecord", ctx, fetch_all=True)
+        assert "best-effort" in envelope["note"]
+
+    async def test_a_result_whose_text_needed_no_scrubbing_carries_no_such_note(self, ctx):
+        envelope = await query("eventRecord", ctx, filters={"code": "E4204981"})
+        assert envelope["note"] is None and "redacted" not in envelope
+
+    async def test_the_note_is_about_text_only_when_text_was_scrubbed(self, ctx):
+        """A credential's value is withheld outright; no best-effort claim is made about it."""
+        envelope = await query("vnsCCred", ctx, fetch_all=True)
+        assert "best-effort" not in envelope["note"]
+
+    async def test_get_by_dn_says_it_too(self, ctx):
+        obj = await get_by_dn("subj-[uni/userext/user-bob]/evt-2", ctx)
+        assert obj["changeSet"] == f"name:bob, otpkey:{REDACTED}, userdom:all"
+        assert obj["_redacted"] == 1 and "best-effort" in obj["_note"]
+
+    async def test_a_group_key_cannot_carry_a_secret_out_of_the_text(self, ctx):
+        answer = await count("eventRecord", ctx, group_by="descr")
+        assert f"ActiveUserSession {REDACTED} created" in answer["groups"]
+        assert TOKEN not in json.dumps(answer) and answer["redacted"] == 1
+
+    async def test_the_other_attributes_of_these_records_still_filter(self, ctx):
+        assert (await query("eventRecord", ctx, filters={"code": "E4204979"}))["returned"] == 1
+        expression = 'wcard(eventRecord.affected,"user-bob")'
+        await count("eventRecord", ctx, filter_expr=expression)
+        assert _backend(ctx).calls[-1]["filter_expr"] == expression, "a plain wcard was refused"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_rows_are_each_redacted_and_each_counted(catalogue_index):
+    """An abstract-class query can return the same object twice; none escapes, none is dropped."""
+    row = {"snmpCommunityP": {"attributes": {"dn": COMMUNITY_DN, "name": SECRET}}}
+    ctx = make_ctx({"descriptions": catalogue_index, "backend": StubBackend([row, row])})
+
+    envelope = await query("snmpCommunityP", ctx)
+
+    assert envelope["returned"] == 2 and envelope["redacted"] == 4
+    assert SECRET not in json.dumps(envelope)
+
+
 # ── get_by_dn ─────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 class TestGetByDn:
     async def test_a_credential_is_withheld_and_the_object_says_so(self, ctx):
-        obj = await get_by_dn("uni/tn-a/lDevVip-D/cCred-admin", ctx)
+        obj = await get_by_dn("uni/tn-a/lDevVip-D/cDev-C/cCred", ctx)
 
         assert obj["value"] == REDACTED and obj["name"] == "admin"
         assert obj["_redacted"] == 1 and "withheld" in obj["_note"]
@@ -379,15 +496,15 @@ class TestGetByDn:
         assert cred["value"] == REDACTED and obj["_redacted"] == 1
 
     async def test_a_projected_secret_is_the_marker_and_a_dropped_one_is_not_announced(self, ctx):
-        kept = await get_by_dn("uni/tn-a/lDevVip-D/cCred-admin", ctx, fields=["name", "value"])
-        dropped = await get_by_dn("uni/tn-a/lDevVip-D/cCred-admin", ctx, fields=["name"])
+        kept = await get_by_dn("uni/tn-a/lDevVip-D/cDev-C/cCred", ctx, fields=["name", "value"])
+        dropped = await get_by_dn("uni/tn-a/lDevVip-D/cDev-C/cCred", ctx, fields=["name"])
 
         assert kept["value"] == REDACTED and kept["_redacted"] == 1
         assert "value" not in dropped and "_redacted" not in dropped and "_note" not in dropped
 
-    async def test_an_unset_credential_is_returned_as_is(self, ctx):
-        obj = await get_by_dn("uni/tn-a/lDevVip-E/cCred-admin", ctx)
-        assert obj["value"] == "" and "_redacted" not in obj and "_note" not in obj
+    async def test_an_unset_credential_is_withheld_too(self, ctx):
+        obj = await get_by_dn("uni/tn-a/lDevVip-E/cDev-C/cCred", ctx)
+        assert obj["value"] == REDACTED and obj["_redacted"] == 1
 
     async def test_an_ordinary_dn_that_does_not_exist_is_still_not_found(self, ctx):
         answer = await get_by_dn("uni/tn-OT/BD-nope", ctx)
@@ -474,7 +591,7 @@ async def test_no_tool_output_contains_a_secret_whatever_is_asked(ctx):
             {"rsp_subtree_include": "audit-logs"},
         ):
             outputs.append(await query(cls, ctx, **kwargs))
-        for group_by in ("dn", "name", "descr", "affected", "tenant", "code"):
+        for group_by in ("dn", "name", "descr", "affected", "tenant", "code", "changeSet", "sessionId"):
             try:
                 outputs.append(await count(cls, ctx, group_by=group_by))
             except (SecretAttributeError, main.UnknownAttributeError) as exc:
@@ -488,7 +605,7 @@ async def test_no_tool_output_contains_a_secret_whatever_is_asked(ctx):
                 outputs.append(str(exc))
 
     dump = json.dumps(outputs) + _logged(ctx)
-    for secret in (SECRET, TOKEN):
+    for secret in (SECRET, TOKEN, OTP, SESSION_ID):
         assert secret not in dump, f"{secret!r} reached an agent or a log"
 
 
@@ -516,7 +633,7 @@ class TestTheAdvertisedSchemasStillValidate:
         result = await _call(served, "query", class_name="vnsCCred", fetch_all=True)
 
         assert not result.is_error, result.content
-        assert result.structured_content["redacted"] == 1
+        assert result.structured_content["redacted"] == 2
         assert SECRET not in json.dumps(result.structured_content)
 
     async def test_query_with_nothing_withheld_has_no_extra_key(self, served):
@@ -532,7 +649,7 @@ class TestTheAdvertisedSchemasStillValidate:
         assert result.structured_content["redacted"] == 1
 
     async def test_get_by_dn_with_a_withheld_secret(self, served):
-        result = await _call(served, "get_by_dn", dn="uni/tn-a/lDevVip-D/cCred-admin")
+        result = await _call(served, "get_by_dn", dn="uni/tn-a/lDevVip-D/cDev-C/cCred")
 
         assert not result.is_error, result.content
         assert result.structured_content["_redacted"] == 1

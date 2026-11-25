@@ -77,7 +77,7 @@ class DescriptionsLoadError(RegistryError):
 class RedactionPolicyError(RegistryError):
     """niwaki's secret-redaction policy is missing, or no longer what we read.
 
-    Raised at startup by `registry.redaction.verify_policy()`. The policy tables
+    Raised at startup by `redact.verify_policy()`. The policy tables
     (`niwaki._secrets`) are private to niwaki, which is pinned to one minor for
     exactly that reason. A copy of them would go stale silently, and a server
     that cannot say which values are secret must not start: serving without the
@@ -179,26 +179,45 @@ class UnknownAttributeError(NiwashiMcpError):
 
 
 class SecretAttributeError(NiwashiMcpError):
-    """A request filters, orders or groups on an attribute that holds a secret.
+    """A request filters, orders or groups on an attribute that holds, or may quote, a secret.
 
     The server never returns such a value, but a predicate on it would answer
     questions about it all the same: `filters={"value": "guess"}` returning one
     object confirms the guess, and `group_by` would print the values as keys. So
     the request is refused whatever `NIWASHI_MCP_STRICT_ATTRIBUTES` says — it
     is not a catalogue check, and relaxing it would reopen the oracle.
+
+    `free_text` is the second kind: an audit record's `changeSet`, which is not a
+    secret itself but is where one gets quoted. It is scrubbed on a best-effort
+    basis, and a predicate on the raw text could confirm what the scrubbing
+    removed, so it is refused the same way.
     """
 
-    def __init__(self, class_name: str, attribute: str, where: str) -> None:
+    def __init__(
+        self, class_name: str, attribute: str, where: str, *, free_text: bool = False
+    ) -> None:
         self.class_name = class_name
         self.attribute = attribute
         self.where = where
+        self.free_text = free_text
+        if free_text:
+            reason = (
+                f"'{attribute}' on ACI class '{class_name}' is free text that can quote "
+                "a secret (a credential, key, community string or session token). The "
+                "server scrubs it on a best-effort basis, and a match on the raw text "
+                "could confirm what was scrubbed, so "
+            )
+        else:
+            reason = (
+                f"'{attribute}' on ACI class '{class_name}' holds a secret "
+                "(a credential, key or community string), and the server withholds it, "
+                "so "
+            )
         super().__init__(
-            f"'{attribute}' on ACI class '{class_name}' holds a secret "
-            f"(a credential, key or community string), so `{where}` cannot use "
-            "it: filtering, ordering or grouping on it would let a guess be "
-            "checked or the values be read back, and the server withholds them. "
-            f"Use another attribute of '{class_name}'; the objects themselves "
-            "still come back, with that value shown as withheld."
+            f"{reason}`{where}` cannot use it: a filter, order or grouping on it would "
+            "let a guess be checked or the values be read back. "
+            f"Use another attribute of '{class_name}'; the objects themselves still "
+            "come back, with that value withheld or scrubbed."
         )
 
 

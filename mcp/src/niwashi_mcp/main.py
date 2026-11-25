@@ -95,7 +95,7 @@ Secrets
   object returned (children and subtree objects included), a DN that carries one
   has that part cut out, and a filter, order_by or group_by on a secret
   attribute — or a DN that names a secret object — is refused. The policy is
-  niwaki's own; see registry/redaction.py and docs/internals/redaction.md.
+  niwaki's own; see niwashi_mcp/redact.py and docs/internals/redaction.md.
 """
 
 import asyncio
@@ -112,6 +112,7 @@ from fastmcp.server.lifespan import lifespan
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator
 
+from niwashi_mcp import redact
 from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
 from niwashi_mcp.apic.version import check_fabric_version
 from niwashi_mcp.exceptions import (
@@ -125,7 +126,7 @@ from niwashi_mcp.exceptions import (
 from niwashi_mcp.middleware.auth import ApiKeyMiddleware, KeyStore, load_api_keys
 from niwashi_mcp.middleware.health import HealthMiddleware
 from niwashi_mcp.middleware.oauth import OAuthDiscoveryMiddleware
-from niwashi_mcp.registry import catalog, redaction
+from niwashi_mcp.registry import catalog
 from niwashi_mcp.registry.descriptions import search as desc_search
 from niwashi_mcp.registry.filter import (
     filter_expr_attributes,
@@ -380,7 +381,7 @@ async def app_lifespan(server: FastMCP):
     # Right after, because the policy resolves against the catalogue; and before
     # the backend connects, because a server that cannot say which values are
     # secret must not be one an APIC session is open behind.
-    redaction.verify_policy()
+    redact.verify_policy()
 
     descriptions = catalog.descriptions_index()
     logger.info(
@@ -568,11 +569,16 @@ SECRETS — this server never hands you a secret, and says so when it holds one
     envelope's "redacted" (get_by_dn: "_redacted") counts what was withheld and
     is absent when nothing was.  This is policy, not an error: report such a
     value as withheld by the server — never as empty, missing or unknown.  An
-    attribute that is empty is shown empty, and means unset.  Do not try to
-    recover a secret: a filter, order_by or group_by on a secret attribute is
-    refused (SecretAttributeError), and so is any DN, scope_dn or filter value
-    that names a secret object (SecretDnError) — whether or not the object
-    exists.  get_schema marks such properties "secret": true; leave them out.
+    empty secret is withheld too, so "<redacted>" says nothing about whether one
+    is set.  Audit, event, fault and session records quote secrets in their own
+    text, so their changeSet and descr are scrubbed — what is recognised is
+    replaced by "<redacted>" — on a best-effort basis: do not read such a record
+    as proof that no secret was ever configured.  Do not try to recover a
+    secret: a filter, order_by or group_by on a secret attribute, or on a
+    record's changeSet, is refused (SecretAttributeError), and so is any DN,
+    scope_dn or filter value that names a secret object (SecretDnError) —
+    whether or not the object exists.  get_schema marks such properties
+    "secret": true (or "scrubbed": true for changeSet); leave them out.
 
 GROUNDING — every specific fact in your final answer (a property name, a
     configured value, a DN template, a relation target, a count) must come
@@ -718,15 +724,18 @@ async def get_schema(
        "default": <value>,                # only when the schema declares one
        "options": [<allowed value>, ...], # only for enumerated properties
        "secret": true,                    # only when the property holds a secret
+       "scrubbed": true,                  # only on changeSet: free text, scrubbed
        "comment": <one-line description>}
 
     `secret` marks a property whose value this server never returns: query() and
     get_by_dn() show it as "<redacted>", and a filter, order_by or group_by on it
     is refused (SecretAttributeError) because the answer would reveal it. On a
     class named by its secret (an SNMP community profile) `dn` and `rn` are marked
-    too: the DN comes back with the secret cut out. The name stays listed so you
-    know the property exists; do not ask for what it holds. No value is ever shown
-    here.
+    too: the DN comes back with the secret cut out. `scrubbed` marks free text
+    that can quote a secret — `changeSet` on the audit, event, fault and session
+    records: it is returned with the secrets it quotes replaced, on a best-effort
+    basis, and is refused the same way. The name stays listed so you know the
+    property exists; do not ask for what it holds. No value is ever shown here.
 
     `options` lists longer than max(list_limit, 100) are sampled — only a
     dozen enums are that long, faultInst.code (80,512 values) the largest — and
@@ -767,7 +776,7 @@ async def get_schema(
     )
     if schema:
         catalog.annotate_relations(schema)
-        redaction.mark_secret_properties(schema, class_name)
+        redact.mark_secret_properties(schema, class_name)
         limit = max(1, min(list_limit, _SCHEMA_LIST_MAX))
         _bound_schema_lists(schema, limit)
         _bound_property_options(schema, max(limit, _SCHEMA_OPTIONS_FLOOR))
@@ -1077,21 +1086,30 @@ def _append_note(note: str | None, extra: str) -> str:
     return f"{note} {extra}" if note else extra
 
 
-def _withheld_note(count: int) -> str:
+def _withheld_note(count: int, scrubbed_text: bool = False) -> str:
     """Tell the agent that secrets were held back, without saying which.
 
     The marker already says *where* (the attribute that reads "<redacted>");
     this says that it was the server's doing and not an empty value, and that
-    asking another way is refused rather than merely unanswered.
+    asking another way is refused rather than merely unanswered. When free text
+    was among it, it also says that text is scrubbed on a best-effort basis: what
+    was recognised is gone, and nothing promises that what was not is absent.
     """
-    return (
+    note = (
         f"{count} secret value(s) were withheld from these results by the "
         f"server's policy (credentials, keys, community strings, session tokens) "
-        f"and appear as {redaction.REDACTED!r}; a DN that carried one is shown "
-        "with that part cut out. This is not an empty value. They cannot be "
-        "recovered through this server: a filter, order_by or group_by on a "
-        "secret attribute is refused."
+        f"and appear as {redact.REDACTED!r}; a DN that carried one is shown "
+        "with that part cut out. This is not an empty value, and an empty secret "
+        "is withheld too. They cannot be recovered through this server: a "
+        "filter, order_by or group_by on a secret attribute is refused."
     )
+    if scrubbed_text:
+        note += (
+            " Free text (changeSet, descr) was scrubbed on a best-effort basis: "
+            "the secrets recognised in it were removed, but do not read an "
+            "audit or event record as proof that none was ever quoted."
+        )
+    return note
 
 
 async def _refuse_secrets(
@@ -1113,7 +1131,7 @@ async def _refuse_secrets(
     carries the refusal's message, which never quotes what the agent sent.
     """
     try:
-        redaction.check_request(
+        redact.check_request(
             class_name,
             filters=filters,
             order_by=order_by,
@@ -1277,15 +1295,24 @@ async def query(
 
         A withheld secret reads "<redacted>" where its value would be, and
         "redacted" counts them. That is the server's policy, not an empty value;
-        an attribute that is genuinely empty is shown empty. The same applies
-        inside "_children", and to a DN that passes through a secret (an SNMP
-        community profile is named by its community string): the segment becomes
-        "community-<redacted>". The secret is also removed from the other text of
-        an object that quotes it, such as an audit record's descr.
+        an empty secret is withheld too, so the marker does not say whether one
+        is set. The same applies inside "_children", and to a DN that passes
+        through a secret (an SNMP community profile is named by its community
+        string): the segment becomes "community-<redacted>".
+
+        Audit, event, fault and session records (`aaaModLR`, `eventRecord`,
+        `faultRecord`, `aaaSessionLR`, ...) quote secrets in their own text. Their
+        `changeSet` — in both formats the APIC writes, `prop:value, ...` and
+        `prop (Old: x, New: y)` — and `descr` are scrubbed: the value of each secret
+        pair, and any secret met in a DN, is replaced. This is best effort, and
+        "note" says so when it applied: a secret in a form nothing recognises can
+        remain, so do not read such a record as proof that none was configured.
+        `changeSet` cannot be filtered, ordered or grouped on (see Raises).
 
     Raises:
         SecretAttributeError: `filters`, `order_by` or `filter_expr` uses an
-                           attribute that holds a secret. Refused whatever
+                           attribute that holds a secret, or an audit record's
+                           `changeSet` (where one is quoted). Refused whatever
                            NIWASHI_MCP_STRICT_ATTRIBUTES is set to, before the
                            APIC is called: the answer would reveal the value.
         SecretDnError:     `scope_dn`, a filter value or `filter_expr` spells a
@@ -1415,7 +1442,8 @@ async def query(
     # After the projection, so what is counted is what the agent receives, and
     # whatever `fields` asked for: a secret that was asked for by name is
     # still the marker, and one that was projected away is not announced.
-    objects, withheld = redaction.redact_objects(objects)
+    redacted = redact.redact_results(objects)
+    objects, withheld = redacted.value, redacted.withheld
 
     returned = len(objects)
 
@@ -1474,7 +1502,7 @@ async def query(
     if fields_note:
         note = _append_note(note, fields_note)
     if withheld:
-        note = _append_note(note, _withheld_note(withheld))
+        note = _append_note(note, _withheld_note(withheld, redacted.scrubbed_text))
         await ctx.info(f"query({class_name!r}) → {withheld} secret(s) withheld")
 
     envelope: QueryEnvelope = {
@@ -1582,7 +1610,7 @@ async def get_by_dn(
     # First, before anything is logged or sent: whether the object exists is
     # the one thing a refusal must not depend on (see SecretDnError).
     try:
-        redaction.check_dn(dn)
+        redact.check_dn(dn)
     except SecretDnError as exc:
         await ctx.warning(f"get_by_dn refused — {exc}")
         raise
@@ -1623,7 +1651,7 @@ async def get_by_dn(
         }
     await ctx.info(f"get_by_dn({dn!r}) → {obj.get('_class')}")
     if fields is None:
-        return _with_disclosure(*redaction.redact_object(obj), note)
+        return _with_disclosure(redact.redact_one(obj), note)
 
     # The class is only known now, from the object the DN resolved to — which
     # is why this cannot fail before the APIC is called as query()'s check does.
@@ -1653,25 +1681,28 @@ async def get_by_dn(
 
     # Projected first, then redacted, as in query(): what is counted is what is
     # returned, and a secret named in `fields` is still the marker.
-    projected, withheld = redaction.redact_object(
-        _project(obj, frozenset(fields), frozenset([object_class, *child_classes]))
+    return _with_disclosure(
+        redact.redact_one(
+            _project(obj, frozenset(fields), frozenset([object_class, *child_classes]))
+        ),
+        note,
     )
-    return _with_disclosure(projected, withheld, note)
 
 
 def _with_disclosure(
-    obj: dict[str, Any], withheld: int, note: str | None
+    redacted: redact.Redacted[dict[str, Any]], note: str | None
 ) -> dict[str, Any]:
     """The `get_by_dn` answer: the object, and the keys that explain what was done to it.
 
     There is no envelope to carry a note here — the object is the whole answer —
     so it rides on the object under synthetic keys, like `_class`. Copied rather
-    than set in place: `obj` may be the backend's. An object that needed no
+    than set in place: the object may be the backend's. An object that needed no
     explanation is returned as it is.
     """
+    obj, withheld, scrubbed_text = redacted
     extras: dict[str, Any] = {}
     if withheld:
-        note = _append_note(note, _withheld_note(withheld))
+        note = _append_note(note, _withheld_note(withheld, scrubbed_text))
         extras["_redacted"] = withheld
     if note:
         extras["_note"] = note
@@ -1846,7 +1877,7 @@ async def _group_counts(
         # whose group value was cut — not every secret the fetch happened to
         # hold: a credential's password withheld while grouping it by name
         # alters nothing the agent reads.
-        objects, _ = redaction.redact_objects(result.objects)
+        objects = redact.redact_results(result.objects).value
         if not from_dn:
             secrets_withheld = sum(
                 1

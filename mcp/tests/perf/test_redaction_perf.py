@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 """
-Performance tests for registry.redaction on a 5,000-object result — the most one
+Performance tests for niwashi_mcp.redact on a 5,000-object result — the most one
 `fetch_all` call ever holds.
 
 Every object a tool returns goes through `redact_object`, so the question is not
@@ -29,17 +29,30 @@ police milliseconds, and they allow for a CI runner 2-4x slower than that machin
   5,000 audit records through a secret DN, each
     with a *distinct* secret (the worst case,
     which also compiles a pattern per object)    < 1,500 ms (measured ~180 ms)
+  5,000 audit records, changeSet parsed, no
+    secret in them (what an audit query is)      < 300 ms   (measured ~33 ms)
+  5,000 audit records of a credential, a distinct
+    secret each, in `changeSet`                  < 1,500 ms (measured ~190 ms)
+
+The audit cases are the dearer because a changeSet is parsed and the class it is
+about is read from the `affected` DN: about 7 microseconds a record against the
+lab's 0.9 ms a record to fetch them.
 """
 
 import time
 
-from niwashi_mcp.registry import redaction
+from niwashi_mcp import redact
 
 _N = 5_000
 
+# Filler attributes share one string object per name: the footprint test in
+# test_startup_perf reads the whole process's high-water mark, and 5,000 objects
+# of distinct filler strings would be 20 MB of it for no extra realism.
+_FILLER = {f"attr{k}": f"value-{k}" for k in range(16)}
+
 
 def _ordinary(i: int) -> dict:
-    attributes = {f"attr{k}": f"value-{i}-{k}" for k in range(16)}
+    attributes = dict(_FILLER)
     attributes.update(
         _class="fvBD", dn=f"uni/tn-OT/BD-bd{i}", name=f"bd{i}", descr="x" * 30,
         modTs="2026-06-01T00:00:00.000+00:00", childAction="", lcOwn="local",
@@ -48,7 +61,7 @@ def _ordinary(i: int) -> dict:
 
 
 def _credential(i: int) -> dict:
-    attributes = {f"attr{k}": f"value-{i}-{k}" for k in range(12)}
+    attributes = dict(list(_FILLER.items())[:12])
     attributes.update(
         _class="vnsCCred", dn=f"uni/tn-OT/lDevVip-D{i}/cCred-admin", name="admin",
         value=f"secret{i}",
@@ -58,7 +71,7 @@ def _credential(i: int) -> dict:
 
 def _audit(i: int) -> dict:
     community = f"c{i}secret"
-    attributes = {f"attr{k}": f"value-{i}-{k}" for k in range(16)}
+    attributes = dict(_FILLER)
     attributes.update(
         _class="aaaModLR",
         dn=f"subj-[uni/fabric/snmpp-default/community-{community}]/mod-{i}",
@@ -75,7 +88,7 @@ def _time(objects: list[dict]) -> tuple[float, int]:
     withheld = 0
     for _ in range(3):
         t0 = time.perf_counter()
-        _, withheld = redaction.redact_objects(objects)
+        withheld = redact.redact_results(objects).withheld
         best = min(best, (time.perf_counter() - t0) * 1000)
     return best, withheld
 
@@ -96,7 +109,8 @@ def test_5000_ordinary_objects_come_back_as_the_same_objects():
     """Nothing is copied when there is nothing to withhold — the cost above is the whole cost."""
     objects = [_ordinary(i) for i in range(_N)]
 
-    out, withheld = redaction.redact_objects(objects)
+    done = redact.redact_results(objects)
+    out, withheld = done.value, done.withheld
 
     assert withheld == 0
     assert all(a is b for a, b in zip(out, objects, strict=True))
@@ -121,3 +135,41 @@ def test_5000_audit_records_each_through_a_distinct_secret_dn():
         f"redacting {_N} audit records took {elapsed:.0f} ms — measured at ~180 ms, and "
         f"this is the worst case: every object carries a different secret"
     )
+
+
+def _plain_audit(i: int) -> dict:
+    attributes = dict(list(_FILLER.items())[:14])
+    attributes.update(
+        _class="aaaModLR", dn=f"subj-[uni/tn-OT/BD-bd{i}]/mod-{i}", affected=f"uni/tn-OT/BD-bd{i}",
+        descr=f"Bridge Domain bd{i} created From IP:10.0.0.1",
+        changeSet=f"name:bd{i}, arpFlood:no, unicastRoute:yes, mac:00:22:BD:F8:19:FF, userdom::all:",
+    )
+    return attributes
+
+
+def _credential_audit(i: int) -> dict:
+    attributes = dict(list(_FILLER.items())[:14])
+    attributes.update(
+        _class="aaaModLR", dn=f"subj-[uni/tn-a/lDevVip-D/cDev-C{i}/cCred]/mod-{i}",
+        affected=f"uni/tn-a/lDevVip-D/cDev-C{i}/cCred", descr="Credential created From IP:10.0.0.1",
+        changeSet=f"name:admin, value:pass{i}word, userdom::all:",
+    )
+    return attributes
+
+
+def test_5000_ordinary_audit_records_are_parsed_and_left_alone():
+    objects = [_plain_audit(i) for i in range(_N)]
+
+    elapsed, withheld = _time(objects)
+
+    assert withheld == 0
+    assert elapsed < 300, f"scrubbing {_N} ordinary audit records took {elapsed:.0f} ms — measured at ~33 ms"
+
+
+def test_5000_audit_records_of_a_credential_each_with_a_distinct_secret_in_changeset():
+    objects = [_credential_audit(i) for i in range(_N)]
+
+    elapsed, withheld = _time(objects)
+
+    assert withheld == _N, "the changeSet of each"
+    assert elapsed < 1_500, f"scrubbing {_N} credential audit records took {elapsed:.0f} ms — measured at ~190 ms"
