@@ -168,6 +168,39 @@ def test_the_envelope_keys_promised_are_the_keys_returned():
         )
 
 
+def test_the_group_by_fields_count_promises_are_the_fields_it_returns():
+    """`count(group_by=...)` documents a breakdown envelope; the code must set it.
+
+    An agent keys off `complete` and `groups` to decide whether it holds an
+    answer, so a field the docstring names and the code never sets is an agent
+    waiting on a value that cannot arrive. Same method as the `query` test: the
+    docstring is stripped first, because it spells out the very `"key":` shapes
+    being looked for and would satisfy the assertion by itself.
+    """
+    doc = _doc("count")
+    keys = {"group_by", "groups", "ungrouped", "complete", "note", "warnings"}
+    for key in keys:
+        assert f'"{key}"' in doc, f"count returns {key!r} but never documents it"
+
+    body = ""
+    for fn_name in ("count", "_group_counts"):
+        fn = ast.parse(textwrap.dedent(inspect.getsource(getattr(main_mod, fn_name))))
+        fn = fn.body[0]
+        if isinstance(fn.body[0], ast.Expr) and isinstance(
+            fn.body[0].value, ast.Constant
+        ):
+            fn.body = fn.body[1:]
+        body += ast.unparse(fn)
+    # `warnings` is added by subscript assignment, the rest as dict literals.
+    for key in keys - {"warnings"}:
+        assert f"'{key}':" in body or f'"{key}":' in body, (
+            f"count documents {key!r} but never sets it"
+        )
+    assert "response['warnings']" in body, "count documents `warnings` but never sets it"
+    # The pseudo-key is part of the contract the docstring teaches.
+    assert f'"{main_mod._TENANT_KEY}"' in doc
+
+
 # ── the skill must describe the tools that exist ─────────────────────────────
 
 

@@ -14,6 +14,7 @@ count(
     filters: dict[str, str] | None = None,
     scope_dn: str | None = None,
     filter_expr: str | None = None,
+    group_by: str | None = None,
 ) -> dict[str, Any]
 ```
 
@@ -23,6 +24,7 @@ count(
 | `filters` | `dict[str, str]` | `{}` | Attribute equality filters `{attr: value}`, same semantics as `query()` |
 | `scope_dn` | `str` | — | DN of a parent object to scope the count to a subtree |
 | `filter_expr` | `str` | — | Raw APIC filter for predicates beyond equality; combined with `filters` via `and()` |
+| `group_by` | `str` | — | Break the count down per value of this attribute, or per tenant with the special value `"tenant"`. See [Grouping](#grouping-group_by). Unset (or empty) gives the plain count |
 
 ---
 
@@ -54,6 +56,55 @@ Because the tally is the very same `total_available` that `query` reports, the t
 | `scope_dn` | `str \| null` | The scope DN, if one was supplied |
 | `filters` | `dict` | The filters that were applied |
 
+With `group_by` set the response gains the fields below; without it the response is exactly the four fields above, and no extra request is made.
+
+---
+
+## Grouping (`group_by`)
+
+"How many X **per** Y?" — faults per severity, BDs per tenant, nodes per role — in one call:
+
+```python
+await count("faultInst", group_by="severity")
+await count("fvBD", group_by="tenant")
+await count("fvAEPg", scope_dn="uni/tn-OT", group_by="descr")
+```
+
+```json
+{
+  "class_name": "faultInst",
+  "count": 7,
+  "scope_dn": null,
+  "filters": {},
+  "group_by": "tenant",
+  "groups": {"A": 3, "B": 2},
+  "ungrouped": 2,
+  "complete": true,
+  "note": null
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `group_by` | `str` | The attribute asked for |
+| `groups` | `dict[str, int] \| null` | Objects per value, ordered by descending count and, within a tie, by value. `null` when `complete` is `false` |
+| `ungrouped` | `int \| null` | Objects with no value to group on (see below). `null` when `complete` is `false` |
+| `complete` | `bool` | `true` when the breakdown accounts for every object `count` reports |
+| `note` | `str \| null` | Why there is no breakdown, and how to narrow the query. `null` when `complete` is `true` |
+| `warnings` | `list[str]` | Present only when non-empty: `group_by` is not in the catalogue and attribute checking is off (below) |
+
+**The invariant.** When `complete` is `true`, `sum(groups.values()) + ungrouped == count`. The tests assert it.
+
+**Valid values.** Any attribute of the class in the catalogue (`get_schema` lists them), or `"tenant"`. `"tenant"` is read from the object's DN — the `tn-<name>` path segment — because a tenant is not an attribute of the objects it owns. If the class has a real attribute called `tenant` (20 classes do, e.g. `pingExecTn`), the attribute wins. An unknown name raises `UnknownAttributeError` with the closest matches, before any request is sent.
+
+**Missing values.** An object that has no value for the attribute is counted in `ungrouped`, never as a group. For `"tenant"` that is every object whose DN has no tenant segment — fabric-level objects such as `topology/pod-1/node-101/...`, or an object under `uni/epp/...` that merely *names* a tenant's EPG inside a bracketed key. It is a separate number, not a `null` key, because a JSON object key is a string and every string (`"null"`, `"None"`, `""`) is a value some attribute can really hold. An **empty string is a value**: `descr` is `""` on most objects, and that is a `""` group, not an absence.
+
+**What it costs.** A plain count is one request that transfers one object. A grouped count fetches **every** matching object (same class, filters and scope, 200 per page) and tallies them in the server, because the APIC cannot group. On a big class, scope or filter first.
+
+**It never returns a partial breakdown.** If the fetch stops at its safety cap, or fetches a different number of objects than `count` — the set changed while it was being read — the groups would not cover the whole set, and a partial breakdown reads as a finding ("only two tenants have faults") when it is only where the fetch stopped. So `complete` is `false`, `groups` and `ungrouped` are `null`, `note` says why, and `count` stays the true APIC total. Narrow the query (one tenant at a time with `scope_dn="uni/tn-<name>"`, or one value at a time with `filters`) and group each narrower set; for a changed set, retry.
+
+**Non-strict attribute checking.** With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` an unknown `group_by` is not refused: the request runs, a warning is logged and added to a `warnings` list in the result, and objects that lack the attribute are reported in `ungrouped`. It exists for a fabric on a release newer than the catalogue.
+
 ---
 
 ## Raises
@@ -61,6 +112,7 @@ Because the tally is the very same `total_available` that `query` reports, the t
 | Exception | Condition |
 |---|---|
 | `UnknownClassError` | `class_name` is not in the catalogue (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index). The guard is identical to `query`'s, so the two tools can never disagree about whether a class is known. |
+| `UnknownAttributeError` | `group_by` is neither `"tenant"` nor an attribute of the class in the catalogue. Includes `.suggestions` (closest names) and `.catalogue_version`. Raised before any request is sent; suppressed by `NIWASHI_MCP_STRICT_ATTRIBUTES=false`, which turns it into a `warnings` entry. |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter values are always escaped, never rejected. |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
 
@@ -80,6 +132,13 @@ await count("fvSubnet", filters={"scope": "public"})
 
 # Non-controller fabric nodes
 await count("fabricNode", filter_expr='ne(fabricNode.role,"controller")')
+
+# Faults per severity, then per tenant
+await count("faultInst", group_by="severity")
+await count("faultInst", group_by="tenant")
+
+# Fabric nodes per role
+await count("fabricNode", group_by="role")
 ```
 
 ---
@@ -92,5 +151,5 @@ A count taken right after a large config push reflects the fabric state **at tha
 
 ## Related
 
-- [`query`](query.md) — fetch the objects themselves once you know how many there are
+- [`query`](query.md) — fetch the objects themselves once you know how many there are, or rank them (`fetch_all=True` plus local aggregation) — `group_by` tallies, it does not answer "which X has the most Y"
 - [`get_by_dn`](get_by_dn.md) — fetch a single object directly by DN
