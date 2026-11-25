@@ -7,6 +7,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ## [Unreleased]
 
+---
+
+## [3.0.0] - 2026-11-25
+
+**Fewer tokens for the same answers, no secrets in the agent's context, and APIC
+refusals that can no longer pass for data.** `query` and `get_by_dn` take
+`fields`, and `count` takes `group_by` (with fault rule names for
+`group_by="code"`). On a lab A/B of 18 fabric-wide tasks, 90 runs a side, that
+cut cost by 21 % overall and by about half where a grouped count answers the
+question, at unchanged accuracy. The APIC returns credentials, SNMP communities
+and session tokens in clear, in objects and in its own audit and event records;
+they are now redacted, and requests that would reveal one are refused. An
+invalid `eq`/`ne` value, which the APIC answers with HTTP 301 and an error
+object, used to read as `count: 1`; any non-2xx or `imdata` error now raises.
+The server moves to fastmcp 4.2.6 and niwaki 2.2.
+
+**Upgrading from 2.x — what can break:** a reverse proxy on the same machine
+needs `MCP_ALLOWED_HOSTS` (or every request gets `421`); unknown attribute names
+raise instead of returning `[]`; an `eq`/`ne` value outside an attribute's
+allowed set is a tool error; secret values read `<redacted>` and filtering or
+grouping on them is refused; `python main.py` is removed. See the README's
+*Upgrading from 2.x*.
+
 ### Added
 
 - **The server publishes its own ACI skill (experimental).** `mcp/client/SKILL.md`
@@ -477,6 +500,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
     a `data/schemas` directory that 2.0 deleted and `.gitignore` excludes, so it
     skipped in CI and in every clean checkout. Measured on `git archive HEAD`:
     one skip, this test. The body never needed the directory.
+
+### Removed
+
+- **The `python main.py` launcher.** `mcp/main.py` was kept through 2.x so 1.x
+  deployments could start the server the old way, with a `DeprecationWarning`
+  announcing its removal in 3.0. Start the server with `niwashi-mcp` or
+  `python -m niwashi_mcp.main`.
 
 ### Fixed
 

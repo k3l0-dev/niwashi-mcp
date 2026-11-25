@@ -17,7 +17,7 @@ The five tools and their signatures are unchanged from 1.2.2. What changed in 2.
 | Console command | `niwashi-mcp` |
 | Git repository | `niwashi-mcp` |
 
-`python main.py` from `mcp/` still starts the server through a deprecated shim that emits a `DeprecationWarning` and forwards to `niwashi_mcp.main:main`. It is scheduled for removal in 3.0; prefer `niwashi-mcp` or `python -m niwashi_mcp.main`.
+The `python main.py` launcher that 2.x kept in `mcp/` for 1.x deployments was removed in 3.0: start the server with `niwashi-mcp` or `python -m niwashi_mcp.main`.
 
 ---
 
@@ -58,7 +58,6 @@ graph TD
     subgraph repo["niwashi-mcp repository"]
         pkg["mcp/src/niwashi_mcp/<br/>server package"]
         proj["mcp/pyproject.toml<br/>distribution niwashi-mcp"]
-        shim["mcp/main.py<br/>deprecated launcher"]
         tests["mcp/tests/"]
         docs["docs/"]
         envex[".env.example"]
@@ -76,7 +75,6 @@ graph TD
     pkg --> dist
     dist -->|"declares dependency"| niwaki
     niwaki -->|"ACI object model"| pkg
-    shim -->|"forwards to"| pkg
     envex -.->|"copied and filled in"| envfile
     envfile -->|"read at startup"| pkg
     pkg -->|"queries"| apic

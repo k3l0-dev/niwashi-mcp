@@ -238,17 +238,14 @@ uv run niwashi-mcp
 `uv sync` installs `niwaki` like any other dependency, so the catalogue lands in
 the virtualenv — a checkout brings no data of its own.
 
-Two equivalent entry points, for when the console script is inconvenient:
+An equivalent entry point, for when the console script is inconvenient:
 
 ```bash
 uv run python -m niwashi_mcp.main   # same code path, no console script
-uv run python main.py               # deprecated shim, removal in 3.0
 ```
 
-`mcp/main.py` exists only so deployments that started the server that way until
-1.x do not break on upgrade. It prepends `src/` to `sys.path` and calls the same
-`main()`. It raises a `DeprecationWarning`, which Python's default filters hide —
-run `python -W always main.py` to see it.
+The `python main.py` launcher that 2.x kept for 1.x deployments was removed in
+3.0.
 
 ---
 
