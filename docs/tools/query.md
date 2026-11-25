@@ -2,6 +2,8 @@
 
 Execute a filtered class query against the APIC. **Only call this after `search_classes` and `get_schema`.**
 
+Every attribute name in the request is checked against the catalogue **before** it is sent — see [Attribute validation](#attribute-validation).
+
 ---
 
 ## Signature
@@ -39,8 +41,8 @@ query(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `filters` | `dict[str, str]` | `{}` | Simple equality filters `{attr: value}`. Keys must be valid property names from `get_schema()`. Multiple entries are combined with APIC `and()`. |
-| `filter_expr` | `str` | — | Raw APIC filter for complex predicates. Combined with `filters` via `and()` when both set. |
+| `filters` | `dict[str, str]` | `{}` | Simple equality filters `{attr: value}`. Keys must be valid property names from `get_schema()` — an unknown one raises `UnknownAttributeError`. Multiple entries are combined with APIC `and()`. |
+| `filter_expr` | `str` | — | Raw APIC filter for complex predicates. Combined with `filters` via `and()` when both set. Each `Class.attr` operand is checked against the catalogue; see [Attribute validation](#attribute-validation). |
 
 ### Scoping
 
@@ -54,14 +56,14 @@ query(
 |---|---|---|---|
 | `limit` | `int` | `20` | Maximum objects to return per page. Clamped to `[1, 200]` — values below 1 are raised to 1 rather than passed to the APIC as an invalid page-size. Not used when `fetch_all=True`, which pages at its own fixed size of 200 whatever `limit` is. |
 | `page` | `int` | — | 0-based page number for paginated result sets. Ignored when `fetch_all=True`. |
-| `order_by` | `str` | — | APIC ordering expression, e.g. `"faultInst.severity\|desc"`. |
+| `order_by` | `str` | — | APIC ordering expression, e.g. `"faultInst.severity\|desc"`. The attribute is checked against the class named in the term. |
 | `fetch_all` | `bool` | `False` | Walk every page (200 objects per page, independent of `limit`) and return the complete matching set in one call — the reliable way to answer a max/min/total/all-of question over a whole class instead of paging manually. Holds at most 5,000 objects (25 pages): a set of 5,000 or fewer comes back whole with `complete` `True`, a larger one comes back as its first 5,000 with `complete` `False` and `total_available` still the true size — nothing beyond the cap is fetched. `complete` is also `False` if the APIC ends its pages before the `totalCount` it reported. Narrow the query (e.g. `scope_dn`) and combine results. |
 
 ### Children and subtrees
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `include_children` | `list[str]` | — | Child class names to embed inline. Each result dict gains a `_children` key. |
+| `include_children` | `list[str]` | — | Child class names to embed inline. Each result dict gains a `_children` key. An unknown class raises `UnknownClassError`. |
 | `rsp_subtree_include` | `str` | — | Subtree categories: `"faults"`, `"health"`, `"audit-logs"`, `"faults,no-scoped"`, `"faults,required"`. |
 
 ### Attribute projection
@@ -117,7 +119,7 @@ An **envelope dict** — not a bare list:
 | `truncated` | `bool` | `total_available > returned` — a default-page result is a **partial page**, not the whole matching set. Never conclude a max/min/total/complete-list answer from a truncated result. |
 | `next_page` | `int \| None` | `page + 1` when truncated and `fetch_all` was not used; `None` otherwise |
 | `complete` | `bool` | `False` only if `fetch_all=True` stopped short of `total_available` — at the 5,000-object cap, or because the APIC ended its pages before the `totalCount` it reported. A set of exactly 5,000 objects is complete. |
-| `note` | `str \| None` | Guidance text, present only when truncated or capped |
+| `note` | `str \| None` | Guidance text, present only when truncated or capped — or when [relaxed attribute checking](#relaxing-the-check) sent a name the catalogue did not know. When several apply they are joined into one string, the truncation or cap note first. |
 
 Any code written against the older (pre-envelope) shape of this doc needs updating: `result["results"][0]["dn"]`, not `result[0]["dn"]`.
 
@@ -127,9 +129,55 @@ Any code written against the older (pre-envelope) shape of this doc needs updati
 
 | Exception | Condition |
 |---|---|
-| `UnknownClassError` | `class_name` is not in the catalogue — the single source of truth for whether an ACI class exists (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index, which is smaller than the validated universe). The 213 catalogue classes absent from the search index validate normally: 2.0 removed the two-tier fallback and the warning it used to emit on them. |
+| `UnknownClassError` | `class_name` is not in the catalogue — the single source of truth for whether an ACI class exists (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index, which is smaller than the validated universe). The 213 catalogue classes absent from the search index validate normally: 2.0 removed the two-tier fallback and the warning it used to emit on them. Also raised for an unknown class in `include_children`, or as the `Class` of a `Class.attr` operand in `filter_expr` or `order_by` (the same error, built the same way). |
+| `UnknownAttributeError` | An attribute in `filters`, `order_by` or `filter_expr` is not a property of its class in the catalogue. Carries `.class_name`, `.attribute`, `.suggestions` (the closest real property names — a case-only difference first) and `.catalogue_version`. Nothing has been sent to the APIC when it is raised. |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter *values* are always escaped, never rejected — this can only be raised by an identifier, not a value. |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
+
+---
+
+## Attribute validation
+
+The APIC answers a filter on a misspelled or invented attribute with HTTP 200 and `[]` — indistinguishable from "there are none". So before a request is built, `query` checks four things against the catalogue, for the class they belong to:
+
+| Source | What is checked | Raises |
+|---|---|---|
+| `filters` | every key, against `class_name` | `UnknownAttributeError` |
+| `order_by` | the attribute of each `Class.attr[\|asc\|desc]` term (terms may be comma-separated), against the class **in the term** | `UnknownAttributeError`, or `UnknownClassError` if the term's class is unknown |
+| `include_children` | every class name (an item may itself be comma-joined, as the APIC takes it) | `UnknownClassError` |
+| `filter_expr` | the `Class.attr` operand of each predicate, against `Class` | `UnknownAttributeError`, or `UnknownClassError` if `Class` is unknown |
+
+In strict mode (the default) the **first** problem raises and no request reaches the backend. The error carries the closest real names, so the caller can correct itself without a `get_schema()` round-trip.
+
+Details worth knowing:
+
+- **Abstract classes** accept the union of their own properties and those of every concrete subclass. A query on `fvABD` returns `fvBD` instances, so `hostBasedRouting` (declared by `fvBD`, not `fvABD`) is valid there.
+- **System attributes** — `dn`, `rn`, `status`, `lcOwn`, `modTs` and the rest — are in the catalogue like any other property, so `wcard(fvBD.dn,"...")` passes.
+- **Quoted values are never inspected.** `wcard(fvBD.dn,"uni/tn-a.b.c")` holds `a.b` inside a string literal; it is a value, not a `Class.attr`. Escaped quotes inside a literal are honoured, and a literal that never closes is treated as running to the end.
+- **Only the first operand of a predicate is an attribute reference** (`eq(fvBD.name,"x")`, `bw(faultInst.severity,"a","b")`, nested under `and`/`or`/`not` as deeply as you like). Anything the extractor does not recognise as `Class.attr` — a bare `name`, a malformed expression — is sent exactly as written, and the APIC remains the judge of it.
+- **`filters` keys that are not identifiers** (`bad-attr`, `123attr`) are left to `build_filter`, which raises `FilterError` for them as before.
+- The check is against **one APIC release** (the catalogue's — `UnknownAttributeError.catalogue_version`). A fabric on another release may carry an attribute or class the catalogue lacks; see below.
+
+### Relaxing the check
+
+Set `NIWASHI_MCP_STRICT_ATTRIBUTES=false` (see [Settings](../configuration/settings.md#attribute-validation)) and the same checks run but **nothing is raised**: the request is sent, and every problem is surfaced in two places so it is never silent —
+
+- the result's `note`, appended to any truncation or cap note rather than replacing it;
+- a `ctx.warning` log entry per problem.
+
+```json
+{
+  "results": [],
+  "returned": 0,
+  "total_available": 0,
+  "truncated": false,
+  "next_page": null,
+  "complete": true,
+  "note": "filters: Unknown attribute 'newAttr' on ACI class 'fvBD'. No close matches found. Call get_schema('fvBD') to list its attributes. The catalogue describes APIC 6.0(9c); a fabric on another release may legitimately have this attribute. Sent anyway because strict attribute checking is off — an empty result may mean this name is wrong, not that nothing matches."
+}
+```
+
+An empty result next to such a note is **not** an answer of zero. The class named by `class_name` itself is outside this switch: an unknown one always raises.
 
 ---
 

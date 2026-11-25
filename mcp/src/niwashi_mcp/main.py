@@ -44,6 +44,10 @@ Environment variables (read from .env at startup)
   MCP_PORT         HTTP port the server listens on (default: 8000)
   MCP_ALLOW_NO_AUTH  "true" to permit a routable bind with MCP_API_KEYS unset.
                    Refused otherwise: this process holds APIC credentials.
+  NIWASHI_MCP_STRICT_ATTRIBUTES
+                   "false" to send a request even when its attribute names are
+                   not in the catalogue, flagging them in the result instead of
+                   refusing it (default: true — refuse). See query()/count().
   MCP_API_KEYS     Comma-separated bearer tokens accepted by ApiKeyMiddleware.
                    Unset means the server runs with NO authentication (logged
                    as a warning at startup).  Reloadable at runtime with
@@ -96,12 +100,22 @@ from pydantic import BeforeValidator
 
 from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
 from niwashi_mcp.apic.version import check_fabric_version
-from niwashi_mcp.exceptions import ConfigurationError, UnknownClassError
+from niwashi_mcp.exceptions import (
+    ConfigurationError,
+    NiwashiMcpError,
+    UnknownAttributeError,
+    UnknownClassError,
+)
 from niwashi_mcp.middleware.auth import ApiKeyMiddleware, KeyStore, load_api_keys
 from niwashi_mcp.middleware.health import HealthMiddleware
 from niwashi_mcp.middleware.oauth import OAuthDiscoveryMiddleware
 from niwashi_mcp.registry import catalog
 from niwashi_mcp.registry.descriptions import search as desc_search
+from niwashi_mcp.registry.filter import (
+    filter_expr_attributes,
+    is_identifier,
+    order_by_attributes,
+)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 #
@@ -254,6 +268,18 @@ def _coerce_json_str(v: object) -> object:
 # Pydantic types with transparent JSON-string coercion for LLM tool callers.
 _JsonList = Annotated[list[str], BeforeValidator(_coerce_json_str)]
 _JsonDict = Annotated[dict[str, str], BeforeValidator(_coerce_json_str)]
+
+# ── Attribute validation mode ─────────────────────────────────────────────────
+
+
+def _strict_attributes() -> bool:
+    """Whether an attribute unknown to the catalogue is refused (the default).
+
+    Read on every call, not at import, so a test or an operator can flip it
+    without a restart.  Any value other than false/0/no/off keeps it strict.
+    """
+    value = os.environ.get("NIWASHI_MCP_STRICT_ATTRIBUTES", "true")
+    return value.strip().lower() not in {"false", "0", "no", "off"}
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -631,6 +657,141 @@ async def get_schema(
     return schema
 
 
+# ── Attribute validation ──────────────────────────────────────────────────────
+#
+# The APIC answers an unknown attribute — in a filter, an order-by, a
+# filter_expr — with HTTP 200 and `[]`, and an unknown class in include_children
+# by embedding nothing. Each is indistinguishable from "no such objects", which
+# is the failure this server exists to prevent, so every name the caller supplies
+# is checked against the catalogue before the request leaves the process.
+#
+# The catalogue describes one APIC release, and a fabric on another may
+# legitimately carry a name it lacks — hence the escape hatch,
+# NIWASHI_MCP_STRICT_ATTRIBUTES=false, which sends the request anyway and says so
+# (see `_enforce_attributes`). The class named by `class_name` itself is not
+# governed by it: that check is older, and a typo there has no legitimate reading.
+
+
+def _attribute_problems(
+    class_name: str,
+    descriptions: dict,
+    *,
+    filters: dict[str, str] | None,
+    order_by: str | None,
+    include_children: list[str] | None,
+    filter_expr: str | None,
+) -> list[tuple[str, NiwashiMcpError]]:
+    """Every name the catalogue does not know, as `(where, error)` in a fixed order.
+
+    The order is `filters`, `order_by`, `include_children`, `filter_expr`, and a
+    name that appears more than once is reported once. `class_name` is assumed
+    to be known already.
+
+    Names that are not identifiers are left for `build_filter`, which raises
+    `FilterError` for them. A `filters` key like `bad-attr` is a malformed
+    request, not a missing attribute, and reporting it as the latter would hide
+    the error that says what is actually wrong with it.
+    """
+    problems: list[tuple[str, NiwashiMcpError]] = []
+    seen_attrs: set[tuple[str, str]] = set()
+    seen_classes: set[str] = set()
+
+    def check_class(name: str, where: str) -> bool:
+        if catalog.class_exists(name):
+            return True
+        if name not in seen_classes:
+            seen_classes.add(name)
+            suggestions = [
+                s["class_name"] for s in desc_search(name, descriptions, limit=5)
+            ]
+            problems.append(
+                (where, UnknownClassError(name, suggestions, len(descriptions)))
+            )
+        return False
+
+    def check_attr(cls: str, attr: str, where: str) -> None:
+        if (cls, attr) in seen_attrs:
+            return
+        seen_attrs.add((cls, attr))
+        if cls != class_name and not check_class(cls, where):
+            return
+        if not catalog.property_exists(cls, attr):
+            problems.append(
+                (
+                    where,
+                    UnknownAttributeError(
+                        cls,
+                        attr,
+                        catalog.closest_properties(cls, attr),
+                        catalog.apic_version(),
+                    ),
+                )
+            )
+
+    for attr in filters or {}:
+        if is_identifier(attr):
+            check_attr(class_name, attr, "filters")
+    for cls, attr in order_by_attributes(order_by):
+        check_attr(cls, attr, "order_by")
+    # An item may itself be a comma-joined list: the client joins the items with
+    # "," into rsp-subtree-class, so ["fvSubnet,fvRsCtx"] has always worked and
+    # must keep working.
+    for item in include_children or []:
+        for name in (part.strip() for part in item.split(",")):
+            if name:
+                check_class(name, "include_children")
+    for cls, attr in filter_expr_attributes(filter_expr):
+        check_attr(cls, attr, "filter_expr")
+    return problems
+
+
+async def _enforce_attributes(
+    tool: str,
+    ctx: Context,
+    descriptions: dict,
+    class_name: str,
+    *,
+    filters: dict[str, str] | None,
+    order_by: str | None = None,
+    include_children: list[str] | None = None,
+    filter_expr: str | None,
+) -> list[str]:
+    """Validate a request's names against the catalogue; refuse or warn.
+
+    Strict (the default): the first unknown name raises `UnknownAttributeError`
+    — or `UnknownClassError` for a class — before anything reaches the backend.
+
+    Not strict (`NIWASHI_MCP_STRICT_ATTRIBUTES=false`): nothing is raised. Each
+    problem is logged through `ctx.warning` and returned as a message for the
+    caller to put in its result, so the request goes out but the agent reading
+    the answer is told which names were unverified. It is never silent: an
+    empty result from an unchecked name looks exactly like a true zero.
+    """
+    problems = _attribute_problems(
+        class_name,
+        descriptions,
+        filters=filters,
+        order_by=order_by,
+        include_children=include_children,
+        filter_expr=filter_expr,
+    )
+    if not problems:
+        return []
+    if _strict_attributes():
+        where, exc = problems[0]
+        await ctx.warning(f"{tool}({class_name!r}) refused — {where}: {exc}")
+        raise exc
+    messages = []
+    for where, exc in problems:
+        await ctx.warning(f"{tool}({class_name!r}) {where}, sent unchecked: {exc}")
+        messages.append(
+            f"{where}: {exc} Sent anyway because strict attribute checking is "
+            "off — an empty result may mean this name is wrong, not that nothing "
+            "matches."
+        )
+    return messages
+
+
 @mcp.tool(title="Query ACI objects", annotations=_FABRIC_READ)
 async def query(
     class_name: str,
@@ -654,6 +815,10 @@ async def query(
       2. Called get_schema(class_name) to learn valid filter attribute names.
     Skipping these steps leads to empty results with no error — the APIC
     silently returns nothing for unknown classes or wrong attribute names.
+    The server therefore checks every attribute name you send — in `filters`,
+    `order_by` and `filter_expr` — and every class in `include_children`
+    against the catalogue, and refuses the request before it reaches the APIC
+    when one is unknown. The error names the closest real ones.
 
     Executes a GET against the APIC class or subtree endpoint.
     The APIC filter string is built automatically from `filters`.
@@ -671,7 +836,8 @@ async def query(
                     e.g. "fvBD", "faultInst", "fabricNode".
         ctx:        Injected FastMCP context (not a user-facing parameter).
         filters:    Attribute filters as {attribute: value} pairs.
-                    Attribute names must match properties from get_schema().
+                    Attribute names must match properties from get_schema();
+                    an unknown name raises UnknownAttributeError.
                     Example: {"name": "servers"}  →  eq(fvBD.name,"servers")
                     Multiple entries are combined with APIC and() syntax.
         scope_dn:   DN of a parent object to scope the subtree query.
@@ -684,15 +850,20 @@ async def query(
                           page-size. Not used when fetch_all=True, which pages
                           at its own fixed size of 200 whatever `limit` is.
         order_by:         APIC ordering expression, e.g. "faultInst.severity|desc".
+                          The attribute is checked against the class in the term.
         include_children: Child class names to embed in each result in one call,
                           e.g. ["fvSubnet", "fvRsCtx"].  Each returned object
                           will contain a "_children" list of child attribute dicts.
                           Equivalent to moquery -x rsp-subtree=children
-                          -x rsp-subtree-class=X,Y.
+                          -x rsp-subtree-class=X,Y. An unknown class raises
+                          UnknownClassError.
         filter_expr:      Raw APIC filter predicate for operations beyond simple
                           equality (wcard, ne, gt, ...), e.g.
                           'wcard(fvBD.dn,"uni/tn-OT")'. Combined with `filters`
-                          via and() when both are provided.
+                          via and() when both are provided. Each Class.attr
+                          operand is checked against the catalogue; quoted
+                          values are never inspected, and anything that is not
+                          recognisably Class.attr is sent as written.
         rsp_subtree_include: Inline subtree categories to include in the same
                           response, e.g. "faults", "health", "audit-logs",
                           "faults,no-scoped", "faults,required".
@@ -729,12 +900,18 @@ async def query(
            "complete": <bool>,          # False only if fetch_all stopped short of
                                         # total_available (5,000-object cap, or
                                         # the APIC ended its pages early)
-           "note": <str|None>}          # guidance, present only when truncated or capped
+           "note": <str|None>}          # guidance, present only when truncated or
+                                        # capped, or when a name was sent unchecked
         Each dict in "results" contains all APIC attributes for the object
         plus a "_class" key with the ACI class name. The "dn" attribute is
         always present and encodes the full object path. When
         include_children is set, each dict also contains "_children": a list
         of child attribute dicts, each with their own "_class" key.
+
+        When the operator has set NIWASHI_MCP_STRICT_ATTRIBUTES=false, an
+        unknown name is not refused: the request is sent and "note" says which
+        names the catalogue did not know — an empty result may then mean the
+        name is wrong, not that nothing matches.
 
     Raises:
         UnknownClassError: class_name is not in the catalogue — includes the
@@ -743,7 +920,16 @@ async def query(
                            check is exact and case-sensitive. It exists because
                            the APIC answers an unknown class with an empty
                            result rather than an error, which is
-                           indistinguishable from "there are none".
+                           indistinguishable from "there are none". Also
+                           raised for an unknown class in `include_children`
+                           or in a `filter_expr` operand.
+        UnknownAttributeError: an attribute in `filters`, `order_by` or
+                           `filter_expr` is not a property of its class in the
+                           catalogue — includes the closest real names. For an
+                           abstract class every concrete subclass's properties
+                           count. The catalogue describes one APIC release, so
+                           a fabric on another may carry a name it lacks; the
+                           operator can relax the check (see above).
         FilterError:       `class_name` or a `filters` key contains characters
                            outside the expected ACI identifier format (see
                            registry.filter.build_filter). Filter *values* are
@@ -770,6 +956,17 @@ async def query(
         suggestion_names = [s["class_name"] for s in suggestions]
         await ctx.warning(f"query called with unknown class {class_name!r}")
         raise UnknownClassError(class_name, suggestion_names, len(descriptions))
+
+    attribute_warnings = await _enforce_attributes(
+        "query",
+        ctx,
+        descriptions,
+        class_name,
+        filters=filters,
+        order_by=order_by,
+        include_children=include_children,
+        filter_expr=filter_expr,
+    )
 
     clamped_limit = max(1, min(limit, 200))
     await ctx.info(
@@ -836,6 +1033,11 @@ async def query(
             f"query({class_name!r}, fetch_all=True) capped — "
             f"{returned}/{result.total_available} fetched"
         )
+
+    # Appended, never assigned: the truncation and cap notes above are what keep
+    # a partial page from being read as a total, and must survive a warning.
+    if attribute_warnings:
+        note = " ".join(filter(None, [note, *attribute_warnings]))
 
     await ctx.info(
         f"query → {returned}/{result.total_available} objects returned "
@@ -934,6 +1136,8 @@ async def count(
 
     ⚠ PREREQUISITE — like query(), verify the class name with search_classes()
     (and its filter attributes with get_schema()) before calling this tool.
+    Attribute names in `filters` and `filter_expr` are checked against the
+    catalogue exactly as query() checks them, and an unknown one is refused.
 
     The most frequent verification need — "how many BDs / EPGs / subnets?" —
     answered in a single cheap request that transfers one object instead of the
@@ -945,9 +1149,11 @@ async def count(
         class_name:  Exact ACI class name verified via search_classes().
         ctx:         Injected FastMCP context (not a user-facing parameter).
         filters:     Attribute equality filters {attribute: value}, same as query().
+                     An unknown attribute name raises UnknownAttributeError.
         scope_dn:    DN of a parent object to scope the count to a subtree.
         filter_expr: Raw APIC filter string for predicates beyond equality;
                      combined with `filters` via and() when both are provided.
+                     Each Class.attr operand is checked, as in query().
 
     Returns:
         A dict:
@@ -956,11 +1162,21 @@ async def count(
            "scope_dn": <scope_dn or None>,
            "filters": <filters or {}>}
 
+        With NIWASHI_MCP_STRICT_ATTRIBUTES=false a name the catalogue does not
+        know is not refused: the request is sent and the dict gains
+        "warnings": a list of strings, one per unverified name. The key is
+        absent otherwise. A count of zero next to a warning may mean the name
+        is wrong, not that nothing matches.
+
     Raises:
         UnknownClassError: class_name is not in the catalogue — the same
                            guard query() applies, from the same single source
                            of truth, so the two tools can never disagree about
-                           whether a class exists.
+                           whether a class exists. Also raised for an unknown
+                           class in a `filter_expr` operand.
+        UnknownAttributeError: an attribute in `filters` or `filter_expr` is
+                           not a property of its class in the catalogue —
+                           the same check, from the same source, as query().
         FilterError:       `class_name` or a `filters` key contains characters
                            outside the expected ACI identifier format (see
                            registry.filter.build_filter). Filter values are
@@ -980,6 +1196,15 @@ async def count(
         await ctx.warning(f"count called with unknown class {class_name!r}")
         raise UnknownClassError(class_name, suggestion_names, len(descriptions))
 
+    attribute_warnings = await _enforce_attributes(
+        "count",
+        ctx,
+        descriptions,
+        class_name,
+        filters=filters,
+        filter_expr=filter_expr,
+    )
+
     await ctx.info(
         f"count({class_name!r}, filters={filters!r}, scope={scope_dn!r})"
     )
@@ -990,12 +1215,17 @@ async def count(
         filter_expr=filter_expr,
     )
     await ctx.info(f"count → {total}")
-    return {
+    response: dict[str, Any] = {
         "class_name": class_name,
         "count": total,
         "scope_dn": scope_dn,
         "filters": filters or {},
     }
+    # Present only when there is something to say, so a default run is
+    # byte-identical to what it was before the check existed.
+    if attribute_warnings:
+        response["warnings"] = attribute_warnings
+    return response
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

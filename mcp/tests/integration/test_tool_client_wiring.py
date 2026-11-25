@@ -31,7 +31,7 @@ thing the real APIC would receive.
 import pytest
 
 from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
-from niwashi_mcp.exceptions import FilterError
+from niwashi_mcp.exceptions import FilterError, UnknownAttributeError
 from tests.conftest import MINIMAL_DESCRIPTIONS, apic_response, make_ctx
 from tests.unit.test_client import FakeHTTPClient, _bd_set, _MockResponse, _sent
 
@@ -328,22 +328,59 @@ async def test_count_invalid_filter_attribute_raises_filter_error(catalogue_inde
 
 
 @pytest.mark.asyncio
-async def test_query_well_formed_but_nonexistent_attribute_does_not_raise(catalogue_index):
-    """Contrast case: a syntactically well-formed attribute name that simply
-    does not exist as a real fvBD property is NOT a FilterError — it builds
-    a valid eq() predicate and is sent to the APIC, which would silently
-    return no matches. build_filter() validates identifier syntax only, never
-    attribute existence; that distinction is exactly what the previous
-    FilterError tests must not blur."""
+async def test_query_well_formed_but_nonexistent_attribute_is_refused_before_any_request(
+    catalogue_index, monkeypatch
+):
+    """Contrast case: a syntactically well-formed attribute name that is not an
+    fvBD property is NOT a FilterError — `build_filter()` validates identifier
+    syntax only — but it is no longer sent either. The APIC answers it with an
+    empty 200, which reads as "there are none"; the catalogue knows better, so
+    the tool refuses with `UnknownAttributeError` and nothing reaches the
+    transport.
+
+    This test used to pin the opposite (the request *was* sent). It was
+    rewritten, not deleted: the FilterError/UnknownAttributeError distinction
+    it draws is still the thing it protects.
+    """
     from niwashi_mcp.main import query
 
+    monkeypatch.delenv("NIWASHI_MCP_STRICT_ATTRIBUTES", raising=False)
     client = _real_client(_MockResponse(200, apic_response([])))
     ctx = _tool_ctx(client, catalogue_index)
 
-    await query("fvBD", ctx, filters={"totallyNotARealProperty": "value"})
+    with pytest.raises(UnknownAttributeError) as excinfo:
+        await query("fvBD", ctx, filters={"totallyNotARealProperty": "value"})
+
+    assert excinfo.value.class_name == "fvBD"
+    assert excinfo.value.attribute == "totallyNotARealProperty"
+    # Not merely "no result": the transport itself was never touched.
+    assert client._client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_query_nonexistent_attribute_is_sent_and_flagged_when_not_strict(
+    catalogue_index, monkeypatch
+):
+    """The escape hatch: with NIWASHI_MCP_STRICT_ATTRIBUTES=false the same
+    request goes out exactly as it used to — the predicate reaches the APIC —
+    but the problem is surfaced in both places a caller can see it: the
+    result's `note` and `ctx.warning`. A relaxed check that stayed silent would
+    turn every typo back into an unexplained empty answer."""
+    from niwashi_mcp.main import query
+
+    monkeypatch.setenv("NIWASHI_MCP_STRICT_ATTRIBUTES", "false")
+    client = _real_client(_MockResponse(200, apic_response([])))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, filters={"totallyNotARealProperty": "value"})
 
     params = client._client.requests[0]["params"]
     assert 'eq(fvBD.totallyNotARealProperty,"value")' in params["query-target-filter"]
+    assert "totallyNotARealProperty" in envelope["note"]
+    assert any(
+        "totallyNotARealProperty" in str(call.args[0])
+        for call in ctx.warning.await_args_list
+    )
 
 
 # ── get_by_dn() → ApicClient.get_by_dn() ──────────────────────────────────────

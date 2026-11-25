@@ -271,3 +271,37 @@ def test_the_wrong_case_example_is_still_wrong():
 
     assert not class_exists("fvBd")
     assert class_exists("fvBD")
+
+
+# ── attribute validation: what the docstrings promise must be real ───────────
+
+
+def test_the_attribute_validation_surface_is_documented_and_implemented():
+    """`query` and `count` tell an agent what is refused, and what a relaxed
+    server adds to its answer. Each claim is pinned to the code that keeps it.
+
+    The relaxed-mode additions matter most: `count` promises a `warnings` key
+    that exists *only* in that mode, and `query` promises it lands in `note`.
+    An agent that reads a zero next to a warning knows the name may be wrong;
+    one whose docs never mentioned the key would read the zero as an answer.
+    """
+    var = "NIWASHI_MCP_STRICT_ATTRIBUTES"
+    assert var in inspect.getsource(main_mod._strict_attributes)
+
+    for tool in ("query", "count"):
+        doc = _doc(tool)
+        assert "UnknownAttributeError" in doc, f"{tool} no longer documents it"
+        assert var in doc, f"{tool} does not name the switch that relaxes it"
+    assert "UnknownAttributeError" in inspect.getsource(main_mod._attribute_problems)
+
+    assert '"warnings"' in _doc("count")
+    # Look at the code with the docstring removed, as the envelope test does:
+    # the docstring spells the key out, so scanning raw source would let the
+    # documentation satisfy an assertion about the implementation.
+    fn = ast.parse(textwrap.dedent(inspect.getsource(main_mod.count))).body[0]
+    fn.body = fn.body[1:]
+    assert "'warnings'" in ast.unparse(fn), "count documents `warnings` but never sets it"
+
+    # query reports the same condition through its existing `note`, not a new key.
+    assert "unchecked" in _doc("query")
+    assert "attribute_warnings" in inspect.getsource(main_mod.query)

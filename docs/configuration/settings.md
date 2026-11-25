@@ -24,6 +24,7 @@ graph LR
         E6["MCP_API_KEYS"]
         E8["MCP_HOST"]
         E9["MCP_ALLOW_NO_AUTH"]
+        E10["NIWASHI_MCP_STRICT_ATTRIBUTES"]
     end
 
     subgraph shell["process environment only"]
@@ -42,6 +43,7 @@ graph LR
         S2["ApiKeyMiddleware<br/>api_keys"]
         S3["uvicorn bind address"]
         S4["startup guard<br/>routable bind + no keys = refused"]
+        S5["query / count<br/>attribute validation mode"]
     end
 
     E1 --> A1
@@ -53,6 +55,7 @@ graph LR
     E8 --> S3
     E8 --> S4
     E9 --> S4
+    E10 --> S5
     X1 --> env
 ```
 
@@ -147,6 +150,27 @@ WARNING  niwashi-mcp  MCP_API_KEYS is not set — server is running WITHOUT auth
 
 ---
 
+## Attribute validation
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `NIWASHI_MCP_STRICT_ATTRIBUTES` | No | `true` | Whether `query` and `count` refuse an attribute (or `include_children` / `filter_expr` class) that the catalogue does not know. `false`, `0`, `no` or `off` (any case, surrounding whitespace ignored) turns refusal into a warning; **any other value, including a typo, keeps it strict** — a mistyped switch must not silently disable the check. |
+
+The APIC answers a filter on an unknown attribute with HTTP 200 and no results, which reads as "there are none". By default the server therefore checks every attribute name in `filters`, `order_by` and `filter_expr`, and every class in `include_children`, against the catalogue before sending, and raises `UnknownAttributeError` (or `UnknownClassError`) with the closest real names. See [`query` — Attribute validation](../tools/query.md#attribute-validation) for exactly what is checked.
+
+The catalogue describes **one APIC release**. A fabric on a newer one can legitimately carry an attribute or class the catalogue lacks, and strict mode would refuse it. Set the variable to `false` for that case:
+
+```dotenv
+NIWASHI_MCP_STRICT_ATTRIBUTES=false
+```
+
+Relaxed mode does not go quiet. The request is sent, and each unknown name is reported in the result — `note` for `query`, a `warnings` list for `count` — and logged as a warning. An empty result in that mode may mean the name is wrong, not that nothing matches.
+
+- Read on **every call**, not at startup: a change takes effect on the next request, without a restart. Because a `SIGHUP` reload re-reads `.env` into the process environment, editing the variable there and sending `kill -HUP` applies it too.
+- The class named by `class_name` is outside this switch — an unknown one always raises `UnknownClassError`.
+
+---
+
 ## Env file location
 
 | Variable | Required | Default | Description |
@@ -197,6 +221,9 @@ APIC_VERIFY_SSL=false
 MCP_HOST=127.0.0.1
 MCP_PORT=8000
 MCP_API_KEYS=abc123xyz,def456uvw
+
+# Optional — uncomment only for a fabric newer than the catalogue
+# NIWASHI_MCP_STRICT_ATTRIBUTES=false
 ```
 
 ---
