@@ -220,6 +220,13 @@ _REQUIRED_TABLES: dict[str, frozenset[str]] = {
     # subclasses. Quiet failure if it moved: the union silently shrinks to the
     # class's own properties and `query()` would refuse valid attributes.
     "inherits": frozenset({"class_id", "ancestor"}),
+    # `relation` carries what the `mo.residual` relation dicts do not: each
+    # relation's cardinality and whether it names its target or holds its DN.
+    # It is keyed by the relation class in *wire* notation (`fvRsCtx`), for the
+    # Rs class and again for its Rt twin. `annotate_relations` reads it. Quiet
+    # failure if the key moved to colon notation: every lookup would miss and
+    # `cardinality` would silently go back to empty.
+    "relation": frozenset({"rs_class", "rel_type", "cardinality"}),
 }
 
 _REQUIRED_MANIFEST_KEYS = frozenset({"prop_flags", "apic_version"})
@@ -237,6 +244,11 @@ _PROBE_CLASS = "fvBD"
 # own properties) and `fvBD` descends from it; no property name is pinned, only
 # that the union is strictly wider than the class's own list.
 _PROBE_ABSTRACT_CLASS = "fvABD"
+
+# Anchor for the relation annotation: `fv:RsCtx` is one of the most stable
+# relations in the model (n-to-1, named). Only that both fields come back
+# non-empty is asserted, not their values.
+_PROBE_RELATION = "fv:RsCtx"
 
 
 def verify_catalogue() -> None:
@@ -313,6 +325,19 @@ def verify_catalogue() -> None:
             f"concrete subclasses add no properties to its {len(own)} own — the "
             f"'inherits' table no longer carries colon-notation ancestors. "
             f"Pin niwaki>=2.2,<2.3."
+        )
+
+    # The relation annotation is a lookup by wire name, so a moved key or a
+    # repurposed column degrades it to "no row" without raising. Probed on a
+    # schema built here rather than on fvBD's own: the guard asserts the table's
+    # shape, not what any one class happens to declare.
+    stub = {"relationTo": {_PROBE_RELATION: {"targetClass": "", "cardinality": ""}}}
+    entry = annotate_relations(stub)["relationTo"][_PROBE_RELATION]
+    if not (entry["cardinality"] and entry.get("kind")):
+        raise DescriptionsLoadError(
+            f"niwaki {version}'s catalogue has no cardinality or kind for the "
+            f"'{_PROBE_RELATION}' relation — the 'relation' table no longer answers "
+            f"by wire-name class. Pin niwaki>=2.2,<2.3."
         )
 
 
@@ -664,8 +689,9 @@ def load_schema(
 
     # relationTo/relationFrom values are plain strings in the catalogue. The
     # dict form is kept for shape compatibility; `cardinality` is empty for all
-    # 2,992 entries, exactly as before — the real cardinality lives on the
-    # relation class itself.
+    # 2,992 entries, exactly as before. This function stays the faithful
+    # jsonmeta projection the oracle and the baseline pin, so the real
+    # cardinality is filled in on top of it, by `annotate_relations`.
     rel_to = extra.get("relationTo")
     if rel_to:
         result["relationTo"] = {
@@ -710,6 +736,59 @@ def load_schema(
             }
 
     return result
+
+
+def annotate_relations(schema: dict[str, Any]) -> dict[str, Any]:
+    """Say, for each relation in a :func:`load_schema` result, what it allows.
+
+    Fills ``cardinality`` and adds ``kind`` on every ``relationTo`` entry, and
+    adds both to every ``relationFrom`` entry, from the catalogue's ``relation``
+    table. Nothing existing changes meaning: ``targetClass`` and ``sourceClass``
+    stay as they were, and so do the keys.
+
+    * ``cardinality`` — the schema's own word for how many of the carrying
+      class may point at how many targets: ``1-to-1``, ``1-to-m``, ``n-to-1`` or
+      ``n-to-m``. Read source-to-target on both sides: ``fvBD`` -> ``fvRsCtx``
+      is ``n-to-1`` (many bridge domains, one VRF each), and so is the
+      ``relationFrom`` entry on ``fvCtx`` that mirrors it.
+    * ``kind`` — ``named`` when the relation holds the target's name, resolved
+      in scope (``tnFvCtxName``), ``explicit`` when it holds its DN (``tDn``).
+      This is what tells an agent which attribute of the relation object to
+      read, or to filter on.
+
+    Done here, on top of ``load_schema``, rather than inside it: ``load_schema``
+    is the projection that the baseline digests and the jsonmeta oracle pin,
+    and they record ``cardinality`` as empty. Annotating is a presentation of
+    the schema to an agent, like bounding its lists in ``main.get_schema``.
+
+    An entry the table does not describe keeps ``cardinality`` as it was (``""``
+    on ``relationTo``, absent on ``relationFrom``) and gets no ``kind``: 2 of
+    6,249 entries, both on ``fvCtx`` and both naming cloud relation classes
+    that are not in the catalogue at all. Absent is not a guess.
+
+    Mutates and returns ``schema`` — the dict is freshly built per call by
+    :func:`load_schema`, so there is no shared state to corrupt. One indexed
+    query per call, none when the class has no relations.
+    """
+    sections = [schema.get(k) for k in ("relationTo", "relationFrom")]
+    names = {name.replace(":", "") for section in sections for name in section or {}}
+    if not names:
+        return schema
+
+    found = {
+        rel: (cardinality, kind)
+        for rel, cardinality, kind in _query(
+            "SELECT rs_class, cardinality, rel_type FROM relation "
+            f"WHERE rs_class IN ({', '.join('?' * len(names))}) "
+            "AND cardinality IS NOT NULL AND rel_type IS NOT NULL",
+            tuple(sorted(names)),
+        )
+    }
+    for section in sections:
+        for name, entry in (section or {}).items():
+            if facts := found.get(name.replace(":", "")):
+                entry["cardinality"], entry["kind"] = facts
+    return schema
 
 
 # Labels that appear in virtually every ACI class and carry no discriminating

@@ -193,6 +193,48 @@ class TestInheritsDamage:
         catalog.known_properties.cache_clear()
 
 
+class TestRelationDamage:
+    """`relation` feeds the cardinality and kind `get_schema` reports.
+
+    The quiet failure: were `rs_class` to move to colon notation (`fv:RsCtx`),
+    every column would still exist and every query would still run, but no
+    relation would match — and `cardinality` would silently go back to empty on
+    every class.
+    """
+
+    def test_it_is_a_required_table(self):
+        assert catalog._REQUIRED_TABLES["relation"] >= {"rs_class", "rel_type", "cardinality"}
+
+    def test_a_dropped_table_is_named(self, broken_catalogue):
+        broken_catalogue("DROP TABLE relation")
+        with pytest.raises(DescriptionsLoadError, match="no 'relation' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE relation RENAME COLUMN rel_type TO kind")
+        with pytest.raises(DescriptionsLoadError, match="rel_type"):
+            catalog.verify_catalogue()
+
+    def test_a_key_moved_to_colon_notation_is_caught(self, broken_catalogue):
+        """Structurally intact; `fvRsCtx` becomes `fv:RsCtx` and nothing matches."""
+        broken_catalogue(
+            "UPDATE relation SET rs_class = substr(rs_class, 1, 2) || ':' || substr(rs_class, 3)"
+        )
+        with pytest.raises(DescriptionsLoadError, match="relation"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_table_is_caught(self, broken_catalogue):
+        broken_catalogue("DELETE FROM relation")
+        with pytest.raises(DescriptionsLoadError, match="relation"):
+            catalog.verify_catalogue()
+
+    def test_a_probe_class_without_relations_still_passes(self, broken_catalogue):
+        """The guard checks the table's shape, not what fvBD happens to declare."""
+        payload = zlib.compress(b'{"containedBy": {"fv:Tenant": ""}}')
+        broken_catalogue(f"UPDATE mo SET residual = x'{payload.hex()}' WHERE class_name = 'fvBD'")
+        catalog.verify_catalogue()
+
+
 class TestManifestDamage:
     def test_a_missing_manifest_key_is_named(self, broken_catalogue):
         broken_catalogue("DELETE FROM manifest WHERE key='apic_version'")

@@ -9,6 +9,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Added
 
+- **`get_schema` reports each relation's cardinality and how it names its
+  target.** `relationTo[*].cardinality` was `""` on all 2,992 entries and the
+  docs told agents not to branch on it: the relation dicts in the catalogue's
+  `residual` blob carry none. The `relation` table does, so `get_schema("fvBD")`
+  now returns `"fv:RsCtx": {"targetClass": "fv:Ctx", "cardinality": "n-to-1",
+  "kind": "named"}` — many bridge domains, one VRF each, and a name
+  (`tnFvCtxName`) rather than a DN. `kind` is `named` or `explicit` (`tDn` only,
+  no name attribute), which is what tells an agent whether a `tn…Name` attribute
+  is worth reading on the relation object. `relationFrom` entries gain the same
+  two keys, read from `sourceClass` to the class.
+
+  Additive: every existing key and `targetClass` / `sourceClass` value is as it
+  was. 6,247 of 6,249 entries are filled; the two the table has no row for, both
+  on `fvCtx` and both naming cloud relation classes absent from the catalogue,
+  keep `cardinality: ""` and get no `kind`. It costs one indexed query per call
+  (about 0.02 ms) and, for the 1,597 classes that have relations, a median 52
+  bytes — at most 2.4 KB, on the classes with the most.
+
+  Done in a new `catalog.annotate_relations()`, applied by the tool, and not in
+  `load_schema()`: that function is the projection the recorded baseline and the
+  jsonmeta oracle pin, and both record `cardinality` as empty. The baseline is
+  untouched and passes unmodified. `verify_catalogue()` now requires the
+  `relation` table and probes it, because its key is the relation class in wire
+  notation and a move to colon notation would make every lookup miss silently —
+  `cardinality` would just go back to empty. SKILL.md, the tool docstring and
+  the docs teach the two keys.
+
 - **`fields` projects `query` and `get_by_dn` results onto the attributes
   asked for.** A class carries ~40 attributes per object and `fetch_all` can
   hold 5,000 objects; an agent that needed a name and a state still received

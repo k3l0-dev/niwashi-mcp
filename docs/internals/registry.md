@@ -92,11 +92,12 @@ Tables the adapter reads:
 | `type_pool` | 3 458 | ACI model types and primitive base types |
 | `enum` | 3 947 | zlib-compressed JSON blobs of enumerated values |
 | `manifest` | 17 | Build metadata |
+| `relation` | 3 027 | One row per relation class, keyed by its Rs *and* its Rt class (field for field the same), plus a few abstract bases with no endpoints. Read for `cardinality` and `rel_type` (`kind`) by `annotate_relations()` |
+| `inherits` | 45 496 | Every ancestor of every class, in colon notation. Read for an abstract class's property union |
 
-The catalogue also carries `relation`, `inherits`, `subclass`, `fault`,
-`scopemeta`, `name_override` and an FTS index. None of them is read here — this
-server derives relations from the `mo` residual blob and ranks with its own
-scorer.
+The catalogue also carries `subclass`, `fault`, `scopemeta`, `name_override` and
+an FTS index. None of them is read here — the relation *endpoints* still come
+from the `mo` residual blob, and ranking uses this server's own scorer.
 
 ### Connection and caches
 
@@ -195,8 +196,20 @@ stay in colon notation, which is a real asymmetry a caller has to know about.
 
 `relationTo` values are plain strings in the catalogue. The dict shape
 (`{targetClass, cardinality}`) is kept for compatibility, and **`cardinality` is
-`""` for all 2 992 entries** across 1 497 distinct relation classes — as it was
-before 2.0. The real cardinality lives on the relation class itself.
+`""` for all 2 992 entries** across 1 497 distinct relation classes in
+`load_schema()`'s output — the residual blob does not carry it. That function is
+what the baseline digests and the jsonmeta oracle pin, so it is left alone.
+
+The real cardinality is in the `relation` table, and `annotate_relations()` puts
+it on top: one `SELECT … WHERE rs_class IN (…)` for the relations of the class at
+hand, run by the `get_schema` tool after `load_schema()` and before the lists are
+bounded. It fills `cardinality` and adds `kind` (`named` or `explicit`) to every
+`relationTo` entry, and adds both to every `relationFrom` entry. An entry the
+table has no row for — two of 6 249, both on `fvCtx`, both naming cloud relation
+classes absent from the catalogue — is left as it was. `verify_catalogue()`
+requires the table and probes `fv:RsCtx`: the key is the relation class in wire
+notation, and were it to move to colon notation every lookup would miss and
+`cardinality` would quietly go back to empty.
 
 ### property_details
 

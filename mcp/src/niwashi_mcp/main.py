@@ -612,14 +612,22 @@ async def get_schema(
                         applies to `containedByTruncated`.  The sample loses
                         nothing actionable — every pattern ends in the same
                         suffix, which is what `rnFormat` already gives you.
-      relationTo     — outgoing Rs relations: {relClass: {targetClass, cardinality}}
+      relationTo     — outgoing Rs relations:
+                        {relClass: {targetClass, cardinality, kind}}
                         Keys and targetClass keep their "pkg:Class" colon
                         notation — unlike `contains`, they are NOT flattened,
                         so strip the colon before querying.  `cardinality` is
-                        empty for every entry on the current schema bundle;
-                        the real value lives on the relation class itself.
-      relationFrom   — incoming Rt relations: {relClass: {sourceClass}}, also
-                        in colon notation
+                        "1-to-1", "1-to-m", "n-to-1" or "n-to-m", read from
+                        this class to the target ("n-to-1": many of these, one
+                        target each).  `kind` is "named" when the relation holds
+                        the target's name (tnFvCtxName, resolved in scope) or
+                        "explicit" when it holds its DN (tDn).  A relation to a
+                        cloud class the catalogue does not describe has no
+                        `kind` and an empty `cardinality`.
+      relationFrom   — incoming Rt relations:
+                        {relClass: {sourceClass, cardinality, kind}}, also in
+                        colon notation; `cardinality` and `kind` describe the
+                        relation as the source declares it, as above
       properties     — sorted list of all available attribute names
       property_details — compact per-property constraints; present ONLY when
                         include_property_details=True or properties_filter is set
@@ -671,6 +679,7 @@ async def get_schema(
         properties_filter=properties_filter,
     )
     if schema:
+        catalog.annotate_relations(schema)
         _bound_schema_lists(schema, max(1, min(list_limit, _SCHEMA_LIST_MAX)))
         await ctx.info(f"get_schema({class_name!r}) → OK")
     else:

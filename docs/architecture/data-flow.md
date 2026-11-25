@@ -136,7 +136,7 @@ sequenceDiagram
 Four points about that output are easy to get wrong:
 
 - **Property names are wire names.** `descr`, not `description`. The catalogue also stores a readable name for each property; this server never reads it, because a readable name is syntactically valid to the APIC and comes back with `[]` and no error.
-- **`relationTo[*].cardinality` is empty for every entry.** That has always been true and is unchanged in 2.0 — the real cardinality lives on the relation class itself.
+- **`relationTo[*].cardinality` is empty in `load_schema()`'s own output.** The relation dicts in the residual blob carry none, and `load_schema()` stays the faithful projection the baseline pins. The `get_schema` tool fills it, and adds `kind` (and both keys to `relationFrom`), from the `relation` table via `catalog.annotate_relations()` — one indexed lookup per call.
 - **An unknown class returns `{}`, not an exception.** An agent recovers from an empty result; it does not recover from a traceback. The only exception this path raises is `DescriptionsLoadError`, and it means the catalogue is missing or unreadable — a broken installation, not a missing class.
 - **`contains` is flattened, `relationTo` and `relationFrom` are not.** Strip the colon before querying a relation class.
 

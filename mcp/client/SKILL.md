@@ -308,9 +308,9 @@ with `UnknownAttributeError` (section 5, Attribute validation).
 
 ```json
 "relationTo": {
-  "fv:RsCtx":       {"targetClass": "fv:Ctx",       "cardinality": ""},
-  "fv:RsBDToOut":   {"targetClass": "l3ext:Out",    "cardinality": ""},
-  "fv:RsBdFloodTo": {"targetClass": "vz:Filter",     "cardinality": ""}
+  "fv:RsCtx":       {"targetClass": "fv:Ctx",    "cardinality": "n-to-1", "kind": "named"},
+  "fv:RsBDToOut":   {"targetClass": "l3ext:Out", "cardinality": "n-to-m", "kind": "named"},
+  "fv:RsBdFloodTo": {"targetClass": "vz:Filter", "cardinality": "n-to-m", "kind": "explicit"}
 }
 ```
 
@@ -321,15 +321,30 @@ Each key is a **Relation Source (Rs)** class — an intermediate object that
 lives under this MO and holds the reference to the target.
 See section 8 for how to traverse it.
 
+- `cardinality` is `1-to-1`, `1-to-m`, `n-to-1` or `n-to-m`, read from this
+  class to the target. `n-to-1` on `fv:RsCtx` means many bridge domains may
+  each point at one VRF: a bridge domain has at most one `fvRsCtx`. `n-to-m`
+  means it may hold several. Use it to decide whether to expect one relation
+  object or a list.
+- `kind` is `named` when the relation holds the target's *name* (`fvRsCtx` →
+  `tnFvCtxName`, resolved in scope) or `explicit` when it holds its *DN*
+  (`tDn` only). It tells you which attribute of the relation object is worth
+  reading — see "Finding the target" in section 8.
+- A relation to a cloud class the catalogue does not describe (two exist, both
+  on `fvCtx`) has `cardinality: ""` and no `kind`. An empty value means *not
+  stated*, not "none".
+
 ### `relationFrom` — incoming Rt relations (another object → this one)
 
 ```json
 "relationFrom": {
-  "fv:RtCtx": {"sourceClass": "fv:ABDPol"}
+  "fv:RtCtx": {"sourceClass": "fv:ABDPol", "cardinality": "n-to-1", "kind": "named"}
 }
 ```
 
 Note the key keeps its colon notation (`fv:RtCtx`), unlike `contains`, which is flattened.
+`cardinality` and `kind` are the relation's own, as above: read from
+`sourceClass` to this class, so `n-to-1` here is many bridge domains, one VRF.
 
 Reverse lookups: which objects of `sourceClass` point to this one. This is the
 equivalent of the APIC UI's **Show Usage** — the APIC materialises an Rt object
@@ -830,7 +845,8 @@ classes, about 20%.** The other 1189 are `explicit` and carry no `tn*Name`
 at all. (1531 classes inherit from `reln:To`; the 32-class difference is
 abstract bases that are never instantiated.) Reading
 `tnFvCtxName` off one of those returns nothing, which is easy to mistake for
-"not configured".
+"not configured". `get_schema` tells you which kind a relation is: its
+`kind` in `relationTo` is `named` or `explicit`.
 
 So: read `tDn`. Fall back to a `tn*Name` only when `tDn` is empty and you
 have confirmed the attribute exists in `get_schema().properties`. A handful
@@ -1100,7 +1116,8 @@ a sample object without filters to observe the actual values in context.
 
 2. get_schema("fvBD")
    → identifiedBy=["name"], containedBy=["fv:Tenant"],
-     relationTo={"fv:RsCtx": {"targetClass": "fv:Ctx", "cardinality": ""}}
+     relationTo={"fv:RsCtx": {"targetClass": "fv:Ctx", "cardinality": "n-to-1",
+                              "kind": "named"}}
      (colon notation on both — strip it to query: fv:RsCtx → fvRsCtx)
 
 3. query("fvTenant", filters={"name": "OT"})

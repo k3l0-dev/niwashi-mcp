@@ -324,9 +324,9 @@ client config only needs its URL to keep working.
 | `SchemaLoadError` can no longer be raised | A missing or unreadable catalogue raises `DescriptionsLoadError` instead |
 
 Everything else holds: the same five tools, the same search scoring, the same
-APIC client with its cookie authentication, retry and pagination, and
-`relationTo[*].cardinality` still empty on every entry — the real cardinality
-lives on the relation class itself.
+APIC client with its cookie authentication, retry and pagination. One later
+addition to `get_schema`: `relationTo[*].cardinality`, empty on every entry in 1.x
+and 2.0, is now filled in and has a `kind` beside it.
 
 Full detail, including what was measured to prove the swap changed nothing:
 [CHANGELOG.md](CHANGELOG.md).

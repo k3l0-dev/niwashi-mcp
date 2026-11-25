@@ -47,8 +47,8 @@ the class actually has something to report:
 | `classPkg` | `str` | yes | Package prefix, e.g. `"fv"` |
 | `label` | `str` | yes | Human-readable label |
 | `contains` | `list[str]` | no — 6,167 of 15,452 classes | Sorted child class names this object may hold, in **flat** notation (e.g. `"fvSubnet"`, `"tagTag"`) — ready to pass to `get_schema`, `query`, or `include_children` |
-| `relationTo` | `dict` | no — 1,017 classes | Outgoing Rs relations: `{relClass: {targetClass, cardinality}}`. Keys and `targetClass` keep `pkg:Class` colon notation (unlike `contains`); `cardinality` is always empty — see [Reading relationTo](#reading-relationto) |
-| `relationFrom` | `dict` | no — 994 classes | Incoming Rt relations: `{relClass: {sourceClass}}`, also in colon notation |
+| `relationTo` | `dict` | no — 1,017 classes | Outgoing Rs relations: `{relClass: {targetClass, cardinality, kind}}`. Keys and `targetClass` keep `pkg:Class` colon notation (unlike `contains`); `cardinality` says how many, `kind` how the target is named — see [Reading relationTo](#reading-relationto) |
+| `relationFrom` | `dict` | no — 994 classes | Incoming Rt relations: `{relClass: {sourceClass, cardinality, kind}}`, also in colon notation; `cardinality` and `kind` are the relation's own, read from `sourceClass` to this class |
 | `property_details` | `dict` | no — on request | Compact per-property constraints. **Present only** when `include_property_details=True` or `properties_filter` is set. |
 | `dnFormatsTruncated` | `dict` | no — 7 classes at the default | `{returned, total, note}`, present only when `dnFormats` was sampled — see [Sampled lists](#sampled-lists) |
 | `containedByTruncated` | `dict` | no — 7 classes at the default | `{returned, total, note}`, present only when `containedBy` was sampled |
@@ -140,11 +140,13 @@ position. Nothing else about these properties changed: `type`, `access`,
   "relationTo": {
     "fv:RsCtx": {
       "targetClass": "fv:Ctx",
-      "cardinality": ""
+      "cardinality": "n-to-1",
+      "kind": "named"
     },
     "fv:RsBDToOut": {
       "targetClass": "l3ext:Out",
-      "cardinality": ""
+      "cardinality": "n-to-m",
+      "kind": "named"
     }
   },
   "properties": ["arpFlood", "descr", "dn", "epMoveDetectMode", "ipLearning",
@@ -269,20 +271,37 @@ verify against the 1.x jsonmeta oracle.
 "relationTo": {
   "fv:RsCtx": {
     "targetClass": "fv:Ctx",
-    "cardinality": ""
+    "cardinality": "n-to-1",
+    "kind": "named"
   }
 }
 ```
 
-Two things to note before using this, because both differ from `contains`:
+Three things to note before using this:
 
 - **The keys and `targetClass` keep their `pkg:Class` colon notation.** Unlike
   `contains`, which is flattened for you, these are not. Drop the colon to get
   the queryable class name: `fv:RsCtx` → `fvRsCtx`, `fv:Ctx` → `fvCtx`.
-- **`cardinality` is always empty.** It is `""` for all 2,992 `relationTo`
-  entries in the catalogue, so do not branch on it and do not report it. The
-  key is kept for shape stability only; `get_schema()` on the relation class
-  itself does not expose it either.
+- **`cardinality` is `1-to-1`, `1-to-m`, `n-to-1` or `n-to-m`**, read from the
+  class to its target. `n-to-1` on `fv:RsCtx` means many bridge domains each
+  point at one VRF — a bridge domain holds at most one `fvRsCtx`; `n-to-m` means
+  it may hold several. It used to be `""` on every entry, because the relation
+  dicts in the catalogue's `residual` blob carry no cardinality; it now comes
+  from the catalogue's `relation` table.
+- **`kind` says how the relation names its target.** `named` holds the target's
+  name (`tnFvCtxName` on `fvRsCtx`), resolved in scope; `explicit` holds its DN
+  (`tDn`) and carries no name attribute. `tDn` is on every relation object either
+  way, so read it first; `kind` tells you whether a `tn…Name` attribute is worth
+  looking for.
+
+`relationFrom` entries gain the same two keys next to `sourceClass`. They are
+the relation's own, read from `sourceClass` to this class, so `fvCtx`'s
+`fv:RtCtx` is also `n-to-1` and `named`.
+
+Two of the 6,249 `relationTo` and `relationFrom` entries in the catalogue — both
+on `fvCtx` — name cloud relation classes the catalogue does not contain. They
+keep `cardinality: ""` and have no `kind`; an empty value there means *not
+stated*.
 
 `fvBD` has an outgoing relation to `fvCtx` (VRF) via the relation class `fvRsCtx`. To find which VRF a BD is associated with:
 
