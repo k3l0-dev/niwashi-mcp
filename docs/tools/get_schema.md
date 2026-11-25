@@ -324,8 +324,9 @@ causes, in order of likelihood:
   keys and `containedBy` entries keep their colon: pass `fvCtx`, not `fv:Ctx`.
 - **The class is newer than the catalogue.** The catalogue ships inside the
   `niwaki` dependency and is built from APIC **6.0(9c)**; a class introduced in
-  a later APIC release is not in it. That release is logged at startup — check
-  it against your fabric's own version before assuming a typo.
+  a later APIC release is not in it. That release is logged at startup, and
+  the server compares it with your fabric's own and warns when they differ —
+  check that line before assuming a typo.
 
 A class being absent from `search_classes()` results is *not* one of the causes:
 213 catalogue classes are unindexed and still resolve here. See

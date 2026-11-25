@@ -30,6 +30,7 @@ classDiagram
         +query_class(class_name, filters, scope_dn, ...) QueryResult
         +get_by_dn(dn, config_only, include_children) dict | None
         +count_class(class_name, filters, scope_dn, filter_expr) int
+        +controller_version() str | None
         +close() None
     }
 
@@ -218,9 +219,34 @@ Measured on an APIC 6.0(9c) simulator; the `moCount` behaviour has not been re-c
 
 ---
 
+## `controller_version()` — the fabric's own release
+
+One GET, called once at startup after the login (see the [startup sequence](../architecture/overview.md#startup-sequence)):
+
+```text
+GET /api/class/firmwareCtrlrRunning.json
+    ?query-target-filter=eq(firmwareCtrlrRunning.type,"controller")
+→ imdata[0].firmwareCtrlrRunning.attributes.version        e.g. "apic-6.0(9c)"
+```
+
+The class also carries switch and plugin firmware, hence the `type == "controller"` filter. `firmwareCtrlrRunning` and both attributes are in the shipped catalogue (`tests/unit/test_fabric_version.py` checks they stay there). The filter is built by `build_filter()` like every other, and the request goes through `_request_json()`, so it re-authenticates on 401/403 and retries transient failures with everything else.
+
+It returns the string **as the APIC wrote it**, stripped. Reading it is not this method's job: `niwashi_mcp.apic.version.normalise_apic_version()` turns `apic-6.0(9c)`, `APIC-6.0(9C)` and `6.0(9c)` into one canonical form so they compare equal, and returns `None` for anything that is not a release string, so an unfamiliar format is "unknown" rather than "different".
+
+| Outcome | Result |
+|---|---|
+| An object with a usable `version` | the stripped string |
+| `imdata` empty — no controller firmware object | `None` — nothing reported is an answer, not an error |
+| An object that arrived but has no usable `version` (missing, blank, not a string, wrong class) | `ApicResponseError` — malformed, which must not read as "nothing reported" |
+| Any transport or auth failure | the usual `Apic*Error` |
+
+A cluster answers with one object per controller; only `imdata[0]` is read. `check_fabric_version()` in `apic/version.py` is the only caller, and it catches everything this method can raise: the lookup is advisory and never stops startup.
+
+---
+
 ## Retry and backoff
 
-`query_class()`, `get_by_dn()`, and `count_class()` all funnel through one shared method, `_request_json()` — the single transport path for every read this client makes. It retries up to `retry_attempts` total attempts (default 3) with exponential backoff (`_backoff_delay`: `base × 2^(attempt-1)`, capped at 2.0 s) for:
+`query_class()`, `get_by_dn()`, `count_class()` and `controller_version()` all funnel through one shared method, `_request_json()` — the single transport path for every read this client makes. It retries up to `retry_attempts` total attempts (default 3) with exponential backoff (`_backoff_delay`: `base × 2^(attempt-1)`, capped at 2.0 s) for:
 
 - Connection-level errors (`httpx.TimeoutException`, `httpx.ConnectError`)
 - HTTP statuses in `_TRANSIENT_STATUSES` = `{404, 500, 502, 503, 504}` — 404 is deliberately included here: nothing in this client ever reaches the backend with a genuinely-unverified class name or treats a missing object as a 404 (see the constant's docstring in `client.py`), so an observed 404 is presumed to be infrastructure noise, not a real "not found"

@@ -852,6 +852,61 @@ class ApicClient:
         logger.debug("count_class(%s) → %d", class_name, count)
         return count
 
+    async def controller_version(self) -> str | None:
+        """The firmware version the APIC controller is running, as it reports it.
+
+        One GET of `firmwareCtrlrRunning` filtered to `type == "controller"`
+        (the class also carries switch and plugin firmware), reading
+        `version` off the first object returned. The class and both attributes
+        are in the shipped catalogue; tests/unit/test_fabric_version.py checks
+        that they stay there. A cluster answers with one object per controller,
+        and only the first is read: a rolling upgrade can leave controllers on
+        different releases, and this reports the one that answered first, not
+        a consensus.
+
+        The string is returned exactly as the APIC wrote it, e.g. "apic-6.0(9c)"
+        or "6.0(9c)" — interpreting it is niwashi_mcp.apic.version's job, so that
+        a format this client has never seen is still reported rather than
+        discarded here.
+
+        Goes through the same GET path as every other read, so it re-authenticates
+        on 401/403 and retries transient failures like any query.
+
+        Returns:
+            The version string, or None when the APIC returned no controller
+            firmware object — "nothing reported", which is not an error.
+
+        Raises:
+            ApicConnectionError / ApicAuthError / ApicRequestError on transport
+            or protocol failures (see _request_json).
+            ApicResponseError: an object came back but carries no usable
+            `version` attribute — malformed, as opposed to absent.
+        """
+        url = f"{self._base}/api/class/firmwareCtrlrRunning.json"
+        params = {
+            "query-target-filter": build_filter(
+                "firmwareCtrlrRunning", {"type": "controller"}
+            )
+        }
+        body = await self._request_json(url, params)
+        imdata = body["imdata"]
+        if not imdata:
+            logger.debug("controller_version() → no firmwareCtrlrRunning object")
+            return None
+
+        try:
+            version = imdata[0]["firmwareCtrlrRunning"]["attributes"]["version"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ApicResponseError(
+                url, f"firmwareCtrlrRunning object has no usable version: {exc!r}"
+            ) from exc
+        if not isinstance(version, str) or not version.strip():
+            raise ApicResponseError(
+                url, f"firmwareCtrlrRunning version is not a non-empty string: {version!r}"
+            )
+        logger.debug("controller_version() → %s", version)
+        return version.strip()
+
     async def close(self) -> None:
         """Release the underlying HTTP connection pool."""
         await self._client.aclose()

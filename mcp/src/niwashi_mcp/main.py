@@ -95,6 +95,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator
 
 from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
+from niwashi_mcp.apic.version import check_fabric_version
 from niwashi_mcp.exceptions import ConfigurationError, UnknownClassError
 from niwashi_mcp.middleware.auth import ApiKeyMiddleware, KeyStore, load_api_keys
 from niwashi_mcp.middleware.health import HealthMiddleware
@@ -270,8 +271,12 @@ async def app_lifespan(server: FastMCP):
     """Load registry and connect to the APIC at startup; close on shutdown.
 
     Yields a context dict available to all tools via ctx.lifespan_context:
-      descriptions  — in-memory class descriptions index
-      backend       — ApicClient instance
+      descriptions   — in-memory class descriptions index
+      backend        — ApicClient instance
+      fabric_version — the APIC release the connected fabric reports, in
+                       canonical form ("6.0(9c)"), or None when it could not be
+                       read or understood. Compared with the catalogue's
+                       release at startup; a mismatch is logged, never fatal.
     """
     load_dotenv(ENV_FILE)
 
@@ -337,9 +342,15 @@ async def app_lifespan(server: FastMCP):
     logger.info("Connected to APIC — %s", host)
 
     try:
+        # The release logged above ("niwaki catalogue, APIC x") is the one the
+        # object model describes; it says nothing about the fabric this server
+        # is now talking to. Ask the fabric, and warn if the two differ. Never
+        # raises and never stops startup — see check_fabric_version.
+        fabric_version = await check_fabric_version(backend, catalog.apic_version())
         yield {
             "descriptions": descriptions,
             "backend": backend,
+            "fabric_version": fabric_version,
         }
     finally:
         await backend.close()

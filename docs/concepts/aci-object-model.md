@@ -154,7 +154,7 @@ The server does not ask the APIC what its object model looks like, and it does n
 
 Two consequences worth knowing:
 
-- **The model version is pinned by a dependency, not chosen by the operator.** The catalogue is built from APIC 6.0(9c); the version is logged at startup so a silent `niwaki` upgrade cannot change the object model an agent reasons about without leaving a trace.
+- **The model version is pinned by a dependency, not chosen by the operator.** The catalogue is built from APIC 6.0(9c); the version is logged at startup so a silent `niwaki` upgrade cannot change the object model an agent reasons about without leaving a trace, and it is compared with the release your fabric reports so that a gap between the two is a warning rather than a surprise (see [SUPPORTED-APIC.md](../../SUPPORTED-APIC.md)).
 - **The catalogue describes the model, never your fabric.** Whether a class exists is answered locally; whether *your* fabric holds any objects of it is answered only by `query()` or `count()` against the APIC.
 
 ---

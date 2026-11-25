@@ -74,6 +74,7 @@ Startup looks like this (the FastMCP banner is omitted):
 2026-08-08 10:58:42,939  WARNING   niwashi-mcp  MCP_API_KEYS is not set — server is running WITHOUT authentication. Set MCP_API_KEYS in .env before deploying to production.
 2026-08-08 10:58:43,311  INFO      niwashi-mcp  Registry loaded — 15239 class descriptions (niwaki catalogue, APIC 6.0(9c))
 2026-08-08 10:58:43,323  INFO      niwashi-mcp  Connected to APIC — your-apic.example.com
+2026-08-08 10:58:43,401  INFO      niwashi-mcp.apic  Fabric runs APIC 6.0(9c), matching the object-model catalogue
 [08/08/26 10:58:43] INFO     Starting MCP server 'niwashi-mcp' with transport 'http' (stateless) on http://0.0.0.0:8000/mcp
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 ```
@@ -83,6 +84,11 @@ comes out before the HTTP server exists at all; the registry and APIC lines come
 from the FastMCP lifespan, which only runs once the server starts serving. A
 process that dies after the registry line has a credentials or reachability
 problem, not a data problem.
+
+The last line compares your fabric's APIC release with the one the catalogue
+describes. If they differ you get a `WARNING` instead, naming both — see
+[SUPPORTED-APIC.md](../../SUPPORTED-APIC.md). It is advisory: the server starts
+either way.
 
 The number in that registry line is not the number of ACI classes. **15 239** is
 the size of the search index — the classes `search_classes` can find. **15 452**
