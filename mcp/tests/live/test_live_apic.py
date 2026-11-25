@@ -187,3 +187,107 @@ async def test_query_class_bad_filter_expr_raises_apic_request_error(live_client
         )
     assert exc_info.value.status == 400
     assert exc_info.value.apic_text
+
+
+# ── fetch_all and the fabric version — what only a real APIC can confirm ─────
+#
+# Both of these were written against the documented shape of the APIC's
+# answers, and neither had been run against a fabric when it was added: the unit
+# tests prove the logic, these prove the assumptions (that an APIC accepts
+# page-size=200 and keeps totalCount stable across pages; that a controller
+# reports its release in a form niwashi_mcp.apic.version can read).
+
+
+async def test_fetch_all_walks_a_multi_page_class_to_its_total(live_client):
+    """fvBD on the lab fabric has more than one 200-object page; a fetch_all
+    walk must return exactly totalCount distinct objects and say it is complete."""
+    probe = await live_client.query_class("fvBD", {}, limit=1)
+    if not 200 < probe.total_available <= 5000:
+        pytest.skip(
+            f"fvBD has {probe.total_available} objects here; this test needs "
+            "more than one 200-object page and fewer than the 5,000 cap"
+        )
+
+    result = await live_client.query_class("fvBD", {}, fetch_all=True)
+
+    assert result.complete is True
+    assert result.total_available == probe.total_available
+    assert len(result.objects) == result.total_available
+    assert len({o["dn"] for o in result.objects}) == len(result.objects), (
+        "a page boundary repeated or dropped an object"
+    )
+
+
+async def test_controller_version_is_a_release_string_we_can_read(live_client):
+    """The fabric's own answer must parse, or the startup check degrades to
+    "unknown" on every real fabric."""
+    from niwashi_mcp.apic.version import normalise_apic_version
+
+    reported = await live_client.controller_version()
+
+    assert reported, "the APIC reported no controller firmware version"
+    assert normalise_apic_version(reported) is not None, (
+        f"firmwareCtrlrRunning.version {reported!r} is not in a format "
+        "normalise_apic_version understands — teach it, or the version check is blind"
+    )
+
+
+# ── A value the APIC refuses is an error, not an answer ───────────────────────
+#
+# Measured on APIC 6.0(9c): an `eq`/`ne` filter whose value is not valid for its
+# attribute is answered `HTTP/1.1 301 Moved Permanently` — no Location header,
+# body `{"totalCount": "1", "imdata": [{"error": {"attributes": {"code": "301",
+# "text": "Incorrect filter format for <class>.<attr>, value '<v>' is not
+# valid"}}}]}`. The 301 is the APIC's own error code used as the status, not a
+# redirect. The client used to parse that body as data: count() returned its
+# totalCount ("1") for a code that does not exist, and query() returned the error
+# object as a row. All read-only GETs; nothing is written.
+
+
+async def test_an_invalid_enum_value_raises_with_the_apics_reason(live_client):
+    """`unicastRoute` is yes|no; "False" is the value that was measured."""
+    with pytest.raises(ApicRequestError) as caught:
+        await live_client.query_class("fvBD", {"unicastRoute": "False"}, limit=1)
+
+    assert caught.value.status == 301, "the APIC's answer to an invalid value has changed"
+    assert caught.value.apic_code == "301"
+    assert "fvBD.unicastRoute" in caught.value.apic_text
+
+
+async def test_count_of_a_code_the_apic_refuses_raises_instead_of_counting_one(live_client):
+    """The eval's 13 bogus counts: eq(faultInst.code, <not a defined code>)."""
+    with pytest.raises(ApicRequestError, match="Incorrect filter format"):
+        await live_client.count_class(
+            "faultInst", {}, filter_expr='eq(faultInst.code,"F0526")'
+        )
+
+
+async def test_a_dn_filter_with_a_star_raises_instead_of_returning_an_error_row(live_client):
+    """The eval's fvCtx query: the second operand ('x') is the invalid value."""
+    with pytest.raises(ApicRequestError, match="Incorrect filter format"):
+        await live_client.query_class(
+            "fvCtx",
+            {},
+            filter_expr='or(eq(fvCtx.dn,"uni/tn-common/ctx-*"),eq(fvCtx.dn,"x"))',
+            fetch_all=True,
+        )
+
+
+async def test_a_refused_value_inside_and_or_ne_raises_too(live_client):
+    with pytest.raises(ApicRequestError, match="Incorrect filter format"):
+        await live_client.count_class(
+            "fvBD", {}, filter_expr='and(eq(fvBD.name,"x"),eq(fvBD.unicastRoute,"False"))'
+        )
+    with pytest.raises(ApicRequestError, match="Incorrect filter format"):
+        await live_client.count_class(
+            "faultInst", {}, filter_expr='ne(faultInst.code,"F9999")'
+        )
+
+
+async def test_a_value_the_apic_accepts_still_answers(live_client):
+    """The guard must not refuse what the APIC answers: a valid enum value, and a
+    wcard on the same attribute (a string match, which the APIC does not validate)."""
+    assert await live_client.count_class("fvBD", {"unicastRoute": "yes"}) >= 0
+    assert await live_client.count_class(
+        "faultInst", {}, filter_expr='wcard(faultInst.code,"F0526")'
+    ) >= 0

@@ -2,10 +2,11 @@
 """The catalogue schema guard.
 
 `registry/catalog.py` reads niwaki's embedded SQLite catalogue with hand-written
-SQL against tables — `mo`, `prop`, `comment_pool`, `label_pool`, `type_pool`,
-`enum`, `manifest` — that are **private** to niwaki. Its public API is
-`Niwaki` / `AsyncNiwaki` / `models`, and none of these appear in it, so any 1.x
-release may restructure them without breaking SemVer.
+SQL against tables — `mo`, `prop_sig`, `class_prop`, `comment_pool`,
+`label_pool`, `type_pool`, `enum`, `manifest` — that are **private** to niwaki.
+Its public API is `Niwaki` / `AsyncNiwaki` / `models`, and none of these appear
+in it, so any release may restructure them without breaking SemVer — 2.1 did,
+splitting `prop` into `prop_sig` and `class_prop`.
 
 Some of those changes fail loudly on their own: a renamed table raises
 `OperationalError` on the first query. The ones worth building a guard for are
@@ -108,8 +109,19 @@ class TestStructuralDamage:
             catalog.verify_catalogue()
 
     def test_a_dropped_prop_column_is_named(self, broken_catalogue):
-        broken_catalogue("ALTER TABLE prop DROP COLUMN default_val")
+        broken_catalogue("ALTER TABLE prop_sig DROP COLUMN default_val")
         with pytest.raises(DescriptionsLoadError, match="default_val"):
+            catalog.verify_catalogue()
+
+    def test_a_dropped_class_prop_table_is_named(self, broken_catalogue):
+        """The table a class's properties are found through, which 2.1 introduced."""
+        broken_catalogue("DROP TABLE class_prop")
+        with pytest.raises(DescriptionsLoadError, match="no 'class_prop' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_class_prop_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE class_prop RENAME COLUMN sig_id TO signature_id")
+        with pytest.raises(DescriptionsLoadError, match="sig_id"):
             catalog.verify_catalogue()
 
     def test_the_error_names_the_niwaki_release(self, broken_catalogue):
@@ -118,7 +130,7 @@ class TestStructuralDamage:
         with pytest.raises(DescriptionsLoadError) as excinfo:
             catalog.verify_catalogue()
         assert "niwaki" in str(excinfo.value)
-        assert "1.9" in str(excinfo.value), "the message should say what to pin"
+        assert "2.3" in str(excinfo.value), "the message should say what to pin"
 
     def test_a_missing_table_reports_the_table_not_its_columns(self, broken_catalogue):
         """Pins the table branch specifically.
@@ -136,6 +148,126 @@ class TestStructuralDamage:
         assert "no 'type_pool' table" in str(excinfo.value)
 
 
+class TestInheritsDamage:
+    """`inherits` feeds `known_properties`' abstract-class union.
+
+    It is the one table read for a purpose the startup probe on `fvBD` never
+    touches, so it needs its own structural and functional guard. The quiet
+    failure is the dangerous one: were `ancestor` stored without the colon,
+    every query would still run and every concrete class would still be
+    right, but an abstract class's union would silently shrink to its own
+    properties and valid attributes would be refused.
+    """
+
+    def test_it_is_a_required_table(self):
+        assert catalog._REQUIRED_TABLES["inherits"] == {"class_id", "ancestor"}
+
+    def test_a_dropped_table_is_named(self, broken_catalogue):
+        broken_catalogue("DROP TABLE inherits")
+        with pytest.raises(DescriptionsLoadError, match="no 'inherits' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE inherits RENAME COLUMN ancestor TO parent")
+        with pytest.raises(DescriptionsLoadError, match="ancestor"):
+            catalog.verify_catalogue()
+
+    def test_a_changed_ancestor_notation_is_caught(self, broken_catalogue):
+        """Structurally intact; every ancestor `fv:ABD` becomes `fvABD`."""
+        broken_catalogue("UPDATE inherits SET ancestor = replace(ancestor, ':', '')")
+        with pytest.raises(DescriptionsLoadError, match="inherits"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_table_is_caught(self, broken_catalogue):
+        broken_catalogue("DELETE FROM inherits")
+        with pytest.raises(DescriptionsLoadError, match="inherits"):
+            catalog.verify_catalogue()
+
+    def test_a_cached_union_cannot_mask_the_damage(self, broken_catalogue):
+        """The functional check must read the database, not a union remembered
+        from the healthy catalogue — `known_properties` is lru_cached."""
+        assert "hostBasedRouting" in catalog.known_properties("fvABD")  # primes the cache
+        broken_catalogue("DELETE FROM inherits")
+        with pytest.raises(DescriptionsLoadError, match="inherits"):
+            catalog.verify_catalogue()
+        catalog.known_properties.cache_clear()
+
+
+class TestRelationDamage:
+    """`relation` feeds the cardinality and kind `get_schema` reports.
+
+    The quiet failure: were `rs_class` to move to colon notation (`fv:RsCtx`),
+    every column would still exist and every query would still run, but no
+    relation would match — and `cardinality` would silently go back to empty on
+    every class.
+    """
+
+    def test_it_is_a_required_table(self):
+        assert catalog._REQUIRED_TABLES["relation"] >= {"rs_class", "rel_type", "cardinality"}
+
+    def test_a_dropped_table_is_named(self, broken_catalogue):
+        broken_catalogue("DROP TABLE relation")
+        with pytest.raises(DescriptionsLoadError, match="no 'relation' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE relation RENAME COLUMN rel_type TO kind")
+        with pytest.raises(DescriptionsLoadError, match="rel_type"):
+            catalog.verify_catalogue()
+
+    def test_a_key_moved_to_colon_notation_is_caught(self, broken_catalogue):
+        """Structurally intact; `fvRsCtx` becomes `fv:RsCtx` and nothing matches."""
+        broken_catalogue(
+            "UPDATE relation SET rs_class = substr(rs_class, 1, 2) || ':' || substr(rs_class, 3)"
+        )
+        with pytest.raises(DescriptionsLoadError, match="relation"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_table_is_caught(self, broken_catalogue):
+        broken_catalogue("DELETE FROM relation")
+        with pytest.raises(DescriptionsLoadError, match="relation"):
+            catalog.verify_catalogue()
+
+    def test_a_probe_class_without_relations_still_passes(self, broken_catalogue):
+        """The guard checks the table's shape, not what fvBD happens to declare."""
+        payload = zlib.compress(b'{"containedBy": {"fv:Tenant": ""}}')
+        broken_catalogue(f"UPDATE mo SET residual = x'{payload.hex()}' WHERE class_name = 'fvBD'")
+        catalog.verify_catalogue()
+
+
+class TestFaultDamage:
+    """`fault` feeds the rule names `count(group_by="code")` reports.
+
+    The quiet failure is an emptied or re-columned table: every query still
+    runs, and every fault code simply comes back unnamed — an agent then has
+    nothing to ground a code in and names it from memory.
+    """
+
+    def test_it_is_a_required_table(self):
+        assert catalog._REQUIRED_TABLES["fault"] == {"code", "name"}
+
+    def test_a_dropped_table_is_named(self, broken_catalogue):
+        broken_catalogue("DROP TABLE fault")
+        with pytest.raises(DescriptionsLoadError, match="no 'fault' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE fault RENAME COLUMN name TO rule")
+        with pytest.raises(DescriptionsLoadError, match="name"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_table_is_caught(self, broken_catalogue):
+        broken_catalogue("DELETE FROM fault")
+        with pytest.raises(DescriptionsLoadError, match="fault"):
+            catalog.verify_catalogue()
+
+    def test_a_code_and_name_swapped_are_caught(self, broken_catalogue):
+        """Structurally intact; the code column now holds the names."""
+        broken_catalogue("UPDATE fault SET code = name")
+        with pytest.raises(DescriptionsLoadError, match="fault"):
+            catalog.verify_catalogue()
+
+
 class TestManifestDamage:
     def test_a_missing_manifest_key_is_named(self, broken_catalogue):
         broken_catalogue("DELETE FROM manifest WHERE key='apic_version'")
@@ -143,7 +275,7 @@ class TestManifestDamage:
             catalog.verify_catalogue()
 
     def test_a_changed_flag_layout_is_caught(self, broken_catalogue):
-        """`prop.flags` is a bitfield whose order lives in the manifest.
+        """`prop_sig.flags` is a bitfield whose order lives in the manifest.
 
         Dropping a flag shifts every bit above it. Nothing would raise; write
         access and `mandatory` would just quietly become wrong.
@@ -194,10 +326,16 @@ class TestEncodingDamage:
         with pytest.raises(DescriptionsLoadError, match="fvBD"):
             catalog.verify_catalogue()
 
-    def test_an_emptied_prop_table_is_caught(self, broken_catalogue):
+    def test_an_emptied_class_prop_table_is_caught(self, broken_catalogue):
         """Structurally intact, functionally useless: every class would report
         zero properties, and `query()` would accept any filter key."""
-        broken_catalogue("DELETE FROM prop")
+        broken_catalogue("DELETE FROM class_prop")
+        with pytest.raises(DescriptionsLoadError, match=r"properties|encoding"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_prop_sig_table_is_caught(self, broken_catalogue):
+        """The other half of the join: memberships remain but name nothing."""
+        broken_catalogue("DELETE FROM prop_sig")
         with pytest.raises(DescriptionsLoadError, match=r"properties|encoding"):
             catalog.verify_catalogue()
 

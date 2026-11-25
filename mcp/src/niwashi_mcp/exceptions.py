@@ -12,14 +12,20 @@ NiwashiMcpError
 ├── AuthenticationError       — incoming request carries no valid API key
 ├── RegistryError             — base for registry load failures
 │   ├── DescriptionsLoadError — niwaki catalogue missing, unreadable, or moved
+│   ├── RedactionPolicyError  — niwaki's secret-redaction policy missing or moved
 │   └── SchemaLoadError       — retained for compatibility; unreachable since 2.0
 ├── UnknownClassError         — class name not found in the descriptions registry
+├── UnknownAttributeError     — attribute not among the class's properties in the catalogue
+├── SecretAttributeError      — filter/order/group on an attribute that holds a secret
+├── SecretDnError             — a DN that is itself named by a secret
 ├── FilterError               — invalid identifier or unsafe value in build_filter
 └── ApicError                 — base for APIC communication errors
     ├── ApicAuthError         — authentication failed (bad credentials or server error)
     ├── ApicConnectionError   — APIC unreachable (network error or timeout)
     ├── ApicResponseError     — APIC returned an unexpected or malformed response
-    └── ApicRequestError      — APIC rejected the request (400/404/500/... — non-auth)
+    └── ApicRequestError      — APIC rejected the request: any non-2xx answer other than
+                                401/403 (400/404/500/..., and the 3xx the APIC uses for
+                                an invalid filter value), or an `error` object in imdata
 """
 
 
@@ -70,6 +76,19 @@ class DescriptionsLoadError(RegistryError):
     """
 
 
+class RedactionPolicyError(RegistryError):
+    """niwaki's secret-redaction policy is missing, or no longer what we read.
+
+    Raised at startup by `redact.verify_policy()`. The policy tables
+    (`niwaki._secrets`) are private to niwaki, which is pinned to one minor for
+    exactly that reason. A copy of them would go stale silently, and a server
+    that cannot say which values are secret must not start: serving without the
+    policy would hand credentials to an agent.
+
+    The remedy is the pin: `niwaki>=2.2,<2.3`.
+    """
+
+
 class SchemaLoadError(RegistryError):
     """A jsonmeta schema file exists on disk but could not be parsed.
 
@@ -107,6 +126,122 @@ class UnknownClassError(NiwashiMcpError):
         super().__init__(
             f"Unknown ACI class '{class_name}' — not in the {registry_size}-class registry. "
             f"{hint} Call search_classes() to find the correct name."
+        )
+
+
+class UnknownAttributeError(NiwashiMcpError):
+    """Attribute name not among a known ACI class's properties in the catalogue.
+
+    The attribute-level counterpart of `UnknownClassError`: APIC answers a
+    filter on a misspelled or invented attribute with `[]` and no error, so the
+    name is checked against the catalogue before the request is sent. Carries
+    closest matches so the LLM can self-correct without a `get_schema()`
+    round-trip.
+
+    The check is against the catalogue, which describes one APIC release, and
+    a fabric on another release may legitimately carry the attribute. The
+    message says so, because the caller may decide to send the request anyway;
+    `catalogue_version` is a required argument rather than read from
+    `registry.catalog`, which imports this module and would make a cycle.
+    """
+
+    def __init__(
+        self,
+        class_name: str,
+        attribute: str,
+        suggestions: list[str],
+        catalogue_version: str,
+    ) -> None:
+        self.class_name = class_name
+        self.attribute = attribute
+        self.suggestions = suggestions
+        self.catalogue_version = catalogue_version
+        hint = (
+            f"Closest matches: {', '.join(suggestions)}."
+            if suggestions
+            else "No close matches found."
+        )
+        described = (
+            f"APIC {catalogue_version}"
+            if catalogue_version and catalogue_version != "unknown"
+            else "an APIC release this server cannot identify"
+        )
+        super().__init__(
+            f"Unknown attribute '{attribute}' on ACI class '{class_name}'. "
+            f"{hint} Call get_schema('{class_name}') to list its attributes. "
+            f"The catalogue describes {described}; a fabric on another release "
+            f"may legitimately have this attribute."
+        )
+
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+#
+# Both messages are written for the agent that receives them, and neither quotes
+# what the agent sent: a refused guess is not echoed back into a log or a reply.
+
+
+class SecretAttributeError(NiwashiMcpError):
+    """A request filters, orders or groups on an attribute that holds, or may quote, a secret.
+
+    The server never returns such a value, but a predicate on it would answer
+    questions about it all the same: `filters={"value": "guess"}` returning one
+    object confirms the guess, and `group_by` would print the values as keys. So
+    the request is refused whatever `NIWASHI_MCP_STRICT_ATTRIBUTES` says — it
+    is not a catalogue check, and relaxing it would reopen the oracle.
+
+    `free_text` is the second kind: an audit record's `changeSet`, which is not a
+    secret itself but is where one gets quoted. It is scrubbed on a best-effort
+    basis, and a predicate on the raw text could confirm what the scrubbing
+    removed, so it is refused the same way.
+    """
+
+    def __init__(
+        self, class_name: str, attribute: str, where: str, *, free_text: bool = False
+    ) -> None:
+        self.class_name = class_name
+        self.attribute = attribute
+        self.where = where
+        self.free_text = free_text
+        if free_text:
+            reason = (
+                f"'{attribute}' on ACI class '{class_name}' is free text that can quote "
+                "a secret (a credential, key, community string or session token). The "
+                "server scrubs it on a best-effort basis, and a match on the raw text "
+                "could confirm what was scrubbed, so "
+            )
+        else:
+            reason = (
+                f"'{attribute}' on ACI class '{class_name}' holds a secret "
+                "(a credential, key or community string), and the server withholds it, "
+                "so "
+            )
+        super().__init__(
+            f"{reason}`{where}` cannot use it: a filter, order or grouping on it would "
+            "let a guess be checked or the values be read back. "
+            f"Use another attribute of '{class_name}'; the objects themselves still "
+            "come back, with that value withheld or scrubbed."
+        )
+
+
+class SecretDnError(NiwashiMcpError):
+    """A DN or filter text names an object by a secret.
+
+    An SNMP community profile is named by its community string, a login session
+    by its token hash, a JWT site by its API key: the secret is part of the DN.
+    Fetching `.../community-public` and being told "found" or "not found" is a
+    way to check a guess, so every such DN is refused on its shape alone —
+    before the APIC is asked, and the same whether or not the object exists.
+    """
+
+    def __init__(self, where: str) -> None:
+        self.where = where
+        super().__init__(
+            f"`{where}` names an object by a secret: an SNMP community string, a "
+            "login-session token or an API key is part of that DN. The server "
+            "refuses every DN of that shape — whether or not such an object "
+            "exists — so a request cannot be used to check a guess. Query the "
+            "class, or the parent's DN, instead: the objects come back with "
+            "the secret withheld."
         )
 
 
@@ -178,28 +313,47 @@ class ApicResponseError(ApicError):
 
 
 class ApicRequestError(ApicError):
-    """APIC rejected a request with a non-2xx, non-authentication status.
+    """APIC rejected a request — by its HTTP status, or by what the body says.
 
-    Raised by ApicClient.query_class(), get_by_dn(), and count_class() (all
-    three share the same request path) for any status code other than
-    401/403 (which trigger the re-auth-and-retry flow instead) — typically
-    400 for a malformed filter_expr or query-target-filter, or a transient
-    404/500/502/503/504 that never recovered within the retry budget (a
-    permanent status like 400 is raised on the first attempt; a transient
-    one is retried a bounded number of times first — see
-    ApicClient.__init__'s retry_attempts).
+    Raised by ApicClient.query_class(), get_by_dn(), count_class() and
+    controller_version() (all four share the same request path) in two cases:
 
-    Carries the raw HTTP status and, when the response body follows APIC's
-    usual error shape (`imdata[0].error.attributes.text`), the human-readable
-    reason APIC supplied — so an LLM caller gets an actionable message
-    instead of an opaque httpx.HTTPStatusError.
+    * a status that is not 2xx and not 401/403 (those trigger the re-auth-and-
+      retry flow instead) — typically 400 for a malformed filter_expr or
+      query-target-filter, or a transient 404/500/502/503/504 that never
+      recovered within the retry budget (a permanent status like 400 is raised
+      on the first attempt; a transient one is retried a bounded number of
+      times first — see ApicClient.__init__'s retry_attempts). That includes
+      3xx. The APIC does answer 3xx, but never as a redirect: it reuses its own
+      error code as the HTTP status, so a filter value that is not valid for
+      its attribute ("Incorrect filter format for faultInst.code, value 'F0526'
+      is not valid") arrives as a `301 Moved Permanently` with no Location
+      header and an error body. The client does not follow redirects, and a 3xx
+      is never read as data.
+    * an `error` object among the `imdata` items, whatever the HTTP status: the
+      APIC's reply to a request it refused is an error object, and a client that
+      read it as an object would report an error row as a result, and its
+      `totalCount` of "1" as a count.
+
+    Carries the raw HTTP status and, when the response body follows APIC's usual
+    error shape (`imdata[n].error.attributes.{code,text}`), the APIC's own code
+    and the human-readable reason — so an LLM caller gets an actionable message
+    instead of an opaque httpx.HTTPStatusError. Both are single-line and
+    length-bounded: they come from the wire, and end up in a tool error and a log.
     """
 
-    def __init__(self, url: str, status: int, apic_text: str = "") -> None:
+    def __init__(
+        self, url: str, status: int, apic_text: str = "", apic_code: str = ""
+    ) -> None:
         self.url = url
         self.status = status
         self.apic_text = apic_text
+        self.apic_code = apic_code
         msg = f"APIC request to {url} failed with HTTP {status}"
+        # The APIC often repeats its code as the HTTP status; say it only when
+        # it adds something (an error object carried by a 200, or code 121 on a 400).
+        if apic_code and apic_code != str(status):
+            msg += f" (APIC error code {apic_code})"
         if apic_text:
             msg += f": {apic_text}"
         super().__init__(msg)

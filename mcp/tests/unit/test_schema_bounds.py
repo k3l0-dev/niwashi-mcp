@@ -25,6 +25,8 @@ import pytest
 from niwashi_mcp.main import (
     _SCHEMA_LIST_MAX,
     _SCHEMA_LIST_SAMPLE,
+    _SCHEMA_OPTIONS_FLOOR,
+    _bound_property_options,
     _bound_schema_lists,
     get_schema,
 )
@@ -187,6 +189,64 @@ class TestThroughTheTool:
     async def test_an_unknown_class_still_returns_empty(self, tool_ctx):
         """The bound must not turn a miss into a dict carrying markers."""
         assert await get_schema("fvNotARealClass", tool_ctx) == {}
+
+
+class TestPropertyOptions:
+    """`options` of an enumerated property — the bound that `dnFormats` missed.
+
+    faultInst.code enumerates 80,512 values. `get_schema("faultInst",
+    properties_filter=["code"])` — the obvious call for "which fault codes are
+    there" — returned about 880 KB, the largest tool result in agent-eval's
+    tier F, on every server version.
+    """
+
+    def test_the_helper_truncates_and_records_the_total(self):
+        schema = {"property_details": {"code": {"options": [f"v{i}" for i in range(300)]}}}
+        out = _bound_property_options(schema, 100)
+        detail = out["property_details"]["code"]
+        assert detail["options"] == [f"v{i}" for i in range(100)]
+        assert detail["optionsTruncated"]["returned"] == 100
+        assert detail["optionsTruncated"]["total"] == 300
+
+    def test_the_note_says_a_missing_value_may_still_be_valid(self):
+        """A sampled enum must not read as the closed set of allowed values."""
+        schema = {"property_details": {"code": {"options": ["v"] * 300}}}
+        note = _bound_property_options(schema, 100)["property_details"]["code"][
+            "optionsTruncated"
+        ]["note"]
+        assert "may still be valid" in note
+        assert "list_limit" in note
+
+    def test_a_short_enum_gains_no_marker(self):
+        schema = {"property_details": {"lc": {"options": ["raised", "cleared"]}, "x": {}}}
+        assert _bound_property_options(schema, 100) == {
+            "property_details": {"lc": {"options": ["raised", "cleared"]}, "x": {}}
+        }
+
+    def test_a_schema_without_details_is_left_alone(self):
+        assert _bound_property_options({"dnFormats": ["a"]}, 1) == {"dnFormats": ["a"]}
+
+    @pytest.mark.asyncio
+    async def test_faultinst_code_is_affordable(self, tool_ctx):
+        schema = await get_schema("faultInst", tool_ctx, properties_filter=["code"])
+        detail = schema["property_details"]["code"]
+        assert len(detail["options"]) == _SCHEMA_OPTIONS_FLOOR
+        assert detail["optionsTruncated"]["total"] == 80_512
+        assert len(json.dumps(schema)) < 15_000
+
+    @pytest.mark.asyncio
+    async def test_the_floor_keeps_ordinary_enums_whole(self, tool_ctx):
+        """list_limit's default of 25 must not cut a 33-value enum."""
+        schema = await get_schema("fvBD", tool_ctx, include_property_details=True)
+        raw = catalog.load_schema("fvBD", include_property_details=True)
+        assert schema["property_details"] == raw["property_details"]
+
+    @pytest.mark.asyncio
+    async def test_list_limit_raises_the_options_sample(self, tool_ctx):
+        schema = await get_schema(
+            "faultInst", tool_ctx, properties_filter=["code"], list_limit=10_000
+        )
+        assert len(schema["property_details"]["code"]["options"]) == _SCHEMA_LIST_MAX
 
 
 @pytest.mark.asyncio

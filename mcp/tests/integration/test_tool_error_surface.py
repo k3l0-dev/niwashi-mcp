@@ -69,6 +69,18 @@ _FAILURES = [
         id="500-server-error",
     ),
     pytest.param(
+        ApicRequestError(
+            "https://apic/api/class/faultInst.json", 301, "Incorrect filter format", "301"
+        ),
+        id="301-the-apics-invalid-filter-value",
+    ),
+    pytest.param(
+        ApicRequestError(
+            "https://apic/api/class/faultInst.json", 200, "Incorrect filter format", "301"
+        ),
+        id="error-object-in-a-2xx",
+    ),
+    pytest.param(
         ApicConnectionError("10.0.0.1", "request timed out"),
         id="timeout",
     ),

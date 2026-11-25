@@ -5,7 +5,7 @@ variables, and one command.
 
 There is no repository to clone and no schema bundle to download. The ACI
 object model — 15 452 classes, generated from APIC **6.0(9c)** — ships as a
-single SQLite catalogue (36 229 120 bytes) inside the `niwaki` dependency, which
+single SQLite catalogue (25 993 216 bytes) inside the `niwaki` dependency, which
 `uv` fetches along with the rest of the wheel.
 
 ## Prerequisites
@@ -74,6 +74,7 @@ Startup looks like this (the FastMCP banner is omitted):
 2026-08-08 10:58:42,939  WARNING   niwashi-mcp  MCP_API_KEYS is not set — server is running WITHOUT authentication. Set MCP_API_KEYS in .env before deploying to production.
 2026-08-08 10:58:43,311  INFO      niwashi-mcp  Registry loaded — 15239 class descriptions (niwaki catalogue, APIC 6.0(9c))
 2026-08-08 10:58:43,323  INFO      niwashi-mcp  Connected to APIC — your-apic.example.com
+2026-08-08 10:58:43,401  INFO      niwashi-mcp.apic  Fabric runs APIC 6.0(9c), matching the object-model catalogue
 [08/08/26 10:58:43] INFO     Starting MCP server 'niwashi-mcp' with transport 'http' (stateless) on http://0.0.0.0:8000/mcp
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 ```
@@ -83,6 +84,11 @@ comes out before the HTTP server exists at all; the registry and APIC lines come
 from the FastMCP lifespan, which only runs once the server starts serving. A
 process that dies after the registry line has a credentials or reachability
 problem, not a data problem.
+
+The last line compares your fabric's APIC release with the one the catalogue
+describes. If they differ you get a `WARNING` instead, naming both — see
+[SUPPORTED-APIC.md](../../SUPPORTED-APIC.md). It is advisory: the server starts
+either way.
 
 The number in that registry line is not the number of ACI classes. **15 239** is
 the size of the search index — the classes `search_classes` can find. **15 452**
@@ -197,6 +203,22 @@ mkdir -p .opencode/skills/niwashi-mcp
 cp mcp/client/SKILL.md .opencode/skills/niwashi-mcp/SKILL.md
 ```
 
+### From the server itself (experimental)
+
+The server publishes the same file as an MCP resource,
+`skill://niwashi-mcp-query/SKILL.md`, next to a `skill://niwashi-mcp-query/_manifest`
+that gives its size and SHA-256 — and, on the 2026-07-28 protocol, through the
+Skills extension (`skills/list`, `skills/get`). A client that fetches skills from
+the server it is connected to needs no copy; one that does not never asks, and the
+five tools are unaffected. This is FastMCP 4.2's implementation of a **draft**
+extension (SEP-2640): the URI scheme and the wire format may change in a FastMCP
+release, and a client has to know to ask for it. Until yours does, use one of the
+copies above.
+
+The skill ships inside the package (`niwashi_mcp/skills/niwashi-mcp-query/`), so
+it is there with `uvx` and no checkout. It is a copy of `mcp/client/SKILL.md`, and
+a test and the wheel smoke check fail if the two differ.
+
 ---
 
 ## Running from a checkout
@@ -262,8 +284,8 @@ The command changed, and one whole step disappeared.
 | | 1.2.2 | 2.0 |
 |---|---|---|
 | Install | `git clone` + download the schema bundle + `tar` | `uvx niwashi-mcp` |
-| Download | 98.8 MB | 16.2 MB — the niwaki wheel |
-| Object model on disk | 1.83 GB across 15 452 files | one 36 229 120-byte file |
+| Download | 98.8 MB | 16.8 MB — the niwaki wheel |
+| Object model on disk | 1.83 GB across 15 452 files | one 25 993 216-byte file |
 | Start | `python main.py` | `niwashi-mcp` |
 
 The step that downloaded and extracted a jsonmeta bundle into `data/schemas/` is

@@ -42,7 +42,8 @@ class TestProjectionFilters:
         filter added 86 keys to `property_details` with a green suite.
         """
         stored = catalog._query(
-            "SELECT m.class_name, p.wire_name FROM prop p JOIN mo m ON m.id = p.class_id "
+            "SELECT m.class_name, p.wire_name FROM class_prop cp "
+            "JOIN prop_sig p ON p.id = cp.sig_id JOIN mo m ON m.id = cp.class_id "
             "WHERE p.default_val IN ('\"\"', '[]', '{}')"
         )
         assert stored, "the corpus no longer has empty defaults — re-scope this test"

@@ -18,7 +18,7 @@ so any LLM can reach all 15,452 classes with no hardcoded class knowledge.</p>
 [![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm%20NC-blue)](LICENSE)
 [![Commercial License](https://img.shields.io/badge/license-Commercial-orange)](LICENSE-COMMERCIAL.md)
 [![Python](https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastMCP](https://img.shields.io/badge/FastMCP-3.4+-00C896)](https://github.com/jlowin/fastmcp)
+[![FastMCP](https://img.shields.io/badge/FastMCP-4.2+-00C896)](https://github.com/jlowin/fastmcp)
 <br/>
 
 ![Cisco ACI](https://img.shields.io/badge/Cisco-ACI-1BA0D7?style=flat-square&logo=cisco&logoColor=white)
@@ -186,6 +186,16 @@ how to read a schema, how DNs are built, and when to reach for each tool.
 | OpenCode | `cp mcp/client/SKILL.md ~/.config/opencode/skills/niwashi-mcp-query/SKILL.md` (or `.opencode/skills/…` per project). The directory name must match the skill's `name:` field, and it must sit beside the server declaration — tools without the skill is the failure this file exists to prevent |
 | Anything else | Paste it into the system prompt or context file |
 
+**Experimental — the server also serves it.** The same file is published as an
+MCP resource, `skill://niwashi-mcp-query/SKILL.md` (with a `skill://niwashi-mcp-query/_manifest`
+carrying its size and SHA-256), and, on the 2026-07-28 protocol, through the
+Skills extension's `skills/list` and `skills/get`. A client that reads skills from
+the server it is connected to needs no copy at all; one that does not simply never
+asks, and the five tools are unaffected. It rides FastMCP 4.2's implementation of
+a draft extension (SEP-2640), so the URI scheme and the wire format may change in
+a FastMCP release, and a client has to know to ask for it — until yours does, copy
+the file as above.
+
 Then ask:
 
 > *"List all tenants configured in this fabric."*
@@ -199,7 +209,7 @@ no hand-written API work.
 
 The server does not ship the ACI object model, and it does not download one. It
 reads a SQLite catalogue embedded in its [`niwaki`](https://pypi.org/project/niwaki/)
-dependency — a single 36 MB file covering all **15,452** managed-object classes,
+dependency — a single 26 MB file covering all **15,452** managed-object classes,
 built from APIC **6.0(9c)**. `get_schema()` reads that file directly; the keyword
 index behind `search_classes()` is rebuilt from it once at startup.
 
@@ -209,8 +219,8 @@ unchanged; only the source of the data moved.
 | | 1.2.2 | 2.0 |
 |---|---|---|
 | Install | `git clone`, download a schema bundle, extract it | `uvx niwashi-mcp` |
-| Download | 98.8 MB tarball | the `niwaki` wheel (18.8 MB at 1.8.0) |
-| Object model on disk | 1.82 GB across 15,452 jsonmeta files | one 36 MB SQLite file |
+| Download | 98.8 MB tarball | the `niwaki` wheel (16.8 MB at 2.2.0) |
+| Object model on disk | 1.82 GB across 15,452 jsonmeta files | one 26 MB SQLite file |
 | Data directory to manage | `data/` | none |
 
 The APIC release is now pinned by the `niwaki` dependency rather than chosen by
@@ -282,6 +292,7 @@ Per-tool reference with worked examples: [`docs/tools/`](docs/tools/).
 | `MCP_API_KEYS` | | — | Comma-separated bearer tokens. Unset means no authentication (development only) |
 | `MCP_HOST` | | `127.0.0.1` | Interface to bind. Loopback by default; a routable value requires `MCP_API_KEYS` |
 | `MCP_ALLOW_NO_AUTH` | | `false` | `true` accepts a routable bind with `MCP_API_KEYS` unset. Refused otherwise |
+| `MCP_ALLOWED_HOSTS` | | — | Comma-separated hostnames accepted in the `Host` header besides loopback names. Set it to your public name when a reverse proxy on the same machine forwards it, or every proxied request is answered `421` |
 | `NIWASHI_MCP_ENV_FILE` | | — | Explicit path to the `.env` file to load |
 
 **Hot reload:** send `SIGHUP` to the process to reload `MCP_API_KEYS` from the
@@ -303,6 +314,9 @@ Full reference: [`docs/configuration/settings.md`](docs/configuration/settings.m
   complete discovery before they hold a token
 - Loopback bind by default — a routable `MCP_HOST` without `MCP_API_KEYS` is
   refused at startup, not merely warned about
+- `Host` and `Origin` validation on requests that arrive on loopback, against
+  DNS rebinding — behind a reverse proxy on the same machine, list its public
+  name in `MCP_ALLOWED_HOSTS`
 - API keys reloadable via `SIGHUP`
 
 Vulnerability disclosure policy: [SECURITY.md](SECURITY.md).
@@ -324,9 +338,9 @@ client config only needs its URL to keep working.
 | `SchemaLoadError` can no longer be raised | A missing or unreadable catalogue raises `DescriptionsLoadError` instead |
 
 Everything else holds: the same five tools, the same search scoring, the same
-APIC client with its cookie authentication, retry and pagination, and
-`relationTo[*].cardinality` still empty on every entry — the real cardinality
-lives on the relation class itself.
+APIC client with its cookie authentication, retry and pagination. One later
+addition to `get_schema`: `relationTo[*].cardinality`, empty on every entry in 1.x
+and 2.0, is now filled in and has a `kind` beside it.
 
 Full detail, including what was measured to prove the swap changed nothing:
 [CHANGELOG.md](CHANGELOG.md).

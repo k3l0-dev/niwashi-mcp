@@ -256,6 +256,44 @@ class TestDescriptionsIndex:
         with_labels = next(v for v in rebuilt.values() if "prop_labels" in v)
         assert isinstance(with_labels["prop_labels"], list)
 
+    def test_prop_labels_follow_wire_name_order(self, rebuilt):
+        """The list is ordered by the wire name of the property each label sits on.
+
+        niwaki 1.x keyed its property table `(class_id, wire_name)`, so rows came
+        back in that order whether or not a query asked. 2.1 keys `class_prop` by
+        signature id instead, and without an explicit `ORDER BY` the labels still
+        come out — as a different list. The digest test above would catch it, but
+        only as "the index changed"; this one says why, and it is derived from
+        the raw rows rather than from the implementation's own query.
+
+        A label shared by several properties is kept once, at the first of them
+        in wire-name order, so that is the position it is checked at.
+        """
+        rows = catalog._query(
+            "SELECT m.class_name, p.wire_name, l.text FROM class_prop cp "
+            "JOIN prop_sig p ON p.id = cp.sig_id JOIN mo m ON m.id = cp.class_id "
+            "JOIN label_pool l ON l.id = p.label_id"
+        )
+        first_wire: dict[str, dict[str, str]] = {}
+        for cls, wire, text in rows:
+            label = text.strip()
+            if label.lower() == wire.lower():
+                continue  # a label that restates the name is dropped, not placed
+            per_class = first_wire.setdefault(cls, {})
+            if label not in per_class or wire < per_class[label]:
+                per_class[label] = wire
+
+        checked = 0
+        for cls, entry in rebuilt.items():
+            labels = entry.get("prop_labels", [])
+            wires = [first_wire[cls][label] for label in labels]
+            assert wires == sorted(wires), f"{cls}: prop_labels are not in wire-name order"
+            checked += len(labels) > 1
+        assert checked > 1_000, (
+            f"only {checked} classes carry two or more prop_labels — the check no "
+            f"longer exercises the ordering"
+        )
+
     def test_generic_labels_are_filtered(self, rebuilt):
         """"Name" on every class would make one query match all 15,000."""
         for entry in rebuilt.values():
@@ -298,7 +336,8 @@ class TestWireOnlyBoundary:
         # chosen by an unordered SELECT. The whole sweep costs ~0.12 s, so the
         # sampling bought nothing and cost the guarantee the docstring claimed.
         rows = catalog._query(
-            "SELECT m.class_name, p.wire_name FROM prop p JOIN mo m ON m.id = p.class_id "
+            "SELECT m.class_name, p.wire_name FROM class_prop cp "
+            "JOIN prop_sig p ON p.id = cp.sig_id JOIN mo m ON m.id = cp.class_id "
             "WHERE m.is_configurable = 1"
         )
         by_class: dict[str, set[str]] = {}

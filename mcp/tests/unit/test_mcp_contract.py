@@ -34,6 +34,19 @@ from niwashi_mcp.main import mcp
 
 _TOOLS = {"search_classes", "get_schema", "query", "get_by_dn", "count"}
 
+
+def _hint(tool, name: str):
+    """One annotation hint, read the way it travels on the wire.
+
+    `model_dump(by_alias=True)` yields the spec's camelCase keys (`readOnlyHint`)
+    whatever the attribute is called on the model. The MCP SDK renamed those
+    attributes to snake_case in v2 and keeps the old spelling only behind a
+    deprecation bridge, so reading `tool.annotations.readOnlyHint` asserts the
+    bridge rather than the contract — and stops working when the bridge goes. The
+    wire form is the contract, and it is the same on both SDK generations.
+    """
+    return tool.annotations.model_dump(by_alias=True)[name]
+
 # Tools that reach the fabric, and therefore interact with an open world.
 _FABRIC = {"query", "get_by_dn", "count"}
 
@@ -86,23 +99,22 @@ class TestTheAdvertisedSurface:
         for name, tool in advertised.items():
             ann = tool.annotations
             assert ann is not None, f"{name} carries no annotations"
-            assert ann.readOnlyHint is True, f"{name} does not declare itself read-only"
+            assert _hint(tool, "readOnlyHint") is True, f"{name} does not declare itself read-only"
 
     def test_open_world_separates_local_reads_from_fabric_reads(self, advertised):
         """`search_classes` and `get_schema` never leave the process."""
         for name, tool in advertised.items():
             expected = name in _FABRIC
-            assert tool.annotations.openWorldHint is expected, (
-                f"{name}: openWorldHint={tool.annotations.openWorldHint}, expected {expected}"
-            )
+            got = _hint(tool, "openWorldHint")
+            assert got is expected, f"{name}: openWorldHint={got}, expected {expected}"
 
     def test_hints_meaningless_under_read_only_are_absent(self, advertised):
         """The MCP spec defines `destructiveHint` and `idempotentHint` as
         meaningful only when `readOnlyHint` is false. Declaring them anyway is
         noise that reads as rigour."""
         for name, tool in advertised.items():
-            assert tool.annotations.destructiveHint is None, name
-            assert tool.annotations.idempotentHint is None, name
+            assert _hint(tool, "destructiveHint") is None, name
+            assert _hint(tool, "idempotentHint") is None, name
 
     def test_every_tool_has_a_human_title_and_a_description(self, advertised):
         """Both are what a client renders in a tool picker."""
@@ -162,12 +174,116 @@ class TestParameterSchemas:
         assert advertised["get_schema"].parameters["properties"]["list_limit"]["default"] == 25
 
 
+class TestNoListenStreams:
+    """The server publishes no change notification, so it offers no stream for one.
+
+    FastMCP 4.2.5 turned `subscriptions/listen` on by default: a supporting client
+    holds a stream open for as long as it is connected. Five fixed tools never
+    change, so the stream would carry nothing and cost a connection.
+    """
+
+    @pytest.fixture
+    def capabilities(self, monkeypatch):
+        import asyncio
+
+        from fastmcp import Client
+        from fastmcp.server.lifespan import lifespan
+
+        from niwashi_mcp import main
+
+        @lifespan
+        async def stub(server):
+            yield {}
+
+        monkeypatch.setattr(main.mcp, "_lifespan", stub)
+
+        async def read(mode: str) -> tuple[str, dict]:
+            async with Client(main.mcp, mode=mode) as client:
+                return client.protocol_version, client.server_capabilities.model_dump(
+                    by_alias=True
+                )
+
+        return lambda mode: asyncio.run(read(mode))
+
+    def test_the_2026_07_28_era_advertises_no_subscription_and_no_list_changes(
+        self, capabilities
+    ):
+        """The era the stream belongs to: `resources.subscribe` and `listChanged`
+        are what tell a client it may open one."""
+        # "auto" is what negotiates the era through `server/discover`; pinning the
+        # version string skips that and yields no capabilities to read.
+        version, caps = capabilities("auto")
+
+        assert version == "2026-07-28", "the client did not negotiate the era under test"
+        assert caps["resources"]["subscribe"] is False
+        for capability in ("tools", "resources", "prompts"):
+            assert caps[capability]["listChanged"] is False, capability
+
+    def test_the_handshake_era_never_advertised_a_subscription(self, capabilities):
+        """Unaffected either way upstream; pinned so a change there is noticed."""
+        version, caps = capabilities("legacy")
+
+        assert version != "2026-07-28"
+        assert caps["resources"]["subscribe"] is False
+
+
 class TestServerIdentity:
     def test_the_server_announces_the_distribution_name(self):
         """It announced `aci-mcp` for five days after the 2.0 rename, because a
         stale process was serving and nothing checked. The name a client sees is
         how it is identified in logs, configs and bug reports."""
         assert mcp.name == "niwashi-mcp"
+
+    @pytest.fixture
+    def served_info(self, monkeypatch):
+        import asyncio
+
+        from fastmcp import Client
+        from fastmcp.server.lifespan import lifespan
+
+        from niwashi_mcp import main
+
+        @lifespan
+        async def stub(server):
+            yield {}
+
+        monkeypatch.setattr(main.mcp, "_lifespan", stub)
+
+        async def read(mode: str):
+            async with Client(main.mcp, mode=mode) as client:
+                return client.server_info
+
+        return lambda mode: asyncio.run(read(mode))
+
+    @pytest.mark.parametrize("mode", ["auto", "legacy"])
+    def test_the_server_reports_its_own_version_not_fastmcps(self, served_info, mode):
+        """Left unset, `serverInfo.version` is FastMCP's own: a client saw the
+        name `niwashi-mcp` next to `4.2.6`, and a bug report quoted the wrong
+        package. Both protocol eras carry it."""
+        from importlib.metadata import version
+
+        import fastmcp
+
+        info = served_info(mode)
+
+        assert info.name == "niwashi-mcp"
+        assert info.version == version("niwashi-mcp")
+        assert info.version != fastmcp.__version__
+        assert info.version[0].isdigit(), info.version
+
+    def test_a_source_tree_that_was_never_installed_says_unknown(self, monkeypatch):
+        """No metadata is not a reason to fail startup, nor to borrow another
+        package's number."""
+        from importlib import metadata
+
+        from niwashi_mcp import main
+
+        def missing(name):
+            raise metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(main, "version", missing)
+
+        assert main._own_version() == "0+unknown"
 
     def test_instructions_are_shipped_and_carry_the_workflow(self):
         """The instructions block is the largest single artifact sent to an

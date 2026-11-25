@@ -17,7 +17,9 @@ the packaging could plausibly break without any unit test noticing:
     data lives in the `niwaki` dependency, and a wrong pin or a missing
     dependency would only show up here;
   - none of the flat 1.x module names leaked into the root namespace;
-  - the console entry point resolves.
+  - the console entry point resolves;
+  - the ACI skill is in the wheel and is the very file in the checkout the
+    script is run from — the one packaging step a unit test cannot see.
 
 Exits non-zero on the first failure.
 """
@@ -67,7 +69,7 @@ def main() -> None:
 
     # The startup guard, against the niwaki the resolver actually chose. This is
     # the check that fails if a release moved the catalogue's private schema —
-    # exactly the scenario the `niwaki>=1.8,<1.9` pin exists to prevent, and the
+    # exactly the scenario the `niwaki>=2.2,<2.3` pin exists to prevent, and the
     # only place in this script where the *resolved* dependency is under test
     # rather than the one in the lockfile.
     try:
@@ -113,6 +115,22 @@ def main() -> None:
 
     # 6. The console entry point resolves to something callable.
     check("entry point `main` is callable", callable(getattr(server, "main", None)))
+
+    # 7. The skill the server publishes is package data, a copy of
+    #    `client/SKILL.md`. A wheel built without it would make the server refuse
+    #    to start (the import loads it), and one built from a stale copy would
+    #    serve a guide the repository no longer contains. The script lives in the
+    #    checkout, so the original is at hand to compare with.
+    from importlib import resources
+
+    packaged = resources.files("niwashi_mcp").joinpath("skills", "niwashi-mcp-query", "SKILL.md")
+    check("the ACI skill ships in the wheel", packaged.is_file())
+    original = Path(__file__).resolve().parents[1] / "client" / "SKILL.md"
+    if original.is_file():
+        check(
+            "the packaged skill is mcp/client/SKILL.md",
+            packaged.is_file() and packaged.read_bytes() == original.read_bytes(),
+        )
 
     print()
     if FAILURES:

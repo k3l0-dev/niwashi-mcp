@@ -24,7 +24,7 @@ get_schema(
 | `class_name` | `str` | — | Exact ACI class name from `search_classes()`. **Case-sensitive** — see [Case sensitivity](#case-sensitivity). |
 | `include_property_details` | `bool` | `False` | Include `property_details` for **every** property. Prefer `properties_filter` unless you truly need all. |
 | `properties_filter` | `list[str]` | — | Include `property_details` only for these property names. The token-efficient path — unknown names are silently skipped, and the caller's order is preserved. |
-| `list_limit` | `int` | `25` | How many `dnFormats` and `containedBy` entries to return. Clamped to `1..500`. Only the seven universal classes ever reach it — see [Sampled lists](#sampled-lists). |
+| `list_limit` | `int` | `25` | How many `dnFormats` and `containedBy` entries to return. Clamped to `1..500`. Property `options` use max(`list_limit`, 100). Only the seven universal classes and a dozen very long enums ever reach it — see [Sampled lists](#sampled-lists). |
 
 ---
 
@@ -47,8 +47,8 @@ the class actually has something to report:
 | `classPkg` | `str` | yes | Package prefix, e.g. `"fv"` |
 | `label` | `str` | yes | Human-readable label |
 | `contains` | `list[str]` | no — 6,167 of 15,452 classes | Sorted child class names this object may hold, in **flat** notation (e.g. `"fvSubnet"`, `"tagTag"`) — ready to pass to `get_schema`, `query`, or `include_children` |
-| `relationTo` | `dict` | no — 1,017 classes | Outgoing Rs relations: `{relClass: {targetClass, cardinality}}`. Keys and `targetClass` keep `pkg:Class` colon notation (unlike `contains`); `cardinality` is always empty — see [Reading relationTo](#reading-relationto) |
-| `relationFrom` | `dict` | no — 994 classes | Incoming Rt relations: `{relClass: {sourceClass}}`, also in colon notation |
+| `relationTo` | `dict` | no — 1,017 classes | Outgoing Rs relations: `{relClass: {targetClass, cardinality, kind}}`. Keys and `targetClass` keep `pkg:Class` colon notation (unlike `contains`); `cardinality` says how many, `kind` how the target is named — see [Reading relationTo](#reading-relationto) |
+| `relationFrom` | `dict` | no — 994 classes | Incoming Rt relations: `{relClass: {sourceClass, cardinality, kind}}`, also in colon notation; `cardinality` and `kind` are the relation's own, read from `sourceClass` to this class |
 | `property_details` | `dict` | no — on request | Compact per-property constraints. **Present only** when `include_property_details=True` or `properties_filter` is set. |
 | `dnFormatsTruncated` | `dict` | no — 7 classes at the default | `{returned, total, note}`, present only when `dnFormats` was sampled — see [Sampled lists](#sampled-lists) |
 | `containedByTruncated` | `dict` | no — 7 classes at the default | `{returned, total, note}`, present only when `containedBy` was sampled |
@@ -95,7 +95,11 @@ Each entry carries only the fields the schema declares (`type` and `access` are 
 | `mandatory` | present when the property is required on create |
 | `default` | the default value, when declared |
 | `options` | allowed values — the exact strings the APIC accepts in `filters` and config |
+| `secret` | present (`true`) when the property holds a secret: [`query`](query.md#secrets) and [`get_by_dn`](get_by_dn.md#secrets) return it as `<redacted>`, and a filter, `order_by` or `group_by` on it is refused. On a class named by its secret (an SNMP community profile) `dn` and `rn` carry it too and are marked as well. |
+| `scrubbed` | present (`true`) on `changeSet` of the audit, event, fault and session records: free text that can quote a secret. It is returned scrubbed, on a best-effort basis, and is refused for filtering like a secret. |
 | `comment` | one-line description |
+
+The names of secret properties stay listed in `properties` — an agent that sees a property exist is less likely to look for it another way — and are labelled so it knows not to ask. No value is ever shown here. See [Internals: Secret redaction](../internals/redaction.md).
 
 Use `include_property_details=True` to dump every property at once — only when you genuinely need the full picture.
 
@@ -140,11 +144,13 @@ position. Nothing else about these properties changed: `type`, `access`,
   "relationTo": {
     "fv:RsCtx": {
       "targetClass": "fv:Ctx",
-      "cardinality": ""
+      "cardinality": "n-to-1",
+      "kind": "named"
     },
     "fv:RsBDToOut": {
       "targetClass": "l3ext:Out",
-      "cardinality": ""
+      "cardinality": "n-to-m",
+      "kind": "named"
     }
   },
   "properties": ["arpFlood", "descr", "dn", "epMoveDetectMode", "ipLearning",
@@ -255,6 +261,16 @@ with `rnFormat` rather than searching the list for a matching entry. Likewise a
 truncated `containedBy` means "attaches to nearly anything" — scope the query
 by the parent you care about instead of reading the list.
 
+**Enumerations are bounded too.** A property's `options` list in
+`property_details` is cut at max(`list_limit`, 100). Of the catalogue's 3,947
+distinct enums the median has 3 values and the 99th percentile 33; only 13
+exceed 100, and `faultInst.code` has 80,512, which made
+`get_schema("faultInst", properties_filter=["code"])` about 880 KB. The floor of
+100 keeps every ordinary enum whole even at the default `list_limit` of 25. A
+sampled property gains `optionsTruncated: {returned, total, note}`; a value
+missing from the sample may still be valid, so filter on it directly rather than
+treat the sample as the closed set.
+
 Raise `list_limit` (clamped to `1..500`) only when a `*Truncated` marker tells
 you the sample was too small. The bound is applied at the tool surface, not in
 the data layer: `registry.catalog.load_schema()` still returns the complete
@@ -269,20 +285,37 @@ verify against the 1.x jsonmeta oracle.
 "relationTo": {
   "fv:RsCtx": {
     "targetClass": "fv:Ctx",
-    "cardinality": ""
+    "cardinality": "n-to-1",
+    "kind": "named"
   }
 }
 ```
 
-Two things to note before using this, because both differ from `contains`:
+Three things to note before using this:
 
 - **The keys and `targetClass` keep their `pkg:Class` colon notation.** Unlike
   `contains`, which is flattened for you, these are not. Drop the colon to get
   the queryable class name: `fv:RsCtx` → `fvRsCtx`, `fv:Ctx` → `fvCtx`.
-- **`cardinality` is always empty.** It is `""` for all 2,992 `relationTo`
-  entries in the catalogue, so do not branch on it and do not report it. The
-  key is kept for shape stability only; `get_schema()` on the relation class
-  itself does not expose it either.
+- **`cardinality` is `1-to-1`, `1-to-m`, `n-to-1` or `n-to-m`**, read from the
+  class to its target. `n-to-1` on `fv:RsCtx` means many bridge domains each
+  point at one VRF — a bridge domain holds at most one `fvRsCtx`; `n-to-m` means
+  it may hold several. It used to be `""` on every entry, because the relation
+  dicts in the catalogue's `residual` blob carry no cardinality; it now comes
+  from the catalogue's `relation` table.
+- **`kind` says how the relation names its target.** `named` holds the target's
+  name (`tnFvCtxName` on `fvRsCtx`), resolved in scope; `explicit` holds its DN
+  (`tDn`) and carries no name attribute. `tDn` is on every relation object either
+  way, so read it first; `kind` tells you whether a `tn…Name` attribute is worth
+  looking for.
+
+`relationFrom` entries gain the same two keys next to `sourceClass`. They are
+the relation's own, read from `sourceClass` to this class, so `fvCtx`'s
+`fv:RtCtx` is also `n-to-1` and `named`.
+
+Two of the 6,249 `relationTo` and `relationFrom` entries in the catalogue — both
+on `fvCtx` — name cloud relation classes the catalogue does not contain. They
+keep `cardinality: ""` and have no `kind`; an empty value there means *not
+stated*.
 
 `fvBD` has an outgoing relation to `fvCtx` (VRF) via the relation class `fvRsCtx`. To find which VRF a BD is associated with:
 
@@ -324,8 +357,9 @@ causes, in order of likelihood:
   keys and `containedBy` entries keep their colon: pass `fvCtx`, not `fv:Ctx`.
 - **The class is newer than the catalogue.** The catalogue ships inside the
   `niwaki` dependency and is built from APIC **6.0(9c)**; a class introduced in
-  a later APIC release is not in it. That release is logged at startup — check
-  it against your fabric's own version before assuming a typo.
+  a later APIC release is not in it. That release is logged at startup, and
+  the server compares it with your fabric's own and warns when they differ —
+  check that line before assuming a typo.
 
 A class being absent from `search_classes()` results is *not* one of the causes:
 213 catalogue classes are unindexed and still resolve here. See

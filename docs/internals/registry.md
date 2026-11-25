@@ -8,8 +8,9 @@ filter strings those two send over the wire.
 |---|---|
 | `catalog.py` | The data layer. Reads the ACI object model from the SQLite catalogue shipped inside the `niwaki` dependency |
 | `descriptions.py` | Scores `search_classes` against an in-memory index (see [search-algorithm.md](search-algorithm.md)) |
-| `filter.py` | Builds `query-target-filter` strings from a plain dict |
+| `filter.py` | Builds `query-target-filter` strings from a plain dict; extracts the `Class.attr` references from a raw `filter_expr` / `order_by` so they can be checked against the catalogue — conservatively (`filter_expr_attributes`) for the typo check, and exhaustively by shape (`dotted_references`) for the secret check |
 
+`niwashi_mcp/redact.py`, one level up, is the secret-redaction policy. It is not a registry module — it decides what the tools may return rather than what the object model is — but it reads the catalogue through two functions added here for it: `catalog.secure_properties()` (every property the schema flags `secure`, grouped by class, one 20 ms query) and `catalog.rn_formats()` (every class's RN template, to read the class an audit record is about from its `affected` DN). See [Secret redaction](redaction.md).
 ---
 
 ## What 2.0 changed
@@ -40,7 +41,7 @@ file that can be malformed on its own.
 ```mermaid
 graph TD
     subgraph registry["registry/"]
-        cat["catalog.py\nload_schema()\nclass_exists()\ndescriptions_index()\napic_version()"]
+        cat["catalog.py\nload_schema()\nclass_exists()\nknown_properties()\ndescriptions_index()\napic_version()"]
         desc["descriptions.py\nsearch()"]
         filt["filter.py\nbuild_filter()"]
     end
@@ -59,9 +60,12 @@ graph TD
     main -->|"via ApicClient query_class() / count_class()"| filt
 ```
 
-`catalog.py` is the only module in the codebase that imports `niwaki`. Every
-other module receives plain dicts, exactly as it did when the source was a
-directory of JSON files.
+`catalog.py` is the only module that reads niwaki's *catalogue*. Every other
+registry module receives plain dicts, exactly as it did when the source was a
+directory of JSON files. The one other reader of niwaki is
+[`redact.py`](redaction.md), which reads its secret-redaction policy
+(`niwaki._secrets`, private, guarded at startup) and two public names
+(`niwaki.catalog.concrete_subclasses`, `niwaki.snapshot.REDACTED`).
 
 ---
 
@@ -70,7 +74,7 @@ directory of JSON files.
 ### The database
 
 `catalog_path()` resolves `niwaki.__file__` → `query/_catalog/catalog.db`. The
-project pins `niwaki>=1.8,<2.0`; the installed 1.8.0 ships a 36 229 120-byte
+project pins `niwaki>=2.2,<2.3`; the installed 2.2.0 ships a 25 993 216-byte
 catalogue built from APIC **6.0(9c)**.
 
 Two `manifest` rows matter to this server:
@@ -78,24 +82,27 @@ Two `manifest` rows matter to this server:
 | Key | Value | Used for |
 |---|---|---|
 | `apic_version` | `6.0(9c)` | `apic_version()`, logged at startup — from 2.0 the corpus version is pinned by a dependency, not chosen by the operator, so it has to be visible |
-| `prop_flags` | Comma-separated flag names | The bit layout of `prop.flags`, read rather than hard-coded |
+| `prop_flags` | Comma-separated flag names | The bit layout of `prop_sig.flags`, read rather than hard-coded |
 
 Tables the adapter reads:
 
 | Table | Rows | Read for |
 |---|---|---|
 | `mo` | 15 452 | One row per ACI class: the scalar schema fields, plus two compressed blobs |
-| `prop` | 332 297 | One row per property per class. `PRIMARY KEY (class_id, wire_name)`, `WITHOUT ROWID` — a lookup by `class_id` walks a b-tree prefix, not the whole table |
+| `prop_sig` | 25 901 | One row per distinct property signature — wire name, label, comment, enum, types, default, flags — stored once however many classes carry it |
+| `class_prop` | 332 297 | One row per property per class: `(class_id, sig_id)`. `PRIMARY KEY (class_id, sig_id)`, `WITHOUT ROWID` — a lookup by `class_id` walks a b-tree prefix, not the whole table. A class's properties are this table joined to `prop_sig`; the join returns them in `sig_id` order, so the one place order is observable (`prop_labels`) sorts by `wire_name` explicitly |
 | `label_pool` | 26 654 | Deduplicated human labels, addressed by id |
 | `comment_pool` | 25 411 | Deduplicated comment text (a JSON list of lines), addressed by id |
 | `type_pool` | 3 458 | ACI model types and primitive base types |
 | `enum` | 3 947 | zlib-compressed JSON blobs of enumerated values |
-| `manifest` | 16 | Build metadata |
+| `manifest` | 17 | Build metadata |
+| `relation` | 3 027 | One row per relation class, keyed by its Rs *and* its Rt class (field for field the same), plus a few abstract bases with no endpoints. Read for `cardinality` and `rel_type` (`kind`) by `annotate_relations()` |
+| `inherits` | 45 496 | Every ancestor of every class, in colon notation. Read for an abstract class's property union |
+| `fault` | 1 491 | One row per fault code: the class that raises it, the code and the rule name (`F0467` → `fltFvNwIssuesConfig-failed`). Read for `fault_names()`, which `count(group_by="code")` uses to name its groups |
 
-The catalogue also carries `relation`, `inherits`, `subclass`, `fault`,
-`scopemeta`, `name_override` and an FTS index. None of them is read here — this
-server derives relations from the `mo` residual blob and ranks with its own
-scorer.
+The catalogue also carries `subclass`, `scopemeta`, `name_override` and an FTS
+index. None of them is read here — the relation *endpoints* still come
+from the `mo` residual blob, and ranking uses this server's own scorer.
 
 ### Connection and caches
 
@@ -121,7 +128,7 @@ One connection for the process, held by `lru_cache(maxsize=1)`:
 | `_pool(table, column, id)` | 4096 | Pooled strings — labels, comments, types |
 | `_pool_blob(table, id)` | 8192 | Compressed enum blobs |
 
-Measured on an Apple-silicon workstation with niwaki 1.8.0: `load_schema("fvBD")`
+Measured on an Apple-silicon workstation with niwaki 2.2.0: `load_schema("fvBD")`
 0.18 ms, the same call with `include_property_details=True` 0.33 ms.
 
 ### Where every `get_schema()` field comes from
@@ -155,8 +162,8 @@ flowchart TD
 | `relationTo` | `residual["relationTo"]` | `{relClass: {targetClass, cardinality}}` |
 | `relationFrom` | `residual["relationFrom"]` | `{relClass: {sourceClass}}` |
 | `dnFormats` | `mo.dn_formats` | zlib + JSON; `[]` when stored null |
-| `properties` | `prop.wire_name` for the class | Sorted names only |
-| `property_details` | `prop` row + `enum` + `type_pool` + `comment_pool` | Opt-in only — see below |
+| `properties` | `prop_sig.wire_name` of the class's `class_prop` rows | Sorted names only |
+| `property_details` | `prop_sig` row + `enum` + `type_pool` + `comment_pool` | Opt-in only — see below |
 
 **Nine keys are emitted unconditionally**, even when empty: `identifiedBy`,
 `rnFormat`, `isAbstract`, `isConfigurable`, `className`, `classPkg`, `label`,
@@ -194,8 +201,20 @@ stay in colon notation, which is a real asymmetry a caller has to know about.
 
 `relationTo` values are plain strings in the catalogue. The dict shape
 (`{targetClass, cardinality}`) is kept for compatibility, and **`cardinality` is
-`""` for all 2 992 entries** across 1 497 distinct relation classes — as it was
-before 2.0. The real cardinality lives on the relation class itself.
+`""` for all 2 992 entries** across 1 497 distinct relation classes in
+`load_schema()`'s output — the residual blob does not carry it. That function is
+what the baseline digests and the jsonmeta oracle pin, so it is left alone.
+
+The real cardinality is in the `relation` table, and `annotate_relations()` puts
+it on top: one `SELECT … WHERE rs_class IN (…)` for the relations of the class at
+hand, run by the `get_schema` tool after `load_schema()` and before the lists are
+bounded. It fills `cardinality` and adds `kind` (`named` or `explicit`) to every
+`relationTo` entry, and adds both to every `relationFrom` entry. An entry the
+table has no row for — two of 6 249, both on `fvCtx`, both naming cloud relation
+classes absent from the catalogue — is left as it was. `verify_catalogue()`
+requires the table and probes `fv:RsCtx`: the key is the relation class in wire
+notation, and were it to move to colon notation every lookup would miss and
+`cardinality` would quietly go back to empty.
 
 ### property_details
 
@@ -204,7 +223,7 @@ Opt-in, because many classes carry more than a hundred properties.
 `include_property_details=True` projects every property. Unknown names in
 `properties_filter` are skipped silently.
 
-The bit layout of `prop.flags` is read from `manifest.prop_flags`, never
+The bit layout of `prop_sig.flags` is read from `manifest.prop_flags`, never
 hard-coded — niwaki owns that layout and may extend it. Nine flags must be
 present (`isConfigurable`, `needsPropDelimiters`, `createOnly`, `readWrite`,
 `readOnly`, `isNaming`, `secure`, `implicit`, `mandatory`); the check runs the
@@ -217,7 +236,7 @@ first time the flags are read, and a layout missing any of them raises
 | `access` | `flags` | Always |
 | `naming` | `flags & isNaming` | The property is part of the DN |
 | `mandatory` | `flags & mandatory` | Required on create |
-| `default` | `prop.default_val` | Declared, and neither `None` nor `""` |
+| `default` | `prop_sig.default_val` | Declared, and neither `None` nor `""` |
 | `options` | `enum_id` → `enum.content` | The enumeration has values left after filtering |
 | `comment` | `comment_id` → `comment_pool` | Non-empty after the sentinel filter |
 
@@ -257,7 +276,7 @@ failure this server exists to prevent, and it would be indistinguishable from
 "no objects match".
 
 So `catalog.py` never calls niwaki's accessors and never reads a readable name:
-`prop.wire_name` is the only source of a property name, for both `properties` and
+`prop_sig.wire_name` is the only source of a property name, for both `properties` and
 `property_details`. `mcp/tests/unit/test_catalog_adapter.py::TestWireOnlyBoundary`
 pins it in two ways — spot checks on known renames (`fvBD.descr` exposed and
 `description` absent; `fvSubnet.ip` exposed and `subnet` absent), and a sweep
@@ -327,6 +346,35 @@ filesystem (APFS, NTFS) `schemas_dir / "fvBd.json"` happily resolved to the real
 structurally impossible — `fvBd` simply does not match `fvBD`. The guard is now
 the storage engine, and a test pins the property so that adding `COLLATE NOCASE`
 some day fails loudly.
+
+### known_properties(), property_exists(), closest_properties()
+
+The attribute-level counterpart of `class_exists()`: APIC answers a filter on an
+invented attribute with `[]`, so the name can be checked first.
+
+`known_properties(class_name)` returns the class's wire names as a `frozenset`
+(empty for an unknown class, never an exception). For an **abstract** class it
+is the union of its own properties and those of all its concrete descendants,
+because a query on the abstract class returns instances of those descendants.
+`fvABD` declares 34 properties; with `fvBD`, `fvBDDef` and `fvSvcBD` the union
+is 54, and `hostBasedRouting` appears only in the union.
+
+Descendants are found through `inherits(class_id, ancestor)`, which holds each
+descendant's full ancestor chain in colon notation (`fv:ABD`). The colon name is
+`mo.class_pkg || ':' || mo.short_name`; `class_name` is `class_pkg ||
+short_name` (0 exceptions in 15 452), so the mapping needs no string parsing.
+The `subclass` table is deliberately not used: it lists direct children only,
+and 850 of its 14 973 entries name a class missing from `mo`, so a walk over it
+cannot cross those gaps. On this catalogue the walk and `inherits` agree on every
+concrete descendant of all 1 954 abstract classes, so this is robustness and one
+query instead of a recursion, not a different answer today.
+
+`property_exists()` is membership in that set, so for an abstract class it also
+accepts an attribute only a subclass carries, and the two functions cannot
+disagree. `closest_properties()` ranks a case-insensitive match first, then
+`difflib` matches (`description` finds `descr`). Results are cached by an
+`lru_cache(maxsize=512)`: the largest union measured is 4 475 names (`statsItem`,
+27-42 ms), so the bound keeps a long session from holding every class it probed.
 
 ### descriptions_index()
 
@@ -489,6 +537,31 @@ before use:
 
 An empty `filters` dict returns `""` — the APIC client omits the
 `query-target-filter` parameter entirely when the string is empty.
+
+### `filter_expr_attributes()`, `order_by_attributes()`, `is_identifier()`
+
+`build_filter` only ever sees dict keys. `filter_expr` and `order_by` are strings
+the caller composed, so the attributes in them have to be *found* before
+`query()` / `count()` can check them against `property_exists()`. These return
+the `(class, attribute)` pairs, in order of first appearance and deduplicated.
+
+- **`filter_expr_attributes(expr)`** masks every double-quoted string literal
+  first (escape-aware; a literal that never closes is dropped to the end of the
+  string), then takes the `Class.attr` that is the **first argument** of a
+  `<lower-case operator>(` — so `eq`, `wcard`, `bw`, `and(eq(...))` all work and
+  an operator the APIC adds later is covered. A dot inside a quoted value is
+  never a reference, and an unquoted later argument (`eq(fvBD.dn,uni.tn)`) is not
+  mistaken for one.
+- **`order_by_attributes(expr)`** splits on `,` and reads each `Class.attr` or
+  `Class.attr|asc|desc` term. A term without a class qualifier is skipped.
+- **`is_identifier(value)`** is `build_filter`'s own identifier test, exposed so a
+  `filters` key it will reject with `FilterError` is not first reported as an
+  unknown attribute.
+
+Both extractors are conservative on purpose: a reference they cannot place with
+certainty is left alone. A false positive refuses a request the APIC would have
+answered; a miss only leaves that one reference unchecked, which is where it
+stood before the check existed.
 
 Note what this check cannot do: it rejects malformed identifiers, not wrong ones.
 A snake_case readable name would fail it, but a single-word one like `subnet`

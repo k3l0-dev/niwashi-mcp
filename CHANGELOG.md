@@ -9,6 +9,172 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Added
 
+- **The server publishes its own ACI skill (experimental).** `mcp/client/SKILL.md`
+  — the object-model guide an agent needs beside the five tools — had to be
+  copied next to the client configuration by hand. It is now also served as the
+  MCP resource `skill://niwashi-mcp-query/SKILL.md`, with a
+  `skill://niwashi-mcp-query/_manifest` giving its size and SHA-256, and through
+  the Skills extension's `skills/list` and `skills/get` on the 2026-07-28
+  protocol. A client that fetches skills from the server it is connected to
+  needs no copy; one that does not never asks, and the five tools are unaffected.
+
+  **Experimental**, and not to be relied on across FastMCP releases: it rides
+  FastMCP 4.2's implementation of a draft extension (SEP-2640), so the URI scheme
+  and the wire format may change without a deprecation period. The file is
+  package data in `niwashi_mcp/skills/niwashi-mcp-query/` (FastMCP requires the
+  folder to carry the skill's name) and is loaded at import, so a wheel that lost
+  it refuses to start. It is a copy of `client/SKILL.md`, which stays the file
+  that is edited and tested; a test fails, naming the `cp` to run, when the two
+  differ by a byte, and `scripts/wheel_smoke.py` makes the same check on the
+  built wheel. The deprecated resource-only providers are not used.
+
+- **`MCP_ALLOWED_HOSTS` names the hosts a reverse proxy may forward.**
+  Comma-separated, patterns allowed (`*.example.com`), read after the `.env` is
+  loaded. See Security: the `Host` header is now validated, and a proxy on the
+  same machine has to be listed. Unset, nothing changes for any other deployment.
+
+- **`get_schema` reports each relation's cardinality and how it names its
+  target.** `relationTo[*].cardinality` was `""` on all 2,992 entries and the
+  docs told agents not to branch on it: the relation dicts in the catalogue's
+  `residual` blob carry none. The `relation` table does, so `get_schema("fvBD")`
+  now returns `"fv:RsCtx": {"targetClass": "fv:Ctx", "cardinality": "n-to-1",
+  "kind": "named"}` — many bridge domains, one VRF each, and a name
+  (`tnFvCtxName`) rather than a DN. `kind` is `named` or `explicit` (`tDn` only,
+  no name attribute), which is what tells an agent whether a `tn…Name` attribute
+  is worth reading on the relation object. `relationFrom` entries gain the same
+  two keys, read from `sourceClass` to the class.
+
+  Additive: every existing key and `targetClass` / `sourceClass` value is as it
+  was. 6,247 of 6,249 entries are filled; the two the table has no row for, both
+  on `fvCtx` and both naming cloud relation classes absent from the catalogue,
+  keep `cardinality: ""` and get no `kind`. It costs one indexed query per call
+  (about 0.02 ms) and, for the 1,597 classes that have relations, a median 52
+  bytes — at most 2.4 KB, on the classes with the most.
+
+  Done in a new `catalog.annotate_relations()`, applied by the tool, and not in
+  `load_schema()`: that function is the projection the recorded baseline and the
+  jsonmeta oracle pin, and both record `cardinality` as empty. The baseline is
+  untouched and passes unmodified. `verify_catalogue()` now requires the
+  `relation` table and probes it, because its key is the relation class in wire
+  notation and a move to colon notation would make every lookup miss silently —
+  `cardinality` would just go back to empty. SKILL.md, the tool docstring and
+  the docs teach the two keys.
+
+- **`count(group_by="code")` names the fault codes.** `{"F0546": 60}` leaves the
+  reader to say what `F0546` is, and an agent that does so from memory is how a
+  fault table gets fabricated (the July inventory, in the entry further down, is
+  one). The catalogue's `fault` table maps each code to the rule name the schema
+  gives it, so the response now carries `group_names`, `{"F0546":
+  "fltEthpmIfPortDownNoInfra", "F0467": "fltFvNwIssuesConfig-failed"}`, in the
+  order of `groups`. Run against a lab fabric (616 faults, 39 distinct codes): 30
+  resolve and 9 do not — 8 threshold-crossing alerts (`tca-*`, whose codes are
+  minted at runtime) and one FSM fault (`F608163`); the table's codes run F0020
+  to F4680, and `sum(groups) + ungrouped == count` held.
+  Those are left out rather than guessed, and the docs say what a missing code
+  means and to read the object's own `rule` and `descr` instead.
+
+  Additive and narrow: the key exists only for `group_by="code"` and only when
+  at least one code resolves; every other response is byte-identical. It is the
+  one place a code appears without an object to explain it. `query` and
+  `get_by_dn` results are left alone on purpose: a fault object already carries
+  its own `rule` (`fv-nw-issues-config-failed` for `F0467`, present on all 616
+  faults read from the lab), so a second name would be redundant on every row of
+  a fetch of thousands, and a key the APIC does not send has no coherent answer
+  under `fields`, which keeps only the attributes asked for. `verify_catalogue()`
+  requires the `fault` table and checks that `F0467` resolves.
+
+- **`fields` projects `query` and `get_by_dn` results onto the attributes
+  asked for.** A class carries ~40 attributes per object and `fetch_all` can
+  hold 5,000 objects; an agent that needed a name and a state still received
+  everything, and the answer is what fills its context. `fields=["name",
+  "arpFlood"]` reduces each result — and each `_children` entry of a class named
+  in `include_children` — to those, plus `dn`, `_class` and `_children`, which
+  are always kept: an object that cannot be addressed or identified is no use to
+  the next call. Names are validated against the queried class or any
+  `include_children` class, because a misspelled field would return objects that
+  merely lack the key, which reads as "the attribute is empty". `fields=[]`
+  keeps only the three fixed keys and the `note` says so; it is not the same
+  request as omitting `fields`.
+
+  Children that arrive another way — `rsp_subtree_include="faults"` brings
+  `faultInst` children — are returned whole: `fields` was never checked against
+  them, and reducing them anyway turned each fault into its `dn` and `_class`
+  with no note, deleting the severity the caller had asked the APIC for. A name
+  that exists only on such a child is therefore refused, since there is nothing
+  for it to select. An `include_children` item may be comma-joined
+  (`["fvSubnet,fvRsCtx"]`, two classes on the wire); every check reads it that
+  way.
+
+  Projection happens after the APIC answers, so it saves the response, not the
+  APIC's work, and changes neither `total_available`, `truncated` nor paging.
+  `get_by_dn` can only validate after the fetch — the class is not known before
+  it. In relaxed mode (see Changed) an unknown name is kept and the doubt is
+  said in the `note`, or in a `_note` key on `get_by_dn`'s object, which has no
+  envelope to carry one.
+
+- **`count(group_by=...)` answers "how many X per Y?" in one call.** `group_by`
+  takes any property of the class, or `"tenant"`, read from the DN's
+  `tn-<name>` segment because a tenant is not an attribute of the objects it
+  owns (20 classes, `pingExecTn` among them, carry a real `tenant` attribute,
+  and that one wins). The APIC cannot group, so the matching objects are fetched
+  and tallied in the server: it costs a full `fetch_all` where a plain count
+  costs one request, and the docs say so. The response gains `group_by`,
+  `groups` (largest first, ties by value), `ungrouped`, `complete` and `note`;
+  without `group_by` it is exactly what it was.
+
+  Objects with no value to group on are counted in `ungrouped`, never under a
+  `null` key: a JSON key is a string, and every string — `"null"`, `"None"`,
+  `""` — is a value some attribute can hold. An empty string *is* a value and
+  keeps its own group. Tenant derivation splits the DN only outside square
+  brackets, so an object under `uni/epp/fv-[uni/tn-A/ap-B/epg-C]/...`, which
+  merely *names* tenant A's EPG in a key and is not in A's subtree, stays
+  ungrouped instead of being credited to A.
+
+  **It never returns a partial breakdown.** If the fetch hits its cap, or
+  fetches a different number of objects from the total it was checked against,
+  `complete` is `false`, `groups` and `ungrouped` are `null`, `count` stays the
+  true total, and `note` says how to narrow. A partial list of groups reads as a
+  finding ("only two tenants have faults") when it is only where the fetch
+  stopped. The note names both ways a fetch stops short — the cap, or the APIC
+  ending its pages early — as `query`'s does. A set the plain count already
+  shows to be larger than one `fetch_all` can hold is withheld without fetching
+  it, rather than after walking 5,000 objects to reach the same answer, and a
+  set of zero is answered (`groups: {}`) without a fetch.
+
+- **The fabric's APIC release is compared with the catalogue's at startup.**
+  The log named only the release the catalogue was built from, which says
+  nothing about the fabric the server is connected to; an operator on another
+  train learned of the gap when a query came back empty, and an empty result
+  reads as "there are none". After the login the server now reads the
+  controller's running release (`firmwareCtrlrRunning`, filtered to
+  `type == "controller"`), normalises both strings — `apic-6.0(9c)`,
+  `APIC-6.0(9C)` and `6.0(9c)` are one release — and logs a `WARNING` naming
+  both and pointing to `SUPPORTED-APIC.md` when they differ.
+
+  It is advisory and never stops startup. A failed lookup, an empty answer, or a
+  string it cannot read is logged as *unknown* and leaves `fabric_version` `None`
+  in the lifespan context; a string the server merely failed to parse is never
+  reported as a different release, since claiming a mismatch it cannot establish
+  is the same kind of wrong answer the warning exists to prevent. Only the first
+  controller's release is read, so a rolling upgrade can briefly run mixed
+  releases the check does not see. The lookup is `ApicClient.controller_version()`.
+
+- **SKILL.md and the server instructions are pinned to the new surface.** Eight
+  tests tie what the agent reads to the code that gives it meaning: that
+  `fields` and `group_by` are shown in a call on a tool that takes them; that the
+  envelope table has a row for every key `QueryEnvelope` declares, and the
+  instructions' key list names them all; that every key
+  `count` can return is named and set; that every exception named in backticks
+  exists, and the switch an operator is told to set is the variable the code
+  reads, with `false` a value it honours; that the 200-per-page and 5,000-object
+  figures quoted in three places are the client's constants; and that the stale
+  sentences this change removed stay removed.
+
+  Mutation-tested: dropping the `fields` row, a 5,000 that disagrees with
+  `_MAX_OBJECTS` (in SKILL.md, and in the instructions), a mistyped switch name,
+  a renamed exception, `groups` withheld as `{}` instead of `null`, and each
+  stale sentence put back each fail the test written for it.
+
 - **SKILL.md's teaching vocabulary is linted against the catalogue.** Every
   backticked camelCase name in the skill file must be a real class, a real
   property, or a documented exception with a reason. A typo in a teaching
@@ -87,6 +253,173 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Changed
 
+- **FastMCP 3.4.11 → 4.2.6, and the MCP SDK 1.30 → 2.3.** `fastmcp>=4.2.6,<5` and
+  `mcp>=2.3,<3` (which FastMCP 4 requires; Python 3.12 and the other floors are
+  unchanged). The five tools, their names, parameters, annotations and results
+  are as they were; what moved is underneath, and each piece was checked rather
+  than assumed:
+
+  - **A schema slip in `query` or `count` is a tool error again.** FastMCP 3
+    validated a tool's return against its output schema; FastMCP 4 does not — it
+    serialises through the annotated type and sends the result, so a wrongly
+    typed value goes out with only a serialiser warning, and a key the TypedDict
+    does not declare is dropped without a trace. `query` and `count` now check
+    their envelope against its TypedDict before returning: strict (the wire is
+    JSON and a client does not coerce), undeclared keys refused, one pydantic
+    `TypeAdapter` built at import. A failure names the keys at fault, never their
+    values, and says it is a server defect. The advertised schema is unchanged
+    and still tolerates a key a newer server adds. Cost, on 5,000 objects of 40
+    attributes: 4.6 ms for the check, 12.0 → 16.8 ms for the tool function,
+    151 → 155 ms through an in-memory client — against seconds at the APIC.
+    `get_by_dn`, `search_classes` and `get_schema` return free-form shapes with
+    no typed envelope and are not covered.
+  - **Three protocol eras are served.** Checked over raw HTTP against a running
+    server: `initialize` on 2025-06-18 and 2025-11-25, and the 2026-07-28 era,
+    which has no handshake — `server/discover` and a per-request envelope — all
+    list the five tools and answer one call to each; `initialize` proposing
+    2026-07-28 negotiates 2025-11-25. `claude -p` (Claude Code 2.1.329) connected,
+    followed `search_classes` → `get_schema` → `count` and answered the live
+    count.
+  - **No listen streams.** FastMCP 4.2.5 serves `subscriptions/listen` by
+    default, and a client that supports it holds a stream open for as long as it
+    is connected. Five fixed tools publish no change notification, so a stream
+    would carry nothing and cost a connection (1,024 per process). It is off, so
+    the server advertises `listChanged` and `resources.subscribe` as false and
+    answers `subscriptions/listen` with method-not-found, as it did on 4.2.4.
+    Set on the settings object before the server is created, not through
+    `FASTMCP_ENABLE_SUBSCRIPTIONS_LISTEN`, which is read when `fastmcp` is
+    imported and loses to anything that imported it first.
+  - **Known future work: the tools' progress messages ride a deprecated
+    capability.** `ctx.info` and `ctx.warning` use the MCP logging capability,
+    which the SDK deprecated for the 2026-07-28 revision (SEP-2577) and will
+    remove. The calls are kept — they are how a client that still supports
+    logging sees what a tool refused — and the one warning they raise is silenced
+    (at runtime and under pytest, scoped to that message so other MCP
+    deprecations still surface). They will have to move to another channel before
+    the capability goes upstream.
+  - **About 12 MB more resident memory**: a fresh interpreter that imports the
+    server and warms the index peaks at ~210 MB, from ~198 MB. The footprint
+    test used to read the peak of the *whole pytest process*, which is whatever
+    every other test left behind — 488 to 516 MB against a 500 MB limit on the
+    same code, failing on some runs of 3.4.11. It now measures a fresh
+    interpreter, as the cold-start test beside it does, and the 500 MB budget
+    means what it said.
+  - The contract test read tool hints as attributes (`readOnlyHint`), which MCP
+    SDK v2 renames behind a deprecation bridge. It reads them through their wire
+    form, `model_dump(by_alias=True)`, which is what a client receives.
+
+- **Behind a reverse proxy on the same machine, set `MCP_ALLOWED_HOSTS`.** A
+  deployment that terminates TLS in Caddy, nginx or Traefik on the server host
+  reaches this process over loopback and forwards its public name in the `Host`
+  header; with the new `Host` validation (see Security) every such request,
+  `/health` included, is now answered `421 Misdirected Request` until the name is
+  listed: `MCP_ALLOWED_HOSTS=mcp.example.com`. The startup log says so when the
+  bind is loopback and the list is empty. A proxy on another machine, a LAN
+  deployment with `MCP_HOST=0.0.0.0` and API keys, and every client on the
+  machine itself are unaffected.
+
+- **Dev tooling moved to pytest 9.2.0, pytest-asyncio 1.5.0 and ruff 0.17.6.**
+  Ruff reports no findings under the existing rule selection. pytest-asyncio
+  1.5 warns when `asyncio_default_fixture_loop_scope` is unset, so it is set to
+  `fixture-scope`, which keeps the current loop behaviour. Lock only; no runtime
+  change.
+
+- **`get_schema` samples very long enumerations.** A property's `options` is
+  cut at max(`list_limit`, 100) and the entry gains `optionsTruncated:
+  {returned, total, note}`. `faultInst.code` enumerates 80,512 values, so
+  `get_schema("faultInst", properties_filter=["code"])` returned about 880 KB —
+  the largest tool result in agent-eval's tier F, on every server version — and
+  now returns about 5 KB. Only 13 of the catalogue's 3,947 enums exceed 100
+  values (median 3, 99th percentile 33), so ordinary enums stay whole at the
+  default `list_limit`. The note tells the agent that a value missing from the
+  sample may still be valid. `catalog.load_schema()` is unchanged; the bound is
+  applied at the tool surface like the `dnFormats` one.
+- **niwaki 1.8 → 2.2: the object model is the same, the catalogue is 10 MB
+  lighter.** `niwaki>=2.2,<2.3`, still a single minor. The one thing that moved
+  under this server is the private table it reads properties from: 2.1 replaced
+  `prop` (one row per class and property) with `prop_sig` (one row per distinct
+  property signature, 25,901 of them) and `class_prop` (which classes carry
+  which signature, the same 332,297 memberships). `catalog.py` now reads the
+  join, `verify_catalogue()` requires both tables, and the startup guard's
+  messages name the new pin. Everything else this server reads — the other
+  tables, the blob encodings, the manifest keys, 15,452 classes, APIC 6.0(9c) —
+  is unchanged, and the catalogue is 25,993,216 bytes instead of 36,229,120
+  (the wheel 16.8 MB instead of 18.8 MB).
+
+  Checked rather than assumed: the joined rows equal the old `prop` rows
+  exactly (332,297 of 332,297, every column), the rebuilt search index is
+  byte-identical to the recording, and the baseline passes unmodified. One
+  difference had to be handled: `prop` was keyed by `(class_id, wire_name)`, so
+  rows came back sorted by wire name without asking; `class_prop` returns them
+  in signature order. Search-index labels are built in that order, so
+  `prop_labels` now says `ORDER BY wire_name`, and a test checks the order
+  against the raw rows. Without it the digest test fails — the index changes —
+  but a bare "the index changed" says nothing about why.
+
+- **An attribute the catalogue does not know is now refused instead of sent —
+  a behaviour change for every `query` and `count` caller.** Before,
+  `query("fvBD", filters={"arpFlod": "yes"})` went to the APIC, which answered
+  HTTP 200 and `[]`, and `count` answered `0`: an invented name was
+  indistinguishable from "there are none", the failure this server exists to
+  prevent. Now every name the caller supplies is checked against the catalogue
+  before the request is built — the keys of `filters`, the attribute of each
+  `order_by` term, every class in `include_children`, and the `Class.attr`
+  operands of `filter_expr`. The first unknown attribute raises the new
+  `UnknownAttributeError`, an unknown class `UnknownClassError`, nothing reaches
+  the backend, and the error carries the closest real names. For an abstract
+  class the accepted names are the union of its own and its concrete subclasses',
+  so `hostBasedRouting`, declared by `fvBD`, is valid on `fvABD`. In
+  `filter_expr`, quoted values are masked before looking, so a dot inside a
+  string literal is never read as `Class.attr`, and anything not recognisably
+  `Class.attr` passes through untouched.
+
+  The catalogue describes one APIC release, and a fabric on another may
+  legitimately carry a name it lacks, so there is an escape hatch:
+  `NIWASHI_MCP_STRICT_ATTRIBUTES=false` sends the request anyway and says so —
+  appended to `query`'s `note`, never replacing the truncation note, or as a
+  `warnings` list on `count` that exists only then — and logs each problem. An
+  empty result beside such a note is not a zero. The switch is read on every
+  call, and any value other than `false`/`0`/`no`/`off` keeps it strict, so a
+  typo cannot quietly disable the check. The class named by `class_name` is
+  outside it: that check is older, and a typo there has no legitimate reading.
+
+  Not done: a guard for the relation-class trap in SKILL.md section 8, where a
+  `filter_expr` on `state`, `stateQual` or `tDn` returns zero results. Those are
+  real properties, so this validation passes them, and the premise a dedicated
+  guard would rest on was not measured for this change.
+
+- **`get_by_dn` now refuses an unknown class in `include_children` — a
+  behaviour change.** It used to send the request and return the object with no
+  `_children` and no warning, which reads as "this object has none": the APIC
+  embeds nothing for a class it does not know. The classes are checked, as
+  `query` checks them, before the request is built — `UnknownClassError`,
+  nothing sent — and with `NIWASHI_MCP_STRICT_ATTRIBUTES=false` the request goes
+  out and the object carries a `_note` saying which class was not recognised
+  (added to, never replacing, the note a `fields` warning writes). A
+  comma-joined item is read as the classes it is.
+
+- **`verify_catalogue()` refuses startup on two more kinds of damage.** It now
+  also fails when the catalogue's `inherits` table is missing or its columns
+  have moved, and when the abstract-class probe — `fvABD`, whose union with its
+  concrete subclasses must be wider than its own properties — comes back no
+  wider. Both are quiet failures: every query still runs, but an abstract
+  class's accepted attributes collapse to its own and valid names start being
+  refused as unknown.
+
+- **Every `query` envelope has a new key, `fields`, and `query` and `count`
+  advertise a typed `outputSchema`.** `fields` echoes the projection and is
+  `null` when none was asked for, so it is present on every result — the one
+  change a caller who never passes `fields` can see. Separately, both tools were
+  annotated `dict[str, Any]`, so FastMCP advertised
+  `{"type": "object", "additionalProperties": true}`: a client was told "an
+  object" and nothing about the keys an agent must read — `truncated`,
+  `complete`, `next_page`. They now return `QueryEnvelope` and `CountEnvelope`
+  typed dicts and the schema names the keys. `count`'s `group_by`, `groups`,
+  `ungrouped`, `complete`, `note` and `warnings` are declared optional, so a key
+  added later is an addition to the schema rather than a break of a client that
+  validates against it. `results` items stay free-form: which attributes an
+  object carries depends on its class.
+
 - **The rest of the audit's bogus-test list — deleted or rebuilt, none left as
   they were.** Two had no reason to exist; the other five were necessary and
   badly built.
@@ -145,7 +478,245 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
     skipped in CI and in every clean checkout. Measured on `git archive HEAD`:
     one skip, this test. The body never needed the directory.
 
+### Fixed
+
+- **A request the APIC refused was read as data: `count` returned 1, `query`
+  returned an error row marked `complete: true`.** The client raised only on an
+  HTTP status of 400 or more and parsed the body of everything else. The APIC
+  does not always refuse with such a status. On 6.0(9c), an `eq` or `ne` filter
+  whose value is not valid for its attribute (`eq(faultInst.code,"F0526")`,
+  `eq(fvBD.unicastRoute,"False")`, `eq(faultInst.severity,"huge")`: attributes
+  with a fixed set of values) is answered `HTTP/1.1 301 Moved Permanently`,
+  with no `Location` header and the body `{"totalCount": "1", "imdata":
+  [{"error": {"attributes": {"code": "301", "text": "Incorrect filter format
+  for faultInst.code, value 'F0526' is not valid"}}}]}`. The 301 is the APIC's
+  own error code reused as the status line; it is not a redirect (the same
+  request repeated gives the same answer, and `wcard` on the same attribute is
+  not validated and answers normally). Parsed as data, that body became
+  `count: 1` (its `totalCount`), a result row of class `error` with
+  `complete: true` (the error object read as a managed object), a `get_by_dn`
+  that "found" an object of class `error`, and a `fetch_all` that ended on it.
+  An agent counting fault codes with `eq` received thirteen bogus counts of 1
+  for codes the fabric has none of, while `wcard` on the same codes said 0. This
+  affected `main` as well as this branch: the status check is the same there.
+
+  The client now fails loudly, on every read it makes (one page, every page of a
+  `fetch_all` walk, `count`, both requests of `count(group_by=...)`, `get_by_dn`
+  found or not, `include_children`, the controller version):
+
+  - **Any status that is not 2xx raises `ApicRequestError`** unless it is
+    handled earlier: 401/403 still re-authenticate once and retry, and the
+    transient list (404, 500, 502, 503, 504) is still retried. That adds 3xx
+    (4xx and 5xx already raised). Redirects are never followed: the APIC's 3xx
+    carries none, and following one would send the session cookie to wherever
+    it pointed. This was already httpx's default; it is now set explicitly and
+    pinned by a test.
+  - **An `error` object in `imdata` raises `ApicRequestError` whatever the
+    status**, including a 200, and including a body that mixes error objects
+    with data rows (the rows are discarded and a warning is logged: the answer
+    that also says "no" is not trusted as the whole answer).
+  - A malformed envelope (a body that is not an object, or an `imdata` that is
+    not a list) is an `ApicResponseError`, as a missing `imdata` already was.
+
+  What an agent sees: a tool error such as `APIC request to
+  https://…/api/class/faultInst.json failed with HTTP 301: Incorrect filter
+  format for faultInst.code, value 'F0526' is not valid`, where it saw a number
+  or a row. **A filter that used to answer 1 or an error row now raises**; to ask
+  whether a fault code is present, `count` it with `wcard` (or `group_by="code"`)
+  rather than `eq`, since `eq` is checked against the attribute's allowed values.
+  `ApicRequestError` gains `apic_code` (the APIC's own code) next to `status` and
+  `apic_text`, and the message adds `(APIC error code N)` when it differs from
+  the status. Both are cut to one line and 500 characters: they come off the
+  wire. Nothing secret can be in them that the caller did not send: a predicate
+  on a secret attribute, or a value spelling a secret DN, is refused before any
+  request is made, so the APIC never has the value to echo.
+
+- **`serverInfo.version` reported FastMCP's version, not niwashi-mcp's.** The
+  server was built without a version and FastMCP fills the field with its own, so
+  every client saw `niwashi-mcp` next to `4.2.6` (`3.4.11` before the move) on
+  both protocol eras, and a bug report quoting what the server announced named
+  the wrong package's release. It is read from the installed distribution's
+  metadata, so `pyproject.toml` stays the one place a release is numbered; a
+  source tree that was never installed reports `0+unknown`.
+
+- **`fetch_all` capped a "fetch everything" call at 500 objects, not the 5,000
+  it advertised.** It paged by the caller's `limit` and stopped after 25 pages,
+  so the default `limit=20` ended a call at 25 x 20 = 500 objects and reported
+  `complete: false` on a 600-object set the cap was never meant to touch; a set
+  of exactly 25 x `limit` objects was reported incomplete too, because the loop
+  fell out of its `for` without a `break` on a page that had left nothing
+  behind. The page size is now fixed at 200 — the largest page `query` already
+  sends, so a full 5,000-object walk is 25 requests instead of 250 — and the cap
+  is 5,000 objects, which lands on a page boundary: nothing is fetched past it
+  and nothing trimmed. After each page the walk checks whether everything the
+  APIC's `totalCount` reported is in hand (`complete: true`, with no extra empty
+  request for an exact multiple of the page size) before asking for another.
+
+  Two behaviours differ for any caller of `fetch_all`. **`limit` no longer means
+  anything under it** — it is not the page size any more, and `page` was already
+  ignored. And **an early end is now an incomplete result**: a short or empty
+  page while `totalCount` says more is due — the APIC ran dry — used to be taken
+  as the natural end and reported `complete: true`; it is now `complete: false`
+  with a logged warning, and the `note` covers both ways a walk can stop short,
+  the cap and the APIC's pages ending first. With no `totalCount` at all a short
+  page is still trusted as the end, as before.
+
+  **An object that arrives twice is kept once and counted once.** The set is not
+  frozen while it is walked: an object created or deleted early in it shifts
+  every later page by one, so the object on a page boundary can arrive twice and
+  another be skipped. Counting the repeat toward `totalCount` made the walk reach
+  the count one object short and report `complete: true` with a duplicate in the
+  answer (and `count(group_by=...)`, which tallies the same objects, would have
+  counted it twice). The walk now keeps the first copy of each `dn` — objects
+  with no `dn` are all kept — compares the distinct count with `totalCount`, and
+  logs how many it dropped. A short page is still judged on what the APIC sent,
+  not on what was kept.
+
 ### Security
+
+- **The `Host` and `Origin` headers are validated, against DNS rebinding.** A
+  server on loopback is not out of a web page's reach: the page makes the
+  victim's browser resolve its own name to `127.0.0.1` after it has loaded, then
+  talks to the server as if it were same-origin. Loopback allows authentication
+  to be off, and a `SIGHUP` reload on a loopback bind may empty the key set later,
+  so there may be nothing else to stop it. The one thing the page cannot hide is
+  the `Host` header, which still carries its own domain; FastMCP's
+  `host_origin_protection="auto"` checks it and is now on.
+
+  A request that **arrives on a loopback address** must name `localhost`,
+  `127.0.0.1`, `::1` or a host in `MCP_ALLOWED_HOSTS`, or it is answered `421`; a
+  cross-origin `Origin` is answered `403`. A request that arrives on a routable
+  address is left alone unless `MCP_ALLOWED_HOSTS` is set, in which case the list
+  applies on every address — so a LAN deployment with `MCP_HOST=0.0.0.0` and API
+  keys is unchanged. Measured on a real server, with the proxy's `Host` header set
+  by hand: the loopback bind refused an unlisted `Host` (421), served `127.0.0.1`, served the public name once listed
+  and refused another; a `0.0.0.0` bind reached over the LAN address was not
+  validated without a list and was with one. It applies whether or not
+  `MCP_API_KEYS` is set, because the key set can change at runtime and the guard
+  must not depend on it. **Action required behind a same-host reverse proxy**: see
+  Changed. `MCP_ALLOWED_ORIGINS` is not added: only a browser sends an `Origin`,
+  and none is a documented client.
+
+- **The FastMCP 4.2.6 / MCP 2.3 move closes one published advisory and the
+  hardening that came with it.** Checked against GitHub's advisory database and
+  the FastMCP repository's own advisory list (which is ahead of it): of the 25
+  advisories published for `fastmcp`, **one** is open on 3.4.11 and fixed only on the
+  4.x line, and 4.2.6 is outside the range of every one. For the MCP SDK, the
+  advisories the old `mcp>=1.30.0` floor covered are fixed on 2.x at 2.2.0, so
+  `mcp>=2.3` (which FastMCP 4 requires) keeps all of them closed. None of the
+  locked packages has a published advisory at its locked version.
+
+  **Reachable by this server:** none. niwashi authenticates callers with its own
+  API-key middleware, configures no FastMCP auth provider, OAuth proxy, OpenAPI
+  provider or task worker, and runs no FastMCP client. Listed because the project
+  names every advisory a bump fixes, with whether it reached it:
+
+  - **fastmcp 4.2.4** — [GHSA-78c8-3jhx-5mg7](https://github.com/advisories/GHSA-78c8-3jhx-5mg7)
+    (medium): the OAuth proxy could redeem one authorization code, or one refresh
+    token, twice when two token requests arrived concurrently. Affects fastmcp
+    2.13.0 to 4.2.3, so 3.4.11 was affected and the 3.x line has no fix. Not
+    reached: no `OAuthProxy` or `OIDCProxy` exists here.
+  - **fastmcp 4.1.7, 4.2.1 and 4.2.5 — security fixes with no advisory assigned**
+    (named in the release notes only): `joserfc` and `Authlib` floors raised and
+    raw-string redirect URIs normalised before validation (4.1.7); JWTs with a
+    future `nbf` rejected, OAuth consent remembered per redirect URI and scope
+    set, issuer binding for pre-registered clients, `required_scopes` kept when a
+    custom token verifier is given, and the `opentelemetry-api` floor raised past
+    the traceparent ReDoS already named below, GHSA-mf5v-w3w3-f6cg (4.2.1);
+    CIMD clients can no longer widen the scopes a server allows, redirect URIs
+    must match an exact pattern's query and root path, a reused rotated refresh
+    token ends its grant, and OpenAPI tools stop forwarding MCP transport headers
+    (4.2.5). All of it is OAuth or OpenAPI code. Not reached.
+  - **fastmcp 4.1.0, relevant to the new skill resource** —
+    [GHSA-pwp3-fpg3-p53c](https://github.com/advisories/GHSA-pwp3-fpg3-p53c) (low):
+    skill providers read a `SKILL.md` that was a symlink pointing outside its
+    folder. Fixed on 3.4.9 and on 4.1.0, so it never applied to 3.4.11 and is
+    closed in 4.2.6; the skill here is loaded from package data, not from a
+    folder a user controls.
+  - **mcp 2.2.0** — the same five the 1.30.0 floor covered, fixed on 2.x at 2.2.0:
+    [GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv),
+    [GHSA-qx49-fqc8-xw99](https://github.com/advisories/GHSA-qx49-fqc8-xw99),
+    [GHSA-w4fh-qvv9-3v23](https://github.com/advisories/GHSA-w4fh-qvv9-3v23),
+    [GHSA-5h93-6whr-6q8j](https://github.com/advisories/GHSA-5h93-6whr-6q8j) and
+    [GHSA-rwrf-2pqf-9j8j](https://github.com/advisories/GHSA-rwrf-2pqf-9j8j).
+    Explained in the entry below; the floor is now 2.3.
+  - **authlib, keyring and their dependencies leave the tree.** FastMCP 4 no
+    longer pulls `authlib`, so the seven `authlib` advisories listed below stop
+    being carried at all, not merely patched.
+
+- **`query`, `get_by_dn` and `count` no longer hand an agent the secrets an APIC
+  returns in clear.** Measured on a 6.0(9c) lab fabric before the fix: the
+  password of an L4-L7 device credential (`vnsCCred.value`, 16 objects), the SNMP
+  trap community (`snmpTrapDest.secName`, 7), a community string that is both the
+  name and the DN of its `snmpCommunityP`, and the session tokens that name
+  `aaaActiveUserSession` objects were all returned as the APIC sent them, and
+  `count(group_by=...)` would have printed any attribute as a group key. Nothing
+  was redacted; the only "secure" in the source was a flag name in `catalog.py`.
+
+  **What is withheld.** A secret attribute reads `<redacted>` in every object,
+  children and subtree objects included, whatever `fields` asked for — and **empty
+  ones too**, so "set" and "unset" cannot be told apart. A DN that passes through a
+  secret (`community-`, `actsession-`, `delsession-`, `sitejwtpubkey-`) has that
+  segment cut wherever a DN appears: `dn`, `rn`, `tDn`, an audit record's
+  `affected`, inside `subj-[...]`. The policy is niwaki's own — the schema's
+  `secure` flag (169 properties), the curated `SECRET_VALUE_POSITIONS` (25) and
+  the secret-DN classes — so the SDK's `snapshot.take()` and this server agree.
+  `verify_policy()` runs at startup, after the catalogue check and before the APIC
+  session opens, and stops the server naming what moved: `niwaki._secrets` is
+  private and a copy of it would go stale silently.
+
+  **What goes beyond niwaki 2.2.** A curated position on an abstract class now
+  reaches its concrete subclasses (`snmpACommunityP.name` names a class no
+  response carries; `snmpCommSecP` is named by its community string too, and
+  niwaki's DN list lacked it). The DN is cut, where niwaki's snapshot only warns.
+  And four positions measured live and absent from niwaki 2.2 —
+  `aaaSessionLR.sessionId`, `aaaUserProfile.otpkey`, `pkiFabricSelfCAEp`'s two certificate-request
+  passphrases — are carried in a short supplement that a test drops when niwaki
+  2.3 absorbs it.
+
+  **Audit, event and session records.** The APIC writes secrets into its own logs:
+  `aaaModLR.changeSet` carried credential and community values, `eventRecord` the
+  OTP seed, session tokens and a trap community, `aaaSessionLR.sessionId` the
+  session token. These are scrubbed, not withheld, so audit questions still work:
+  `changeSet` is parsed in both formats (`prop:value, prop:value`, 12,437 of the
+  lab's 12,493, and `prop (Old: x, New: y)`), the value of each secret pair is
+  replaced using the class read from the `affected` DN (every secret property
+  name when none fits — over-masking, never raising), a secret met in a DN is cut
+  and then removed from the record's other text. Text that names a secret property
+  but cannot be parsed, or that still holds a secret once scrubbed, is replaced
+  whole. **This is best effort and the response says so.**
+
+  **Requests that would reveal one are refused**, in both
+  `NIWASHI_MCP_STRICT_ATTRIBUTES` modes and before the APIC is called:
+  `filters`, `order_by`, `filter_expr` operands and `group_by` on a secret
+  attribute, on `dn`/`rn` of a class named by a secret, or on `changeSet`
+  (`SecretAttributeError`); and any DN, `scope_dn`, filter value or `filter_expr`
+  that spells a secret RN segment (`SecretDnError`). `get_by_dn` refuses such a DN
+  on its shape alone, so "found" and "not found" cannot check a guess — an
+  existing and a missing DN get the identical answer. `filter_expr` operands are
+  found by shape, not by the typo check's conservative extractor, so a predicate
+  cannot hide one by how it is written.
+
+  **The agent is told, without being told what.** `query`'s envelope gains an
+  optional `redacted` count and a `note`; `get_by_dn` an optional `_redacted` and
+  `_note`; `count(group_by=...)` an optional `redacted`. All are absent when
+  nothing was withheld, so an ordinary object is byte-identical to what it was.
+  `get_schema` marks `"secret": true` on a secret property (names stay listed) and
+  `"scrubbed": true` on `changeSet`.
+
+  **Cost.** 1.4 microseconds an ordinary object, about 7 for an audit record whose
+  `changeSet` is parsed: 0.01 to 5 percent of what the same objects cost to fetch
+  from the lab APIC (0.2 to 24 ms each).
+
+  **Known limits**, documented in `docs/internals/redaction.md`: a fabric newer than
+  the catalogue (an unflagged secret in a class it lacks, covered only by a name
+  heuristic); a secret reused as a name elsewhere, which is visible as that name;
+  substring probes through the DN and free-text attributes of other classes
+  (`wcard` on an audit record's `affected` or `descr`); and free text in a form the
+  scrubber does not recognise. There is no opt-out. Every decision sits in one
+  module, `niwashi_mcp/redact.py`, whose interface follows what niwaki 2.3 plans
+  to publish as `niwaki.secrets`, so the switch is a change to that file and its
+  niwaki-coupled tests.
 
 - **24 published advisories in the locked dependencies are fixed** (#38).
   `pip-audit` reported 35 findings on 7 packages; on the exported lock it now
@@ -169,7 +740,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
     request metadata on every tool call and tool listing, so a caller able to
     reach `/mcp` could burn CPU with a crafted header. `/mcp` requires an API key
     except on a loopback development bind, which bounds who that caller can be.
-  - **fastmcp ≥ 3.4.10** (3.4.11 locked) —
+  - **fastmcp ≥ 3.4.10** (3.4.11 locked; since moved to ≥ 4.2.6, see above) —
     [GHSA-7xgj-8392-5q4r](https://github.com/advisories/GHSA-7xgj-8392-5q4r)
     (medium): authorization added by component transforms was skipped on direct
     calls. This server defines no per-tool authorization, so the practical
@@ -178,7 +749,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   **Defence in depth — present in the dependency tree, not on this server's
   paths:**
 
-  - **mcp ≥ 1.30.0** (new direct floor) —
+  - **mcp ≥ 1.30.0** (new direct floor; since moved to ≥ 2.3, see above) —
     [GHSA-84m7-p3x7-pcfv](https://github.com/advisories/GHSA-84m7-p3x7-pcfv)
     (unbounded StreamableHTTP session accumulation). The server runs
     `stateless_http=True`, so it holds no sessions and was not exposed in its
@@ -217,6 +788,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
     and [GHSA-vvf4-9x63-8xvv](https://github.com/advisories/GHSA-vvf4-9x63-8xvv)
     (high, CPU and memory exhaustion in DNS wire and zone parsing). Pulled in
     only by email-validator; no DNS parsing runs in this server.
+- `python-dotenv` 1.2.2 → 1.2.4 (direct dependency), and the dev tools `pytest` 9.2.0, `pytest-asyncio` 1.5.0 and `ruff` 0.17.6, bumped in the same lock; no advisory involved.
 
 ---
 

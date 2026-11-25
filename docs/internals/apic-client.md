@@ -30,6 +30,7 @@ classDiagram
         +query_class(class_name, filters, scope_dn, ...) QueryResult
         +get_by_dn(dn, config_only, include_children) dict | None
         +count_class(class_name, filters, scope_dn, filter_expr) int
+        +controller_version() str | None
         +close() None
     }
 
@@ -170,17 +171,28 @@ Children are only included when `include_children` is set.
 
 | Mode | Behaviour |
 |---|---|
-| `fetch_all=False` (default) | One request. `page` is sent only when the caller supplied it. `QueryResult.complete` is always `True` — it describes the loop, not the result set |
-| `fetch_all=True` | Pages `0, 1, 2, …` with `page-size = limit`, accumulating into one `QueryResult`. `page` is ignored |
+| `fetch_all=False` (default) | One request with `page-size = limit`. `page` is sent only when the caller supplied it. `QueryResult.complete` is always `True` — it describes the loop, not the result set |
+| `fetch_all=True` | Pages `0, 1, 2, …` with a fixed `page-size` of 200, accumulating into one `QueryResult`. `limit` and `page` are both ignored |
 
-The loop stops at the first short page — fewer objects than `limit`, the natural end of the set — or at one of two safety caps:
+The three constants that govern a walk:
 
 ```python
-_MAX_PAGES = 25
+_FETCH_ALL_PAGE_SIZE = 200
 _MAX_OBJECTS = 5000
+_MAX_PAGES = _MAX_OBJECTS // _FETCH_ALL_PAGE_SIZE   # 25
 ```
 
-A fabric-wide class scan with no `scope_dn` can be unbounded (a bad filter, or a class with tens of thousands of instances), so the page loop needs a hard stop independent of the caller's `limit`. Hitting either cap sets `complete=False` on the returned `QueryResult`; a natural end leaves it `True`. `total_available` is re-read from every page and always reports the APIC's own `totalCount`, so a capped result still tells the caller how much it did not fetch.
+The page size is fixed rather than taken from the caller's `limit` because the two used to be coupled and the coupling made the cap unreachable: the loop stopped after 25 pages, so the default `limit=20` capped a "fetch everything" call at 25 × 20 = 500 objects — a tenth of the advertised 5,000 — and reported `complete=False` on sets the cap was never meant to touch. 200 is the largest page the `query` tool already sends (its `limit` clamp is `[1, 200]`), so it is a page size this server issues to the APIC anyway, and a full walk is 25 requests rather than 250. `_MAX_OBJECTS` is a multiple of it, so the cap lands on a page boundary: the loop never holds an object past the cap and nothing is fetched only to be discarded. `_MAX_PAGES` is derived from the other two, and is the loop's hard bound.
+
+After each page the loop checks, in this order:
+
+1. **Everything `totalCount` reported is in hand** — `complete=True`. "In hand" counts *distinct* objects: each page's objects are de-duplicated by `dn` as they arrive (first copy kept; an object with no `dn` is always kept). The set can shift while it is walked — an object created or deleted early in it moves every later page by one, so the object on a page boundary arrives twice and another is never sent — and counting the repeat would reach `totalCount` one object short, `complete=True` with a duplicate in the answer. Dropped repeats are logged as a warning. This is checked first, so a set that is an exact multiple of the page size ends here with no extra, empty request, and a set of exactly 5,000 objects is complete rather than "capped".
+2. **The page was short or empty** — the natural end of the set. "Short" is what the APIC sent, not what was kept: a full page that repeated an object is still a full page. With no `totalCount` to compare against (absent or not a number) that is all the evidence there is, and the result is `complete=True`, as it has always been. If a `totalCount` *was* reported and has not been reached, the APIC ran dry early: the loop stops (it never requests page after empty page), logs a warning, and returns `complete=False`.
+3. **The page was full** — request the next, until `_MAX_PAGES` pages have been fetched. Falling out of the loop is the cap: `complete=False`, with `total_available` still carrying the APIC's own `totalCount` so the caller knows how much it did not get.
+
+`totalCount` is re-read from every page and the latest value wins; a page that omits it keeps the earlier figure. Completeness is therefore a count: if the set shrinks to the number of distinct objects already in hand, those are every object the APIC says there now is, and the walk is complete. With none ever reported, `total_available` falls back to the number of objects fetched — and a walk that fills all 25 pages without ever meeting a short page is reported `complete=False`, never guessed complete.
+
+A fabric-wide class scan with no `scope_dn` can be unbounded (a bad filter, or a class with tens of thousands of instances), so the loop needs a hard stop independent of the caller. Objects past the cap are never fetched, never returned and never trimmed after the fact. The `query` tool reports a capped or early-ended walk through `complete=false` and a `note` — one note for both, since the agent's next move (narrow the query and combine) is the same.
 
 ---
 
@@ -207,9 +219,34 @@ Measured on an APIC 6.0(9c) simulator; the `moCount` behaviour has not been re-c
 
 ---
 
+## `controller_version()` — the fabric's own release
+
+One GET, called once at startup after the login (see the [startup sequence](../architecture/overview.md#startup-sequence)):
+
+```text
+GET /api/class/firmwareCtrlrRunning.json
+    ?query-target-filter=eq(firmwareCtrlrRunning.type,"controller")
+→ imdata[0].firmwareCtrlrRunning.attributes.version        e.g. "apic-6.0(9c)"
+```
+
+The class also carries switch and plugin firmware, hence the `type == "controller"` filter. `firmwareCtrlrRunning` and both attributes are in the shipped catalogue (`tests/unit/test_fabric_version.py` checks they stay there). The filter is built by `build_filter()` like every other, and the request goes through `_request_json()`, so it re-authenticates on 401/403 and retries transient failures with everything else.
+
+It returns the string **as the APIC wrote it**, stripped. Reading it is not this method's job: `niwashi_mcp.apic.version.normalise_apic_version()` turns `apic-6.0(9c)`, `APIC-6.0(9C)` and `6.0(9c)` into one canonical form so they compare equal, and returns `None` for anything that is not a release string, so an unfamiliar format is "unknown" rather than "different".
+
+| Outcome | Result |
+|---|---|
+| An object with a usable `version` | the stripped string |
+| `imdata` empty — no controller firmware object | `None` — nothing reported is an answer, not an error |
+| An object that arrived but has no usable `version` (missing, blank, not a string, wrong class) | `ApicResponseError` — malformed, which must not read as "nothing reported" |
+| Any transport or auth failure | the usual `Apic*Error` |
+
+A cluster answers with one object per controller; only `imdata[0]` is read. `check_fabric_version()` in `apic/version.py` is the only caller, and it catches everything this method can raise: the lookup is advisory and never stops startup.
+
+---
+
 ## Retry and backoff
 
-`query_class()`, `get_by_dn()`, and `count_class()` all funnel through one shared method, `_request_json()` — the single transport path for every read this client makes. It retries up to `retry_attempts` total attempts (default 3) with exponential backoff (`_backoff_delay`: `base × 2^(attempt-1)`, capped at 2.0 s) for:
+`query_class()`, `get_by_dn()`, `count_class()` and `controller_version()` all funnel through one shared method, `_request_json()` — the single transport path for every read this client makes. It retries up to `retry_attempts` total attempts (default 3) with exponential backoff (`_backoff_delay`: `base × 2^(attempt-1)`, capped at 2.0 s) for:
 
 - Connection-level errors (`httpx.TimeoutException`, `httpx.ConnectError`)
 - HTTP statuses in `_TRANSIENT_STATUSES` = `{404, 500, 502, 503, 504}` — 404 is deliberately included here: nothing in this client ever reaches the backend with a genuinely-unverified class name or treats a missing object as a 404 (see the constant's docstring in `client.py`), so an observed 404 is presumed to be infrastructure noise, not a real "not found"
@@ -228,7 +265,8 @@ The table below describes the read path (`_request_json()`). See [exceptions.md]
 |---|---|
 | `httpx.TimeoutException` / `httpx.ConnectError` | `ApicConnectionError`, once the retry budget is exhausted — but immediately, on the first failure, when raised from `authenticate()` |
 | `resp.status_code in (401, 403)` | triggers re-auth; then `ApicAuthError` if still failing |
-| `resp.status_code` non-2xx, non-401/403 (e.g. 400, or transient 404/500/502/503/504 that never recovered) | `ApicRequestError` — carries the HTTP status and, when present, the APIC-supplied error text |
+| `resp.status_code` non-2xx, non-401/403 (e.g. 400, a 3xx, or transient 404/500/502/503/504 that never recovered) | `ApicRequestError` — carries the HTTP status and, when present, the APIC's error code and text. A 3xx is not a redirect: the APIC answers an `eq`/`ne` filter value that is invalid for its attribute with a `301` and an error body, and redirects are never followed |
+| status 2xx, but an `error` object among the `imdata` items (alone, or mixed with data rows) | `ApicRequestError` — same fields; a mixed answer is discarded whole, with a logged warning |
 | `resp.json()` raises `ValueError` | `ApicResponseError` |
-| `"imdata"` missing from body | `ApicResponseError` |
+| `"imdata"` missing from body, or not a list | `ApicResponseError` |
 | login body carries no `imdata[0].aaaLogin.attributes.token` | `ApicResponseError` — from `authenticate()` only |

@@ -49,7 +49,7 @@ flowchart LR
     tools["search_classes"]
 
     db -->|"read-only, immutable"| cat
-    cat -->|"mo and prop tables,<br/>label and comment pools"| idx
+    cat -->|"mo, prop_sig and class_prop tables,<br/>label and comment pools"| idx
     idx -->|"tokenised once on first search"| tools
 ```
 
@@ -136,7 +136,7 @@ sequenceDiagram
 Four points about that output are easy to get wrong:
 
 - **Property names are wire names.** `descr`, not `description`. The catalogue also stores a readable name for each property; this server never reads it, because a readable name is syntactically valid to the APIC and comes back with `[]` and no error.
-- **`relationTo[*].cardinality` is empty for every entry.** That has always been true and is unchanged in 2.0 — the real cardinality lives on the relation class itself.
+- **`relationTo[*].cardinality` is empty in `load_schema()`'s own output.** The relation dicts in the residual blob carry none, and `load_schema()` stays the faithful projection the baseline pins. The `get_schema` tool fills it, and adds `kind` (and both keys to `relationFrom`), from the `relation` table via `catalog.annotate_relations()` — one indexed lookup per call.
 - **An unknown class returns `{}`, not an exception.** An agent recovers from an empty result; it does not recover from a traceback. The only exception this path raises is `DescriptionsLoadError`, and it means the catalogue is missing or unreadable — a broken installation, not a missing class.
 - **`contains` is flattened, `relationTo` and `relationFrom` are not.** Strip the colon before querying a relation class.
 
@@ -210,12 +210,12 @@ sequenceDiagram
     end
 
     apic-->>tool: QueryResult — objects, total_available, complete
-    tool-->>LLM: envelope — results, returned, total_available,<br/>truncated, next_page, complete, note
+    tool-->>LLM: envelope — results, returned, total_available,<br/>truncated, next_page, complete, note, fields
 ```
 
-The envelope is not a bare list, and `truncated: true` must never be read as a maximum, a minimum, a total, or a complete list. `total_available` is the APIC-reported size of the matching set regardless of how much was fetched; `fetch_all=True` walks pages until a short page ends the loop or a safety cap of 25 pages or 5,000 objects sets `complete: false`.
+The envelope is not a bare list, and `truncated: true` must never be read as a maximum, a minimum, a total, or a complete list. `total_available` is the APIC-reported size of the matching set regardless of how much was fetched; `fetch_all=True` walks pages of 200 (whatever `limit` is) until everything `totalCount` reported is in hand; a safety cap of 5,000 objects, or the APIC ending its pages before that count, sets `complete: false`.
 
-`count` follows the same validation path — the identical `class_exists` guard, so the two tools can never disagree about whether a class is known — then issues the same class or subtree request with a page size of 1 and reads `totalCount` from the envelope.
+`count` follows the same validation path — the identical `class_exists` guard, so the two tools can never disagree about whether a class is known — then issues the same class or subtree request with a page size of 1 and reads `totalCount` from the envelope. With `group_by` set it then also walks the matching set the way `fetch_all=True` does and tallies it in the server, because the APIC cannot group — see [`count`](../tools/count.md#grouping-group_by).
 
 ---
 
@@ -234,7 +234,7 @@ flowchart TD
     URL_CLASS --> PARAMS
 
     subgraph PARAMS["Query parameters added when present"]
-        P1["page-size = limit"]
+        P1["page-size = limit<br/>(200 when fetch_all is true)"]
         P2["query-target-filter = built filter and filter_expr,<br/>combined with an APIC and predicate"]
         P3["order-by = order_by"]
         P4["rsp-subtree=children plus rsp-subtree-class=X,Y<br/>when include_children is set"]

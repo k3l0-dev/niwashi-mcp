@@ -889,3 +889,660 @@ async def test_query_truncation_survives_a_limit_that_gets_clamped():
     assert envelope["truncated"] is True, "consumed was computed on the unclamped limit"
     assert envelope["next_page"] == 3
     assert envelope["note"] is not None
+
+
+# ── field projection ──────────────────────────────────────────────────────────
+#
+# Projection happens in the tool layer, after the backend answers, so the stub
+# needs no support for it: these tests assert what the tool does to what any
+# backend returned. A wide class is ~40 attributes an object; `fields` exists so
+# an agent can ask for the three it will read.
+
+_WIDE_IMDATA = [
+    {
+        "fvBD": {
+            "attributes": {
+                "dn": "uni/tn-OT/BD-servers",
+                "name": "servers",
+                "descr": "prod servers",
+                "arpFlood": "no",
+                "unicastRoute": "yes",
+                "modTs": "2026-01-01T00:00:00.000+00:00",
+            },
+            "children": [
+                {
+                    "fvSubnet": {
+                        "attributes": {
+                            "dn": "uni/tn-OT/BD-servers/subnet-[10.0.1.1/24]",
+                            "ip": "10.0.1.1/24",
+                            "scope": "private",
+                            "descr": "gw",
+                        }
+                    }
+                },
+                {
+                    "fvRsCtx": {
+                        "attributes": {
+                            "dn": "uni/tn-OT/BD-servers/rsctx",
+                            "tnFvCtxName": "ot.main.vrf",
+                            "state": "formed",
+                        }
+                    }
+                },
+            ],
+        }
+    },
+    {
+        "fvBD": {
+            "attributes": {
+                "dn": "uni/tn-OT/BD-clients",
+                "name": "clients",
+                "descr": "",
+                "arpFlood": "yes",
+                "unicastRoute": "yes",
+                "modTs": "2026-01-02T00:00:00.000+00:00",
+            }
+        }
+    },
+    {
+        "fvAEPg": {
+            "attributes": {
+                "dn": "uni/tn-OT/ap-prod/epg-web",
+                "name": "web",
+                "descr": "front end",
+                "prio": "level1",
+            }
+        }
+    },
+]
+
+
+@pytest.fixture
+def strict_attributes(monkeypatch):
+    """Attribute checking on, whatever the developer's shell exports."""
+    monkeypatch.delenv("NIWASHI_MCP_STRICT_ATTRIBUTES", raising=False)
+
+
+@pytest.fixture
+def relaxed_attributes(monkeypatch):
+    monkeypatch.setenv("NIWASHI_MCP_STRICT_ATTRIBUTES", "false")
+
+
+@pytest.mark.asyncio
+async def test_query_without_fields_returns_the_backends_objects_untouched():
+    """`fields` unset must change nothing about the objects an agent receives.
+
+    Compared against what the backend itself returns, serialised, so a stray
+    reordering or a dropped key fails — and the envelope's key set is pinned, so
+    the one intended difference (`fields: null`) is the only one.
+    """
+    import json
+
+    from niwashi_mcp.main import query
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+    raw = await StubBackend(_WIDE_IMDATA).query_class(
+        "fvBD", {}, include_children=["fvSubnet", "fvRsCtx"]
+    )
+
+    omitted = await query("fvBD", ctx, include_children=["fvSubnet", "fvRsCtx"])
+    explicit = await query(
+        "fvBD", ctx, include_children=["fvSubnet", "fvRsCtx"], fields=None
+    )
+
+    assert json.dumps(omitted["results"]) == json.dumps(raw.objects)
+    assert omitted == explicit
+    assert omitted["fields"] is None
+    assert set(omitted) == {
+        "results", "returned", "total_available", "truncated",
+        "next_page", "complete", "note", "fields",
+    }
+
+
+@pytest.mark.asyncio
+async def test_query_fields_reduces_every_result_to_the_listed_attributes(
+    strict_attributes,
+):
+    from niwashi_mcp.main import query
+
+    envelope = await query("fvBD", _stub_ctx(_WIDE_IMDATA), fields=["name", "arpFlood"])
+
+    assert envelope["returned"] == 2
+    for obj in envelope["results"]:
+        # `_children` is kept wherever the APIC sent children, requested or not.
+        assert set(obj) - {"_children"} == {"name", "arpFlood", "dn", "_class"}
+        assert "descr" not in obj and "modTs" not in obj
+    assert envelope["fields"] == ["name", "arpFlood"]
+    assert envelope["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_query_fields_never_drops_dn_class_or_children(strict_attributes):
+    """An empty projection keeps exactly the three keys that cannot be removed.
+
+    `dn` is how the object is addressed again, `_class` what it is, `_children`
+    the subtree the caller asked to embed. Dropping any of them would leave a
+    result nobody can follow up on.
+    """
+    from niwashi_mcp.main import query
+
+    envelope = await query(
+        "fvBD", _stub_ctx(_WIDE_IMDATA), include_children=["fvSubnet"], fields=[]
+    )
+
+    servers = next(o for o in envelope["results"] if o["dn"].endswith("BD-servers"))
+    clients = next(o for o in envelope["results"] if o["dn"].endswith("BD-clients"))
+    assert set(servers) == {"dn", "_class", "_children"}
+    assert set(clients) == {"dn", "_class"}, "a `_children` key appeared from nowhere"
+    assert envelope["fields"] == []
+    assert "fields=[]" in envelope["note"], "an empty projection must say what it is"
+
+
+@pytest.mark.asyncio
+async def test_query_fields_naming_the_always_kept_keys_is_accepted(strict_attributes):
+    from niwashi_mcp.main import query
+
+    envelope = await query(
+        "fvBD", _stub_ctx(_WIDE_IMDATA), fields=["dn", "_class", "_children", "name"]
+    )
+
+    assert {o["name"] for o in envelope["results"]} == {"servers", "clients"}
+
+
+@pytest.mark.asyncio
+async def test_query_fields_reduces_each_child_too(strict_attributes):
+    from niwashi_mcp.main import query
+
+    envelope = await query(
+        "fvBD",
+        _stub_ctx(_WIDE_IMDATA),
+        filters={"name": "servers"},
+        include_children=["fvSubnet", "fvRsCtx"],
+        fields=["name", "ip", "tnFvCtxName"],
+    )
+
+    (servers,) = envelope["results"]
+    assert set(servers) == {"name", "dn", "_class", "_children"}
+    subnet, rsctx = servers["_children"]
+    assert subnet == {
+        "dn": "uni/tn-OT/BD-servers/subnet-[10.0.1.1/24]",
+        "ip": "10.0.1.1/24",
+        "_class": "fvSubnet",
+    }
+    assert rsctx == {
+        "dn": "uni/tn-OT/BD-servers/rsctx",
+        "tnFvCtxName": "ot.main.vrf",
+        "_class": "fvRsCtx",
+    }
+
+
+@pytest.mark.asyncio
+async def test_query_fields_valid_only_on_an_included_child_class_is_accepted(
+    strict_attributes,
+):
+    """`ip` is a property of fvSubnet, not of fvBD.
+
+    The same field is refused without the include: the pair is what proves the
+    check consults `include_children` rather than being lax, or ignoring it.
+    """
+    from niwashi_mcp.exceptions import UnknownAttributeError
+    from niwashi_mcp.main import query
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+    envelope = await query("fvBD", ctx, include_children=["fvSubnet"], fields=["ip"])
+    assert envelope["returned"] == 2
+
+    with pytest.raises(UnknownAttributeError) as exc:
+        await query("fvBD", ctx, fields=["ip"])
+    assert exc.value.attribute == "ip"
+
+
+@pytest.mark.asyncio
+async def test_query_unknown_field_is_refused_before_the_backend_is_called(
+    strict_attributes,
+):
+    from niwashi_mcp.exceptions import UnknownAttributeError
+    from niwashi_mcp.main import query
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+
+    with pytest.raises(UnknownAttributeError) as exc:
+        await query("fvBD", ctx, fields=["name", "arpFlod"])
+
+    assert exc.value.class_name == "fvBD"
+    assert exc.value.attribute == "arpFlod"
+    assert "arpFlood" in exc.value.suggestions
+    assert exc.value.catalogue_version, "the release the check ran against is named"
+    assert ctx.lifespan_context["backend"].calls == [], "the APIC was called anyway"
+    ctx.warning.assert_called_once()
+    assert "arpFlod" in ctx.warning.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_query_unknown_field_suggestions_reach_into_included_children(
+    strict_attributes,
+):
+    from niwashi_mcp.exceptions import UnknownAttributeError
+    from niwashi_mcp.main import query
+
+    with pytest.raises(UnknownAttributeError) as exc:
+        await query(
+            "fvBD",
+            _stub_ctx(_WIDE_IMDATA),
+            include_children=["fvRsCtx"],
+            fields=["tnFvCtxNam"],
+        )
+
+    assert exc.value.suggestions[:1] == ["tnFvCtxName"]
+
+
+@pytest.mark.asyncio
+async def test_query_unknown_field_when_relaxed_warns_and_says_so_in_the_note(
+    relaxed_attributes,
+):
+    """Relaxed mode lets the request through; it must not let the doubt vanish.
+
+    An attribute the catalogue does not know may still exist on a fabric running
+    another release — or may be a typo. Either way the agent is told, in the
+    answer it reads, rather than only in a log.
+    """
+    from niwashi_mcp.main import query
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+    envelope = await query("fvBD", ctx, fields=["name", "newFangledAttr"])
+
+    assert envelope["returned"] == 2
+    assert all(set(o) - {"_children"} == {"name", "dn", "_class"} for o in envelope["results"])
+    assert "newFangledAttr" in envelope["note"]
+    assert envelope["fields"] == ["name", "newFangledAttr"]
+    assert any("newFangledAttr" in c.args[0] for c in ctx.warning.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_query_relaxed_unknown_field_keeps_the_truncation_note(
+    relaxed_attributes,
+):
+    """The projection note is appended to the truncation note, never over it."""
+    from niwashi_mcp.main import query
+
+    envelope = await query(
+        "fvBD", _stub_ctx(_WIDE_IMDATA), limit=1, fields=["newFangledAttr"]
+    )
+
+    assert envelope["truncated"] is True
+    assert "partial page" in envelope["note"], "the truncation warning was clobbered"
+    assert "newFangledAttr" in envelope["note"]
+
+
+@pytest.mark.asyncio
+async def test_query_fields_does_not_change_what_matched_or_how_many(strict_attributes):
+    from niwashi_mcp.main import query
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+    full = await query("fvBD", ctx, limit=1)
+    projected = await query("fvBD", ctx, limit=1, fields=["name"])
+
+    for key in ("returned", "total_available", "truncated", "next_page", "complete"):
+        assert projected[key] == full[key], key
+    assert projected["results"][0]["dn"] == full["results"][0]["dn"]
+
+
+def test_project_leaves_the_object_it_was_given_alone():
+    import copy
+
+    from niwashi_mcp.main import _project
+
+    obj = {
+        "dn": "d",
+        "name": "n",
+        "_class": "fvBD",
+        "_children": [
+            {"dn": "c", "ip": "i", "_class": "fvSubnet"},
+            {"dn": "f", "severity": "major", "_class": "faultInst"},
+        ],
+    }
+    before = copy.deepcopy(obj)
+
+    out = _project(obj, frozenset({"name"}), frozenset({"fvBD", "fvSubnet"}))
+
+    assert obj == before, "projection mutated the backend's object"
+    assert out == {
+        "dn": "d",
+        "name": "n",
+        "_class": "fvBD",
+        "_children": [
+            {"dn": "c", "_class": "fvSubnet"},
+            {"dn": "f", "severity": "major", "_class": "faultInst"},
+        ],
+    }
+    # A child left whole is still a copy: shrinking or editing the answer must
+    # not reach back into the backend's dict.
+    assert out["_children"][1] is not obj["_children"][1]
+
+
+# ── field projection — which children it reduces ─────────────────────────────
+#
+# `fields` is validated against the queried class and the include_children
+# classes, so those are the only children it may reduce. Children that came
+# with `rsp_subtree_include` (faults, health) were never checked against it:
+# `query("fvBD", rsp_subtree_include="faults", fields=["name"])` used to hand
+# back each faultInst as `{"dn", "_class"}` — the fault the caller asked for,
+# with its severity and code deleted, and no note saying so.
+
+_BD_WITH_FAULT_IMDATA = [
+    {
+        "fvBD": {
+            "attributes": {
+                "dn": "uni/tn-OT/BD-servers",
+                "name": "servers",
+                "arpFlood": "no",
+            },
+            "children": [
+                {
+                    "fvSubnet": {
+                        "attributes": {
+                            "dn": "uni/tn-OT/BD-servers/subnet-[10.0.1.1/24]",
+                            "ip": "10.0.1.1/24",
+                            "scope": "private",
+                        }
+                    }
+                },
+                {
+                    "faultInst": {
+                        "attributes": {
+                            "dn": "uni/tn-OT/BD-servers/fault-F0467",
+                            "code": "F0467",
+                            "severity": "major",
+                            "descr": "invalid path",
+                        }
+                    }
+                },
+            ],
+        }
+    }
+]
+
+_FAULT_WHOLE = {
+    "dn": "uni/tn-OT/BD-servers/fault-F0467",
+    "code": "F0467",
+    "severity": "major",
+    "descr": "invalid path",
+    "_class": "faultInst",
+}
+
+
+def _child(obj: dict, cls: str) -> dict:
+    (found,) = [c for c in obj["_children"] if c["_class"] == cls]
+    return found
+
+
+@pytest.mark.asyncio
+async def test_query_fields_leaves_rsp_subtree_include_children_whole(
+    strict_attributes,
+):
+    from niwashi_mcp.main import query
+
+    envelope = await query(
+        "fvBD",
+        _stub_ctx(_BD_WITH_FAULT_IMDATA),
+        rsp_subtree_include="faults",
+        fields=["name"],
+    )
+
+    (bd,) = envelope["results"]
+    assert set(bd) == {"name", "dn", "_class", "_children"}
+    assert _child(bd, "faultInst") == _FAULT_WHOLE
+    # The subnet was not asked for with include_children, so it is not ours to
+    # reduce either: only the classes `fields` was checked against are.
+    assert _child(bd, "fvSubnet")["scope"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_query_fields_still_reduces_the_include_children_classes(
+    strict_attributes,
+):
+    """The other half of the rule: the same call, with the subnet embedded by
+    `include_children`, reduces the subnet and still leaves the fault alone."""
+    from niwashi_mcp.main import query
+
+    envelope = await query(
+        "fvBD",
+        _stub_ctx(_BD_WITH_FAULT_IMDATA),
+        include_children=["fvSubnet"],
+        rsp_subtree_include="faults",
+        fields=["name", "ip"],
+    )
+
+    (bd,) = envelope["results"]
+    assert _child(bd, "fvSubnet") == {
+        "dn": "uni/tn-OT/BD-servers/subnet-[10.0.1.1/24]",
+        "ip": "10.0.1.1/24",
+        "_class": "fvSubnet",
+    }
+    assert _child(bd, "faultInst") == _FAULT_WHOLE
+
+
+@pytest.mark.asyncio
+async def test_query_fields_names_valid_only_on_an_rsp_subtree_child_are_refused(
+    strict_attributes,
+):
+    """`severity` belongs to faultInst, which `fields` neither reduces nor
+    checks, so it selects nothing on a bridge domain. Refusing it is honest —
+    accepting it would read as "severity was projected" when the fault arrives
+    whole either way — and the closest-names list points at fvBD's own."""
+    from niwashi_mcp.exceptions import UnknownAttributeError
+    from niwashi_mcp.main import query
+
+    ctx = _stub_ctx(_BD_WITH_FAULT_IMDATA)
+    with pytest.raises(UnknownAttributeError) as exc:
+        await query(
+            "fvBD", ctx, rsp_subtree_include="faults", fields=["name", "severity"]
+        )
+
+    assert exc.value.attribute == "severity"
+    assert ctx.lifespan_context["backend"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_fields_leaves_children_of_other_classes_whole(
+    strict_attributes,
+):
+    from niwashi_mcp.main import get_by_dn
+
+    obj = await get_by_dn(
+        "uni/tn-OT/BD-servers",
+        _stub_ctx(_BD_WITH_FAULT_IMDATA),
+        include_children=["fvSubnet"],
+        fields=["name", "ip"],
+    )
+
+    assert set(obj) == {"name", "dn", "_class", "_children"}
+    assert _child(obj, "fvSubnet") == {
+        "dn": "uni/tn-OT/BD-servers/subnet-[10.0.1.1/24]",
+        "ip": "10.0.1.1/24",
+        "_class": "fvSubnet",
+    }
+    assert _child(obj, "faultInst") == _FAULT_WHOLE
+
+
+# A comma-joined item is one entry of the list and two classes on the wire. The
+# class check always split it; `fields` did not, so `["fvSubnet,fvRsCtx"]` was
+# accepted by one and refused (or mis-projected) by the other.
+_COMMA_FORMS = [
+    pytest.param(["fvSubnet,fvRsCtx"], id="joined"),
+    pytest.param(["fvSubnet, fvRsCtx"], id="joined-with-space"),
+    pytest.param(["fvSubnet", "fvRsCtx,"], id="trailing-comma"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_children", _COMMA_FORMS)
+async def test_query_fields_reads_a_comma_joined_include_children_item_as_classes(
+    strict_attributes, include_children
+):
+    from niwashi_mcp.main import query
+
+    envelope = await query(
+        "fvBD",
+        _stub_ctx(_WIDE_IMDATA),
+        filters={"name": "servers"},
+        include_children=include_children,
+        fields=["name", "ip"],
+    )
+
+    (servers,) = envelope["results"]
+    # `ip` is fvSubnet's: it was accepted, and the subnet was reduced with it.
+    assert [set(c) for c in servers["_children"]] == [
+        {"ip", "dn", "_class"},
+        {"dn", "_class"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_children", _COMMA_FORMS)
+async def test_get_by_dn_fields_reads_a_comma_joined_include_children_item_as_classes(
+    strict_attributes, include_children
+):
+    from niwashi_mcp.main import get_by_dn
+
+    obj = await get_by_dn(
+        "uni/tn-OT/BD-servers",
+        _stub_ctx(_WIDE_IMDATA),
+        include_children=include_children,
+        fields=["name", "ip"],
+    )
+
+    assert [set(c) for c in obj["_children"]] == [{"ip", "dn", "_class"}, {"dn", "_class"}]
+
+
+@pytest.mark.asyncio
+async def test_query_fields_suggestions_reach_into_a_comma_joined_item(
+    strict_attributes,
+):
+    from niwashi_mcp.exceptions import UnknownAttributeError
+    from niwashi_mcp.main import query
+
+    with pytest.raises(UnknownAttributeError) as exc:
+        await query(
+            "fvBD",
+            _stub_ctx(_WIDE_IMDATA),
+            include_children=["fvSubnet,fvRsCtx"],
+            fields=["tnFvCtxNam"],
+        )
+
+    assert exc.value.suggestions[:1] == ["tnFvCtxName"]
+
+
+# ── field projection — get_by_dn ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_without_fields_is_unchanged():
+    from niwashi_mcp.main import get_by_dn
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+    omitted = await get_by_dn("uni/tn-OT/BD-servers", ctx, include_children=["fvSubnet"])
+    explicit = await get_by_dn(
+        "uni/tn-OT/BD-servers", ctx, include_children=["fvSubnet"], fields=None
+    )
+
+    assert omitted == explicit
+    assert {"descr", "arpFlood", "modTs", "unicastRoute"} <= set(omitted)
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_fields_reduces_the_object_and_its_children(strict_attributes):
+    from niwashi_mcp.main import get_by_dn
+
+    obj = await get_by_dn(
+        "uni/tn-OT/BD-servers",
+        _stub_ctx(_WIDE_IMDATA),
+        include_children=["fvSubnet", "fvRsCtx"],
+        fields=["name", "ip"],
+    )
+
+    assert set(obj) == {"name", "dn", "_class", "_children"}
+    assert obj["_class"] == "fvBD"
+    assert [set(c) for c in obj["_children"]] == [
+        {"ip", "dn", "_class"},
+        {"dn", "_class"},
+    ]
+    assert "_note" not in obj
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_validates_fields_against_the_class_that_came_back(
+    strict_attributes,
+):
+    """The DN carries the class, so the caller never names one to check against.
+
+    `arpFlood` is a property of fvBD and not of fvAEPg; the object at this DN is
+    an fvAEPg, so it must be refused — and named as an fvAEPg in the error.
+    """
+    from niwashi_mcp.exceptions import UnknownAttributeError
+    from niwashi_mcp.main import get_by_dn
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+
+    ok = await get_by_dn("uni/tn-OT/ap-prod/epg-web", ctx, fields=["prio"])
+    assert set(ok) == {"prio", "dn", "_class"}
+
+    with pytest.raises(UnknownAttributeError) as exc:
+        await get_by_dn("uni/tn-OT/ap-prod/epg-web", ctx, fields=["arpFlood"])
+    assert exc.value.class_name == "fvAEPg"
+    assert exc.value.attribute == "arpFlood"
+    ctx.warning.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_field_valid_only_on_an_included_child_is_accepted(
+    strict_attributes,
+):
+    from niwashi_mcp.exceptions import UnknownAttributeError
+    from niwashi_mcp.main import get_by_dn
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+    obj = await get_by_dn(
+        "uni/tn-OT/BD-servers", ctx, include_children=["fvSubnet"], fields=["ip"]
+    )
+    assert obj["_children"][0]["ip"] == "10.0.1.1/24"
+
+    with pytest.raises(UnknownAttributeError):
+        await get_by_dn("uni/tn-OT/BD-servers", ctx, fields=["ip"])
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_unknown_field_when_relaxed_is_noted_on_the_object(
+    relaxed_attributes,
+):
+    from niwashi_mcp.main import get_by_dn
+
+    ctx = _stub_ctx(_WIDE_IMDATA)
+    obj = await get_by_dn("uni/tn-OT/BD-servers", ctx, fields=["name", "newFangledAttr"])
+
+    assert set(obj) - {"_children"} == {"name", "dn", "_class", "_note"}
+    assert "newFangledAttr" in obj["_note"]
+    assert any("newFangledAttr" in c.args[0] for c in ctx.warning.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_empty_fields_keeps_only_the_fixed_keys(strict_attributes):
+    from niwashi_mcp.main import get_by_dn
+
+    obj = await get_by_dn("uni/tn-OT/BD-clients", _stub_ctx(_WIDE_IMDATA), fields=[])
+
+    assert {k for k in obj if k != "_note"} == {"dn", "_class"}
+    assert "fields=[]" in obj["_note"]
+
+
+@pytest.mark.asyncio
+async def test_get_by_dn_not_found_with_fields_still_says_not_found(strict_attributes):
+    """No object, so no class to validate against — and no reason to hide that."""
+    from niwashi_mcp.main import get_by_dn
+
+    result = await get_by_dn(
+        "uni/tn-OT/BD-nope", _stub_ctx(_WIDE_IMDATA), fields=["notAnAttribute"]
+    )
+
+    assert result["found"] is False
+    assert result["dn"] == "uni/tn-OT/BD-nope"

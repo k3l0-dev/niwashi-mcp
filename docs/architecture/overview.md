@@ -28,18 +28,26 @@ Until 1.2.2 the server read raw jsonmeta files from a schema bundle that had to 
 | | 1.2.2 | 2.0 |
 |---|---|---|
 | Install | `git clone` + download script + `tar` | `uvx niwashi-mcp` |
-| Download | 98.8 MB | 16.2 MB — the niwaki wheel |
-| On disk | 1.83 GB | 32.8 MB |
+| Download | 98.8 MB | 16.8 MB — the niwaki wheel |
+| On disk | 1.83 GB | 26.0 MB |
 
-The catalogue is `catalog.db`, resolved at runtime as `<niwaki package dir>/query/_catalog/catalog.db` — 36,229,120 bytes, built from **APIC 6.0(9c)**, holding **15,452 classes** and 332,297 property rows. `mcp/pyproject.toml` pins the dependency to `niwaki>=1.8,<1.9` — a single minor, because this server reads the catalogue's *private* schema, which niwaki may restructure in any 1.x release without breaking SemVer; the version installed here is 1.8.0.
+The catalogue is `catalog.db`, resolved at runtime as `<niwaki package dir>/query/_catalog/catalog.db` — 25,993,216 bytes, built from **APIC 6.0(9c)**, holding **15,452 classes** and 332,297 class-property memberships (25,901 distinct property signatures). `mcp/pyproject.toml` pins the dependency to `niwaki>=2.2,<2.3` — a single minor, because this server reads the catalogue's *private* schema, which niwaki may restructure in any release without breaking SemVer (2.1 did, splitting the `prop` table into `prop_sig` and `class_prop`); the version installed here is 2.2.0.
 
 Three consequences follow from the file being a build artefact inside a wheel:
 
 - It is opened **read-only and immutable** — `file:…?immutable=1` — which lets SQLite skip locking entirely.
 - Exactly **one connection per process** is opened and cached. A second connection would load a second copy of the string pools into memory for no benefit.
-- The APIC release the model describes is now pinned by the dependency, not chosen by the operator. It changes when niwaki changes, which is why it is logged at startup.
+- The APIC release the model describes is now pinned by the dependency, not chosen by the operator. It changes when niwaki changes, which is why it is logged at startup — and compared with the fabric's own release, below.
 
-That last point deserves care: the version logged at startup is the release the **catalogue** was generated from, read from the catalogue's own `manifest` table. It says nothing about the version of the fabric the server is connected to.
+That last point deserves care: the `APIC 6.0(9c)` in the `Registry loaded` line is the release the **catalogue** was generated from, read from the catalogue's own `manifest` table. By itself it says nothing about the fabric the server is connected to — so the lifespan also asks the fabric.
+
+Right after the login it reads the controller's running release (`GET /api/class/firmwareCtrlrRunning.json`, filtered to `type == "controller"`, reading `version` off the first object returned) and compares it with the catalogue's, after normalising both — `apic-6.0(9c)`, `APIC-6.0(9C)` and `6.0(9c)` are the same release. A mismatch is a `WARNING` that names both releases, says that classes and attributes added, removed or renamed between them may be refused as unknown or come back empty, and points to [SUPPORTED-APIC.md](../../SUPPORTED-APIC.md). The check is advisory:
+
+- It **never stops startup.** A failed lookup, an empty answer, an answer in a format it cannot read, or an account that may not read the firmware classes each log a warning and leave `fabric_version` as `None`.
+- It **never claims a mismatch it cannot establish.** A version string the server fails to parse is "unknown", not "different".
+- Only the **first** controller's release is read. During a rolling upgrade a cluster can briefly run mixed releases; the check reports the one that answered first, not a consensus.
+
+The result — the fabric's release in canonical form such as `6.0(9c)`, or `None` — is kept in the lifespan context as `fabric_version`, next to `descriptions` and `backend`.
 
 ---
 
@@ -58,7 +66,7 @@ graph TD
 
     subgraph pypi["Python package index"]
         dist["niwashi-mcp wheel"]
-        niwaki["niwaki wheel — 16.2 MB<br/>catalog.db inside"]
+        niwaki["niwaki wheel — 16.8 MB<br/>catalog.db inside"]
     end
 
     envfile[".env<br/>APIC credentials"]
@@ -153,13 +161,13 @@ This is a deliberate architectural constraint, not an accident of the migration:
 Two related choices are visible at the boundary and worth stating, because both are silent when wrong:
 
 - **Wire names only.** Every property in the catalogue carries a wire name — `descr` — and a readable name — `description`. This server reads `wire_name` and nothing else. A readable name reaches the APIC, is syntactically valid, and returns `[]` without an error.
-- **The server does not use niwaki's own full-text index.** `catalog.py` reads the `mo` and `prop` tables and rebuilds the search index this server has always used, so the v2 scorer, its synonym table, and its structural priors are unchanged by the migration.
+- **The server does not use niwaki's own full-text index.** `catalog.py` reads the `mo`, `prop_sig` and `class_prop` tables and rebuilds the search index this server has always used, so the v2 scorer, its synonym table, and its structural priors are unchanged by the migration.
 
 ---
 
 ## Middleware stack
 
-Three middleware layers wrap FastMCP, outermost first:
+Three middleware layers wrap FastMCP, outermost first. FastMCP's own Host/Origin guard (DNS-rebinding protection, see [Settings — The Host guard](../configuration/settings.md#the-host-guard)) sits outside all three:
 
 | Order | Middleware | Purpose |
 |---|---|---|
@@ -183,8 +191,8 @@ Three middleware layers wrap FastMCP, outermost first:
 | 6 | Tool | Reads the in-memory index or the catalogue, and calls the APIC when the tool needs live data |
 | 7 | `ApicClient` | Builds URL and query parameters, sends an HTTPS GET to the APIC |
 | 8 | APIC | Returns an `imdata` JSON array |
-| 9 | Tool | Shapes the response: `query` flattens objects, each gaining a `_class` key, into an envelope — `{"results", "returned", "total_available", "truncated", "next_page", "complete", "note"}`; `count` returns `{"class_name", "count", "scope_dn", "filters"}`; `get_by_dn` returns the flattened object, or a `{"found": false, …}` dict |
-| 10 | FastMCP | Serialises the response as an MCP JSON-RPC result |
+| 9 | Tool | Shapes the response: `query` flattens objects, each gaining a `_class` key, into an envelope — `{"results", "returned", "total_available", "truncated", "next_page", "complete", "note", "fields"}` (`fields` echoes the projection, `null` when none was asked for); `count` returns `{"class_name", "count", "scope_dn", "filters"}`, plus `group_by`, `groups`, `ungrouped`, `complete` and `note` when `group_by` is set, and `warnings` only when attribute checking is relaxed; `get_by_dn` returns the flattened object, or a `{"found": false, …}` dict |
+| 10 | FastMCP | Serialises the response as an MCP JSON-RPC result. Before that, `query` and `count` have checked their envelope against its TypedDict (FastMCP 4 no longer does it for them), and a mismatch is a tool error |
 
 Steps 7 and 8 do not occur for `search_classes` and `get_schema`: both are answered entirely from process-local data.
 
@@ -212,8 +220,10 @@ sequenceDiagram
 
     Note over life: inside app_lifespan
     life->>life: load_dotenv on the resolved .env
+    life->>cat: verify_catalogue, fail startup if niwaki's private schema moved
+    life->>life: redact.verify_policy, fail startup if niwaki's secret policy moved
     life->>cat: descriptions_index
-    cat->>cat: read the mo and prop tables, resolve label and comment pools
+    cat->>cat: read the mo, prop_sig and class_prop tables, resolve label and comment pools
     cat-->>life: 15,239-entry search index, in memory
     life->>cat: apic_version from the catalogue manifest
     cat-->>life: the APIC release the catalogue was built from
@@ -223,11 +233,14 @@ sequenceDiagram
     life->>apic: POST /api/aaaLogin.json
     apic-->>life: session token, stored as the APIC-cookie
     life->>life: log the connected host
-    Note over life: yields descriptions and backend to every tool
+    life->>apic: GET /api/class/firmwareCtrlrRunning.json, type is controller
+    apic-->>life: the controller's running release, or an error
+    life->>life: normalise both releases, compare, warn on a mismatch or on anything unreadable
+    Note over life: yields descriptions, backend and fabric_version to every tool
     Note over life: on shutdown, close the httpx client
 ```
 
-Two details of that order matter in practice. The registry is built **before** any APIC contact, so a broken installation fails on `DescriptionsLoadError` rather than on a confusing authentication error. And `APIC_HOST` / `APIC_PASSWORD` are validated **before** the login attempt, so a missing variable raises `ConfigurationError` with the variable named instead of surfacing as a connection failure.
+Three details of that order matter in practice. The registry is built **before** any APIC contact, so a broken installation fails on `DescriptionsLoadError` rather than on a confusing authentication error. `APIC_HOST` / `APIC_PASSWORD` are validated **before** the login attempt, so a missing variable raises `ConfigurationError` with the variable named instead of surfacing as a connection failure. And the version lookup comes **after** the login and is the one APIC call at startup that is allowed to fail: a login failure refuses to start, a version failure only warns.
 
 The `.env` file itself is resolved in a fixed order: `NIWASHI_MCP_ENV_FILE` if set, then `./.env`, then the repository root when the code is running from a verified checkout, then `~/.config/niwashi-mcp/.env`. A checkout is recognised by the presence of `mcp/pyproject.toml`, never by path arithmetic alone — installed into `site-packages`, that arithmetic would silently yield a directory that exists and means nothing.
 
@@ -276,7 +289,7 @@ Anything below is gone from the running server. It appears here only so that a r
 | Removed | Replacement |
 |---|---|
 | `data/` directory and the schema bundle | the catalogue inside the `niwaki` dependency |
-| `data/schemas/*.json` jsonmeta files | the `mo` and `prop` tables of `catalog.db` |
+| `data/schemas/*.json` jsonmeta files | the `mo`, `prop_sig` and `class_prop` tables of `catalog.db` |
 | `data/class-descriptions.json` | `catalog.descriptions_index()`, rebuilt at startup |
 | the bundle download script | nothing — `uvx niwashi-mcp` installs everything |
 | `registry/schema.py` and `resolve_schemas_dir()` | `registry/catalog.py` |

@@ -35,6 +35,11 @@ classDiagram
         Raised by registry/catalog.py
     }
 
+    class RedactionPolicyError {
+        niwaki's secret-redaction policy missing or moved
+        Raised at startup by redact.verify_policy()
+    }
+
     class SchemaLoadError {
         +str class_name
         +str path
@@ -48,6 +53,30 @@ classDiagram
         +int registry_size
         Class absent from the catalogue
         Raised by query() and count()
+    }
+
+    class UnknownAttributeError {
+        +str class_name
+        +str attribute
+        +list~str~ suggestions
+        +str catalogue_version
+        Attribute absent from the class's catalogue properties
+        Raised by callers of registry/catalog.py property helpers
+    }
+
+    class SecretAttributeError {
+        +str class_name
+        +str attribute
+        +str where
+        +bool free_text
+        Filter, order or group on a secret or on changeSet
+        Raised by query() and count()
+    }
+
+    class SecretDnError {
+        +str where
+        A DN, scope or filter value that names a secret object
+        Raised by query(), count() and get_by_dn()
     }
 
     class FilterError {
@@ -83,7 +112,9 @@ classDiagram
         +str url
         +int status
         +str apic_text
-        Non-2xx, non-auth status (400, or exhausted-retry 404/500/502/503/504)
+        +str apic_code
+        Non-2xx, non-auth status (400, a 3xx, or exhausted-retry 404/500/502/503/504),
+        or an error object in imdata whatever the status
         Raised by the shared _request_json() path
     }
 
@@ -91,10 +122,14 @@ classDiagram
     NiwashiMcpError <|-- AuthenticationError
     NiwashiMcpError <|-- RegistryError
     NiwashiMcpError <|-- UnknownClassError
+    NiwashiMcpError <|-- UnknownAttributeError
+    NiwashiMcpError <|-- SecretAttributeError
+    NiwashiMcpError <|-- SecretDnError
     NiwashiMcpError <|-- FilterError
     NiwashiMcpError <|-- ApicError
 
     RegistryError <|-- DescriptionsLoadError
+    RegistryError <|-- RedactionPolicyError
     RegistryError <|-- SchemaLoadError
 
     ApicError <|-- ApicAuthError
@@ -114,13 +149,17 @@ Module paths below are relative to `mcp/src/niwashi_mcp/`.
 | `ConfigurationError` | `main.py` — `app_lifespan()` and `_serve()` | `APIC_HOST` or `APIC_PASSWORD` unset or empty (lifespan); `MCP_PORT` not parseable as an integer (`_serve()`) |
 | `AuthenticationError` | `middleware/auth.py` `_authenticate()` | Token absent or matching no key — caught in `dispatch()` and converted to HTTP 401 |
 | `DescriptionsLoadError` | `registry/catalog.py` | The niwaki catalogue (`catalog.db`) is not present at the expected path inside the installed `niwaki` package; or its `manifest` table has no `prop_flags` row; or `prop_flags` no longer declares every flag the adapter reads |
+| `RedactionPolicyError` | `niwashi_mcp/redact.py` — `verify_policy()`, called by `app_lifespan()` after `verify_catalogue()` and before the APIC session opens | A name read from niwaki's private `niwaki._secrets` is missing or has changed shape, the policy no longer gives the known answers (`vnsCCred.value` a secret, `fvBD` untouched, ...), or a class named by a secret has an RN format that cannot be cut. The server does not start: with no policy it cannot say which values are secret. See [Secret redaction](redaction.md) |
 | `SchemaLoadError` | *nothing* | Defined and importable, but unreachable — see below |
-| `UnknownClassError` | `main.py` — `query()` and `count()` tools | `catalog.class_exists(class_name)` returned `False`: the name is absent from the catalogue's class table (15,452 entries), case included |
+| `UnknownClassError` | `main.py` — `query()`, `count()` and (for `include_children` only) `get_by_dn()` tools | `catalog.class_exists(class_name)` returned `False`: the name is absent from the catalogue's class table (15,452 entries), case included. Also raised for an unknown class in `include_children`, or in a `Class.attr` operand of `filter_expr` / `order_by` |
+| `UnknownAttributeError` | `main.py` — `query()` and `count()` tools, via `_attribute_problems()` | `catalog.property_exists()` returned `False` for an attribute in `filters`, `order_by` or `filter_expr`: the name is not among the class's wire-name properties (for an abstract class, the union with its concrete subclasses). Raised before any request is built, unless `NIWASHI_MCP_STRICT_ATTRIBUTES=false`, in which case it is reported in the result instead |
+| `SecretAttributeError` | `niwashi_mcp/redact.py` — `check_request()`, called first thing by `query()` and `count()` | A `filters` key, `order_by` term, `filter_expr` operand or `group_by` is a secret property of its class, `dn`/`rn` of a class named by a secret, or free text that can quote one (`changeSet`). **Not governed by `NIWASHI_MCP_STRICT_ATTRIBUTES`**; raised before the attribute check, before anything is logged or sent. The message never quotes what the agent sent |
+| `SecretDnError` | `niwashi_mcp/redact.py` — `check_dn()` and `check_request()`; `get_by_dn()` calls it first | A DN, `scope_dn`, filter value or `filter_expr` spells a secret RN segment (`community-<x>`, `actsession-<x>`, `delsession-<x>`, `sitejwtpubkey-<x>`). Decided on the text alone, so an existing and a missing DN get the same answer |
 | `FilterError` | `registry/filter.py` `_validate_ident()` | Class name or attribute key does not match `^[A-Za-z][A-Za-z0-9]*$`. Filter *values* are escaped, never rejected — a value cannot raise this |
 | `ApicAuthError` | `apic/client.py` | `authenticate()`: the login POST came back non-2xx. `_send()`: the request was still 401/403 after a re-authentication round-trip |
 | `ApicConnectionError` | `apic/client.py` | `httpx.TimeoutException` or `httpx.ConnectError`. `authenticate()` has no retry loop and raises on the first failure; the read path (`query_class()`, `get_by_dn()`, `count_class()`, all through `_request_json()`) raises only once the retry budget is exhausted |
 | `ApicResponseError` | `apic/client.py` | `authenticate()`: login body is not JSON, or carries no token. `_request_json()`: body is not valid JSON, or has no `imdata` key |
-| `ApicRequestError` | `apic/client.py` `_request_json()` | Non-2xx, non-auth status — a permanent one such as 400 on the first attempt, or a transient 404/500/502/503/504 that never recovered within the retry budget. Carries the status and, when the body follows APIC's error shape, its text |
+| `ApicRequestError` | `apic/client.py` `_request_json()` | Non-2xx, non-auth status — a permanent one such as 400 on the first attempt, a 3xx (the APIC answers an invalid filter value with a `301` that is not a redirect; redirects are never followed), or a transient 404/500/502/503/504 that never recovered within the retry budget. Also an `error` object among `imdata`, alone or mixed with data rows, whatever the status. Carries the status and, when the body follows APIC's error shape, its code (`apic_code`) and text (`apic_text`), each cut to one line of at most 500 characters |
 
 `DescriptionsLoadError` surfaces the first time the catalogue connection is opened, and never again — the connection is opened lazily and cached for the process. In a running server that first time is startup, when the lifespan builds the search index; the connection is nevertheless reached through every catalogue call, which is why `get_schema()` documents the exception too. Whichever caller triggers it, the condition is an installation failure rather than a user error, and the message carries the resolved path and the fix: `pip install --force-reinstall niwaki`.
 
@@ -156,6 +195,21 @@ New code should not catch `SchemaLoadError`: the clause would compile, and never
 Validation itself runs against the catalogue's class table, which holds **15,452** classes. The 213-class difference is the set of classes that carry no label, no comment and no usable property label: there is nothing to index for them, so `search_classes()` cannot reach them — but `query()` and `count()` accept them, because they exist. A class in that gap therefore never raises `UnknownClassError`, even though `search_classes()` will not find it.
 
 Case is part of the check. SQLite's default `BINARY` collation makes it structural rather than a hand-written comparison: `fvBd` does not resolve to `fvBD`, and never silently returns the wrong class's results.
+
+---
+
+## UnknownAttributeError and the catalogue's release
+
+`UnknownClassError` says a class does not exist. `UnknownAttributeError` says less: the attribute is not in a catalogue that describes **one** APIC release (`catalog.apic_version()`, e.g. `6.0(9c)`), and a fabric on another release may legitimately have it. The message states this, so a caller that gets the error can decide whether to refuse or to send the request anyway.
+
+| Attribute | Value |
+|---|---|
+| `class_name` | The class the attribute was looked up on, verbatim |
+| `attribute` | The name the caller supplied, verbatim |
+| `suggestions` | Up to 5 closest property names, from `catalog.closest_properties()` — may be empty |
+| `catalogue_version` | The APIC release the catalogue was generated from. A required argument: `exceptions.py` cannot import `registry.catalog` (which imports it), so the caller passes `catalog.apic_version()` |
+
+What counts as "among the class's properties" is `catalog.known_properties()`: the class's own wire names, plus, for an abstract class, those of its concrete subclasses (resolved through the catalogue's `inherits` table; see [registry.md](registry.md)). `property_exists()` is defined as membership in that set, so the two cannot disagree.
 
 ---
 

@@ -9,7 +9,7 @@ You have five MCP tools:
 - `get_schema` — inspect a class: identifiers, containment, children, per-property constraints
 - `query` — fetch objects of a class (filtered, scoped)
 - `get_by_dn` — fetch one object directly by its DN (shortcut, skips discovery)
-- `count` — count objects of a class without transferring them
+- `count` — count objects of a class without transferring them, or per value of one attribute / per tenant (`group_by`)
 
 This skill explains the ACI object model, the data structures the tools
 return, how to read a schema, and how to navigate the object tree.
@@ -77,7 +77,8 @@ under `results`, alongside the true size of the matching set:
   "truncated": false,
   "next_page": null,
   "complete": true,
-  "note": null
+  "note": null,
+  "fields": null
 }
 ```
 
@@ -86,14 +87,16 @@ under `results`, alongside the true size of the matching set:
 | `results` | The objects, same per-item shape as before (`_class`, `dn`, attributes, optional `_children`) |
 | `returned` | `len(results)` — how many objects came back in this call |
 | `total_available` | The APIC-reported true match count — fabric-wide or subtree-wide, regardless of how many were fetched |
-| `truncated` | `total_available > returned` — this call did NOT return everything that matches |
+| `truncated` | `true` when matches remain past this page (earlier pages plus `returned` fall short of `total_available`) — this call did NOT return everything that matches. Always `false` after `fetch_all=True`, even when that stopped short: read `complete` there |
 | `next_page` | `page + 1` when `truncated` and `fetch_all` was not used; `null` otherwise |
-| `complete` | `false` only when `fetch_all=True` hit the safety cap before exhausting all matches |
-| `note` | Guidance string when `truncated` or capped; `null` otherwise |
+| `complete` | `false` only when `fetch_all=True` stopped short of `total_available` — it holds at most 5,000 objects per call, and it also stops early if the APIC ends its pages before the count it reported. Either way the result is partial |
+| `note` | Guidance string when `truncated`, when `complete` is `false`, when a name was sent unchecked (section 5, Attribute validation) or when `fields=[]` was passed; `null` otherwise |
+| `fields` | The projection applied, echoed back; `null` when `fields` was not passed (section 5, Keep answers small) |
+| `redacted` | **Absent unless the server withheld a secret** — then how many were (values, DN segments, text attributes). A withheld value reads `"<redacted>"`; `note` says so too (section 5, Secrets) |
 
 **`truncated: true` is a hard stop for any max/min/total/all-of conclusion** —
-see section 5's Pagination subsection and the FULL-FABRIC AGGREGATION rule in
-the server instructions.
+and so is `complete: false`. See section 5's Pagination subsection and the
+FULL-FABRIC AGGREGATION rule in the server instructions.
 
 All attribute values in `results` items are **strings** (including numbers
 and booleans).
@@ -120,7 +123,8 @@ When `include_children` is set, each object in `results` also contains
   "truncated": false,
   "next_page": null,
   "complete": true,
-  "note": null
+  "note": null,
+  "fields": null
 }
 ```
 
@@ -205,6 +209,13 @@ all end in the same relative name, which `rnFormat` gives you in full
 than hunting the matching entry. Pass `list_limit` (max 500) only if you truly
 need a wider sample — and never present the sample as the complete list.
 
+A property's `options` in `property_details` are sampled the same way, at
+max(`list_limit`, 100): only a dozen enums are longer, and `faultInst.code` has
+80,512 values. A sampled entry carries `optionsTruncated: {returned, total,
+note}`. A value missing from a sampled list may still be valid — filter on it
+directly, or `count(…, group_by="code")` to see which codes actually occur,
+instead of concluding it does not exist.
+
 ### `containedBy` — the parent class(es) in `pkg:Class` notation
 
 ```json
@@ -278,6 +289,8 @@ Per-property fields (only `type` and `access` are always present):
 | `naming` | present when the property is part of the DN (an identifier) |
 | `default` | the default value, when declared |
 | `options` | allowed values — the **exact strings** the APIC accepts in `filters` and config |
+| `secret` | `true` on a property that holds a secret — the server never returns its value and refuses to filter, order or group on it (section 5, Secrets) |
+| `scrubbed` | `true` on `changeSet` of the audit, event, fault and session records — free text that can quote a secret: returned scrubbed (best effort), and refused for filtering like a secret (section 5, Secrets) |
 | `comment` | one-line description |
 
 `options` removes the guesswork behind section 10: never guess an enum's casing —
@@ -297,16 +310,17 @@ it tells you nothing about what it means or what it currently allows.
 "properties": ["adminSt", "addr", "descr", "dn", "id", "name", ...]
 ```
 
-Only attributes in this list are valid `filters` and `filter_expr` keys.
-A filter on an attribute not in `properties` returns `[]` silently.
+Only attributes in this list are valid `filters` and `filter_expr` keys. The
+APIC answers a filter on any other name with `[]`; the server refuses it first
+with `UnknownAttributeError` (section 5, Attribute validation).
 
 ### `relationTo` — outgoing Rs relations (this object → another)
 
 ```json
 "relationTo": {
-  "fv:RsCtx":       {"targetClass": "fv:Ctx",       "cardinality": ""},
-  "fv:RsBDToOut":   {"targetClass": "l3ext:Out",    "cardinality": ""},
-  "fv:RsBdFloodTo": {"targetClass": "vz:Filter",     "cardinality": ""}
+  "fv:RsCtx":       {"targetClass": "fv:Ctx",    "cardinality": "n-to-1", "kind": "named"},
+  "fv:RsBDToOut":   {"targetClass": "l3ext:Out", "cardinality": "n-to-m", "kind": "named"},
+  "fv:RsBdFloodTo": {"targetClass": "vz:Filter", "cardinality": "n-to-m", "kind": "explicit"}
 }
 ```
 
@@ -317,15 +331,30 @@ Each key is a **Relation Source (Rs)** class — an intermediate object that
 lives under this MO and holds the reference to the target.
 See section 8 for how to traverse it.
 
+- `cardinality` is `1-to-1`, `1-to-m`, `n-to-1` or `n-to-m`, read from this
+  class to the target. `n-to-1` on `fv:RsCtx` means many bridge domains may
+  each point at one VRF: a bridge domain has at most one `fvRsCtx`. `n-to-m`
+  means it may hold several. Use it to decide whether to expect one relation
+  object or a list.
+- `kind` is `named` when the relation holds the target's *name* (`fvRsCtx` →
+  `tnFvCtxName`, resolved in scope) or `explicit` when it holds its *DN*
+  (`tDn` only). It tells you which attribute of the relation object is worth
+  reading — see "Finding the target" in section 8.
+- A relation to a cloud class the catalogue does not describe (two exist, both
+  on `fvCtx`) has `cardinality: ""` and no `kind`. An empty value means *not
+  stated*, not "none".
+
 ### `relationFrom` — incoming Rt relations (another object → this one)
 
 ```json
 "relationFrom": {
-  "fv:RtCtx": {"sourceClass": "fv:ABDPol"}
+  "fv:RtCtx": {"sourceClass": "fv:ABDPol", "cardinality": "n-to-1", "kind": "named"}
 }
 ```
 
 Note the key keeps its colon notation (`fv:RtCtx`), unlike `contains`, which is flattened.
+`cardinality` and `kind` are the relation's own, as above: read from
+`sourceClass` to this class, so `n-to-1` here is many bridge domains, one VRF.
 
 Reverse lookups: which objects of `sourceClass` point to this one. This is the
 equivalent of the APIC UI's **Show Usage** — the APIC materialises an Rt object
@@ -365,7 +394,8 @@ query("fvBD", filters={"unicastRoute": "yes", "arpFlood": "no"})
 # → eq(fvBD.unicastRoute,"yes") AND eq(fvBD.arpFlood,"no")
 ```
 
-Only use attribute names from `get_schema().properties`.
+Only use attribute names from `get_schema().properties` — an unknown name is
+refused before anything is sent (see Attribute validation below).
 
 ### Complex filter expression — `filter_expr`
 
@@ -380,6 +410,15 @@ Combined with `filters` via `and()` if both are provided.
 | `gt` / `lt` | `gt(faultInst.severity,"minor")` |
 | `and` | `and(ne(fabricNode.role,"controller"),eq(fabricNode.fabricSt,"active"))` |
 | `or` | `or(eq(fvBD.arpFlood,"yes"),eq(fvBD.unicastRoute,"no"))` |
+
+**`eq`/`ne` values are checked against the attribute's allowed values.** On an
+attribute with a fixed set of values (an enum such as `unicastRoute`,
+`severity`, `faultInst.code`), a value outside that set is refused by the APIC
+and the tool raises an error naming it ("value 'F0526' is not valid"). That is
+a statement about the *value*, not about the fabric: it does not mean "none
+exist". To ask whether a fault code occurs, use
+`count("faultInst", group_by="code")` (every code present, with counts and rule
+names) or `wcard(faultInst.code,"F0526")`, which is not validated.
 
 ```python
 # All active non-controller nodes
@@ -428,7 +467,9 @@ query("fvTenant", rsp_subtree_include="health")
 ### Time range for log records — `time_range`
 
 Restricts log record queries by time window.
-Valid for: `faultRecord`, `aaaModLR`, `eventRecord`, `healthRecord`.
+Valid for: `faultRecord`, `aaaModLR`, `eventRecord`, `healthRecord`. Their
+`changeSet` and `descr` are scrubbed of secrets they quote (section 5, Secrets),
+and `changeSet` cannot be used in `filters`, `filter_expr` or `order_by`.
 
 ```python
 # Audit log last 24 hours
@@ -443,7 +484,8 @@ query("aaaModLR", time_range="2026-01-01|2026-01-31")
 
 ### Pagination — `page` and `fetch_all`
 
-`limit` is the page size. Pages are 0-based.
+`limit` is the page size (clamped to 1–200). Pages are 0-based. `limit` and
+`page` are for plain paging only: `fetch_all` ignores both.
 
 ```python
 # First 20 faults (page 0)
@@ -461,16 +503,26 @@ query("fvBD", include_children=["fvSubnet"], fetch_all=True)
 #    "truncated": false, "complete": true, ...}
 ```
 
-`fetch_all` uses `limit` as the page size internally and stops at the first
-short page (the natural end) or at a safety cap on very large result sets —
-if the cap is hit, `complete` comes back `false` and `total_available` still
-tells you the true size; narrow the query (e.g. `scope_dn`) and combine.
+`fetch_all` pages the APIC at a fixed 200 objects per page, whatever `limit`
+is, and stops when everything the APIC's count reported is in hand
+(`complete: true`). It holds at most **5,000 objects** per call: a larger set
+comes back as its first 5,000 with `complete: false`, and `total_available`
+still tells you the true size. `complete` is also `false` if the APIC ends its
+pages before the count it reported — you cannot tell that apart from the cap
+from outside, and the answer is the same:
+
+- **`complete: false` means the result is partial.** Do not state a maximum,
+  minimum, total, or "all of X" from it.
+- Narrow the query so each call matches fewer than 5,000 objects — a `scope_dn`
+  per tenant, or a filter — and combine the results across the narrower calls.
+- **Read `complete`, not `truncated`, after `fetch_all`.** `truncated` is always
+  `false` there, including when the cap was hit.
 
 **Rule: a max/min/sum/all-of question over a class is only answerable from a
-complete set.** If `truncated` is `true` in the response, do not draw that
-conclusion from it — re-run with `fetch_all=True`, or page with `page`/`limit`
-until `truncated` is `false`, before computing a maximum, minimum, total, or
-"all of X" answer.
+complete set.** If `truncated` is `true` in the response, or `complete` is
+`false` after `fetch_all`, do not draw that conclusion from it — re-run with
+`fetch_all=True`, or page with `page`/`limit` until `truncated` is `false`,
+before computing a maximum, minimum, total, or "all of X" answer.
 
 ### Configuration only — `config_only`
 
@@ -483,6 +535,158 @@ drift detection, and backup.
 # Just the intended config of a BD, no operational churn
 query("fvBD", filters={"name": "servers"}, config_only=True)
 ```
+
+### Keep answers small — `fields`
+
+Even with `config_only`, an object carries dozens of attributes, and a
+`fetch_all` over a big class multiplies that by thousands. When you only need a
+few attributes to answer — names, an address, a state, something to tally
+locally — pass `fields` and every object comes back reduced to those:
+
+```python
+# Name and ARP-flooding of every BD in a tenant, nothing else
+query("fvBD", scope_dn="uni/tn-OT", fields=["name", "arpFlood"], fetch_all=True)
+# → each result: {"_class": "fvBD", "dn": "uni/tn-OT/BD-servers",
+#                 "name": "servers", "arpFlood": "no"}
+
+get_by_dn("uni/tn-OT/BD-servers", fields=["name", "arpFlood"])   # same, one object
+```
+
+- **`dn`, `_class` and `_children` are always kept**, so you can still address
+  an object and tell what it is. Naming them in `fields` is accepted.
+- **`include_children` children are reduced by the same list.** One flat
+  `fields` list serves the parents and the `_children` of the classes you listed
+  in `include_children`; a name is accepted if it is a property of the queried
+  class *or* of any `include_children` class.
+- **Other children come back whole.** Children that arrived through
+  `rsp_subtree_include` (`faultInst` for `"faults"`, `healthInst` for `"health"`)
+  are not reduced, and their attributes are not checked: `fields=["name"]` on
+  `query("fvBD", rsp_subtree_include="faults", ...)` leaves each fault complete,
+  severity and code included. A name that exists only on such a child (`severity`
+  on a bridge domain) is refused — it would select nothing — so leave it out.
+- **Names are checked against the catalogue.** A misspelled field would
+  otherwise return objects that merely lack the key, which reads as "the
+  attribute is empty". An unknown name raises `UnknownAttributeError` (below) —
+  for `query` before the request, for `get_by_dn` after the fetch, since the
+  class is only known from what the DN returned.
+- **`fields=[]` is not "everything".** It keeps only `dn`, `_class` and
+  `_children`, and `note` (`_note` on `get_by_dn`) says so. Omit `fields` to
+  receive every attribute.
+- **It only narrows what came back.** Which objects match, `total_available`,
+  `truncated`, `complete` and paging are unchanged, and it cannot return an
+  attribute that `config_only` already removed. It shrinks the response, not
+  the APIC's work, so scope or filter big queries as usual.
+
+### Attribute validation — `UnknownAttributeError`
+
+The APIC answers a filter on an attribute that does not exist, or an
+`include_children` entry for a class that does not exist, with HTTP 200 and an
+empty result — the same shape as "there are none". So before sending anything,
+the tools check the names you supplied against the catalogue:
+
+| Where | What is checked | Tools |
+|---|---|---|
+| `filters` | every key, against the queried class | `query`, `count` |
+| `order_by` | the attribute of each term, against the class named in the term | `query` |
+| `include_children` | every class name; an item may be comma-joined (`"fvSubnet,fvRsCtx"`), and counts as the classes it names | `query`, `get_by_dn` (before the fetch) |
+| `filter_expr` | each `Class.attr` operand (quoted values are never inspected) | `query`, `count` |
+| `fields` | every name (see above) | `query` (before the request), `get_by_dn` (after the fetch) |
+| `group_by` | the attribute (see section 7) | `count` |
+
+An unknown attribute raises **`UnknownAttributeError`**, an unknown class
+`UnknownClassError`, and **nothing is sent to the APIC**. The error names the
+closest real properties and tells you to call `get_schema` for the full list:
+
+```text
+Unknown attribute 'arpFlod' on ACI class 'fvBD'. Closest matches: arpFlood. Call get_schema('fvBD') to list its attributes. The catalogue describes APIC 6.0(9c); a fabric on another release may legitimately have this attribute.
+```
+
+Take one of the suggestions, or read `get_schema(class_name).properties`, fix the
+call and retry. Like every tool error it is a failure to answer, not an answer
+of zero (see section 7). The class named by `class_name` is always checked and
+always raises; every other name — attributes, and the classes in
+`include_children`, `filter_expr` and `order_by` — has the relaxed mode below.
+
+Names are checked, **values are not**: `filters={"arpFlood": "yess"}` is a valid
+name with a value no object carries, so the result is `[]` (section 10). Read
+the allowed values with `get_schema` (`property_details`, section 4).
+
+**Fabrics on another release.** The catalogue describes one APIC release
+(`6.0(9c)`), and a fabric on another may legitimately carry an attribute or
+class it lacks. The operator can then set `NIWASHI_MCP_STRICT_ATTRIBUTES=false`.
+You cannot change this from a tool call. In that mode nothing is refused: the
+request is sent, and the doubt is stated in the result — in `note` for `query`,
+in a `warnings` list for `count`, in a `_note` key on the object for `get_by_dn`
+(an unknown `include_children` class, or `fields`):
+
+```text
+filters: Unknown attribute 'newAttr' on ACI class 'fvBD'. ... Sent anyway because strict attribute checking is off — an empty result may mean this name is wrong, not that nothing matches.
+```
+
+**A note or warning like that means an empty result — `[]`, or a count of `0` —
+is not a zero.** The name may simply be wrong. Verify it with `get_schema`, or
+drop that filter and look again, before telling the user nothing matches. And if
+a strict refusal names a property you have good reason to believe exists on this
+fabric, say that the fabric may run a different release than the catalogue
+rather than guessing around it.
+
+### Secrets — withheld, never a filter
+
+An APIC returns some secrets in clear: the password of an L4-L7 device
+credential (`vnsCCred`, attribute `value`), the community of an SNMP trap
+destination (`snmpTrapDest`, `secName`), the community string that *is* an
+`snmpCommunityP`'s name, the token that names a login session
+(`aaaActiveUserSession`, `hashToken`). This server never hands you one. In
+`query` and `get_by_dn` — in the object, in each `_children` entry, and whatever
+`fields` you asked for — a secret value reads `"<redacted>"`:
+
+```python
+query("vnsCCred", fields=["name", "value"])
+# → results: [{"_class": "vnsCCred", "dn": "...", "name": "admin", "value": "<redacted>"}],
+#   "redacted": 1, "note": "1 secret value(s) were withheld ..."
+```
+
+- **It is the server's policy, not an empty value.** Report it as withheld by
+  the server — never as empty, missing or unknown. An *empty* secret is withheld
+  too, so `"<redacted>"` says nothing about whether one is set: do not tell the
+  user a credential is configured, or unset, from it.
+- **`redacted` / `_redacted` counts what was withheld** and is absent when
+  nothing was. `get_schema` marks each such property `"secret": true`; leave it
+  out of `filters` and `fields` rather than asking.
+- **Audit, event, fault and session records quote secrets in their own text.**
+  Creating a credential writes `value:<the password>` into the audit record's
+  `changeSet`; a login writes the session token into an event's `descr` and DN.
+  For `aaaModLR`, `eventRecord`, `faultRecord`, `aaaSessionLR` (and the other
+  record classes with a `changeSet`) the server **scrubs** the text rather than
+  withholding the record, so audit questions still work: the value of each secret
+  pair in `changeSet` — both formats, `prop:value, prop:value` and
+  `prop (Old: x, New: y)` — becomes `<redacted>`, a secret met in a DN (`dn`,
+  `affected`) is cut, and it is removed from `descr` too. `aaaSessionLR.sessionId`
+  is withheld outright. **This is best effort**: `note` says so when it applied,
+  and a secret in a form the scrubber does not recognise can remain, so never
+  present an audit or event record as proof that a secret was not configured or
+  changed. A `changeSet` that names a secret property but cannot be parsed is
+  replaced whole. `get_schema` marks `changeSet` `"scrubbed": true`, and it
+  **cannot be filtered, ordered or grouped on** (`SecretAttributeError`): use
+  `affected`, `user`, `created` or `descr` to find a record, then read it.
+- **A DN can carry a secret.** An SNMP community profile is named by its
+  community string (`.../community-<string>`), a login session by its token, a
+  JWT site by its key, and so is every object beneath them. Those DNs come back
+  with the secret cut out (`.../community-<redacted>`), wherever a DN appears: an
+  object's own `dn`, a `tDn`, an audit record's `affected`. The same goes for the
+  text of an object that quotes it, such as an audit record's `descr`. A DN with
+  `<redacted>` in it cannot be fetched or used as a `scope_dn`.
+- **Asking another way is refused, not answered.** A filter, `order_by`,
+  `filter_expr` operand or `group_by` on a secret attribute raises
+  **`SecretAttributeError`** — a match would confirm a guess, and `group_by`
+  would print the values as keys — and so does a `count` with such a `filters`.
+  A DN, `scope_dn`, filter value or `filter_expr` that names an object by its
+  secret raises **`SecretDnError`**, from `get_by_dn` too, **before the APIC is
+  asked and whether or not the object exists**, so "found" and "not found" cannot
+  be used to check a guess. Neither is governed by `NIWASHI_MCP_STRICT_ATTRIBUTES`.
+  Both are failures to answer, not answers of zero; do not rephrase to get round
+  them. To see which communities or credentials exist, `query` or `count` the
+  class itself — `count("snmpCommunityP")` is fine.
 
 ---
 
@@ -500,10 +704,16 @@ get_by_dn("uni/tn-OT/BD-servers")
 get_by_dn("uni/tn-OT/BD-servers",
           config_only=True,
           include_children=["fvSubnet", "fvRsCtx"])
+
+# only the attributes you will read (plus dn, _class, _children)
+get_by_dn("uni/tn-OT/BD-servers", fields=["name", "arpFlood"])
 ```
 
 Return shape is a single object dict (same shape as one item of `query`'s
-`results` list), **not** an envelope and **not** a list. If the DN does not
+`results` list), **not** an envelope and **not** a list. `fields` behaves as in
+section 5 (Keep answers small). Every class in `include_children` is checked
+before the request: a misspelt one raises `UnknownClassError` instead of
+returning the object with no `_children`. If the DN does not
 exist, you get an explicit not-found instead of a silent empty result:
 
 ```json
@@ -513,6 +723,11 @@ exist, you get an explicit not-found instead of a silent empty result:
 
 A not-found usually means a stale or mistyped DN — re-derive it from a fresh
 `query` result rather than reconstructing it from memory.
+
+Secrets are withheld here as in `query`: when something was, the object carries
+`"_redacted": <count>` and a `_note`, and the value reads `"<redacted>"`. A DN
+that names an object by a secret (`.../community-<string>`) is refused with
+`SecretDnError` rather than answered found or not found (section 5, Secrets).
 
 ---
 
@@ -529,10 +744,79 @@ count("fvSubnet", filters={"scope": "public"})  # public subnets only
 ```
 
 Verify the class name with `search_classes` first — `count` raises the same
-`UnknownClassError` (with suggestions) as `query` for an unknown class.
+`UnknownClassError` (with suggestions) as `query` for an unknown class, and
+checks attribute names in `filters` and `filter_expr` the same way, raising
+`UnknownAttributeError` for an unknown one (section 5, Attribute validation).
+It also refuses to count *by value* of a secret — `filters`, `filter_expr` or
+`group_by` on a secret attribute raises `SecretAttributeError` (section 5,
+Secrets); counting the class itself is fine.
 
-**Counting vs. ranking.** `count` gives a scalar tally — it cannot tell you
-*which* object is the extreme case. "How many subnets in total?" is `count`.
+### "How many X per Y?" — `group_by`
+
+A breakdown — faults per severity, bridge domains per tenant, nodes per role —
+is one call, not a fetch plus a local tally:
+
+```python
+count("faultInst", group_by="severity")   # faults per severity
+count("faultInst", group_by="tenant")     # faults per tenant
+count("fabricNode", group_by="role")      # nodes per role
+# the second call returns, for example:
+# → {"class_name": "faultInst", "count": 7, "scope_dn": null, "filters": {},
+#    "group_by": "tenant", "groups": {"OT": 4, "mgmt": 2}, "ungrouped": 1,
+#    "complete": true, "note": null}
+```
+
+- **What it accepts.** Any property of the class (`get_schema` lists them), or
+  the special value `"tenant"`, read from the `tn-<name>` segment of each
+  object's DN — a tenant is not an attribute of the objects it owns. If the
+  class has a real attribute called `tenant`, the attribute wins. An unknown
+  name raises `UnknownAttributeError`.
+- **`groups`** maps each value to its count, largest first (ties by value).
+  Values are strings, like every attribute value.
+- **`ungrouped`** counts the objects that have no value to group on, and it is
+  never a group of its own. For `"tenant"` these are the objects whose DN has no
+  tenant segment — fabric-level objects such as `topology/pod-1/node-101/...`,
+  which do not belong to a tenant and must not be given one. An empty string *is*
+  a value and keeps its own `""` group.
+- **`redacted`** appears beside `groups` only when a secret was withheld from the
+  objects tallied — a group key can then be a DN with `<redacted>` in it, never
+  the secret.
+- **When `complete` is `true`,** `sum(groups.values()) + ungrouped == count`.
+- **When `complete` is `false`, there is no breakdown.** `groups` and
+  `ungrouped` are `null`, `count` is still the true total, and `note` says why:
+  the fetch stopped short of the whole set (the 5,000-object `fetch_all` cap, or
+  the APIC ending its pages early), or the set changed while it was being read.
+  **Never report partial groups and never infer a breakdown** from `count` or
+  from what you remember — a partial list of groups reads as a finding ("only
+  two tenants have faults") when it is just where the fetch stopped. Narrow and
+  retry: one tenant at a time with `scope_dn="uni/tn-<name>"`, or one value at a
+  time with `filters`, grouping each narrower set; for a set that changed,
+  simply retry.
+- **`group_by="code"` also names the fault codes.** On a fault class
+  (`faultInst`, `faultRecord`, ...) the response gains `group_names`, a map from
+  each code the catalogue defines to its rule name, in the order of `groups`:
+  `{"F0467": "fltFvNwIssuesConfig-failed", "F0546": "fltEthpmIfPortDownNoInfra"}`.
+  Use those names, not your memory, to say what a code is. A code **missing**
+  from `group_names` is not named, not unnamed-by-accident: threshold-crossing
+  alerts (rules `tca-*`) mint their codes at runtime, and FSM faults (rules
+  `fsm-*`) are not defined in the schema either. For such a code say that it has no
+  catalogue entry, or `query` one object of it and read its own `rule` and
+  `descr` — never write a name or a meaning for it yourself. The key is absent
+  when no code resolves. Objects returned by `query` already carry `rule`, so
+  nothing is added to them.
+- **It costs more than a plain `count`.** A plain count is one request that
+  transfers one object; a grouped count fetches every matching object, 200 per
+  page, because the APIC cannot group. On a big class, scope or filter first.
+- **Relaxed attribute mode** (`NIWASHI_MCP_STRICT_ATTRIBUTES=false`): an unknown
+  `group_by` is not refused; a `warnings` entry says so and the objects that
+  lack it land in `ungrouped`. Treat that breakdown as unverified.
+
+Without `group_by` the response is the plain count and nothing else changes.
+
+**Counting vs. ranking.** `count` tallies — a number, or one number per value
+of an attribute — but it cannot rank individual objects by something they
+contain, or tell you *which* object is the extreme case. "How many subnets in
+total?" is `count`. "How many subnets per tenant?" is `count` with `group_by`.
 "Which bridge domain has the most subnets?" is argmax, and needs the actual
 objects: fetch everything with `fetch_all=True`, then group/argmax locally.
 
@@ -555,12 +839,13 @@ This is exactly the case section 5's Pagination rule guards against — do not
 compute an argmax from a plain default `query()` call; see there for why.
 
 > **An error is not an answer.** A tool call that raises an error — unknown
-> class, unreachable DN, malformed filter — did not execute the query; it has
-> no data to report. Never restate that absence as a count of zero, an empty
-> result, or "no such objects" — those are valid answers to a query that *did*
-> run. When `count` or `query` raises `UnknownClassError`, report that the
-> question cannot be answered as asked (the class does not exist), not a
-> number.
+> class, unknown attribute, unreachable DN, malformed filter — did not execute
+> the query; it has no data to report. Never restate that absence as a count of
+> zero, an empty result, or "no such objects" — those are valid answers to a
+> query that *did* run. When `count` or `query` raises `UnknownClassError`,
+> report that the question cannot be answered as asked (the class does not
+> exist), not a number; for `UnknownAttributeError`, correct the name from the
+> error's suggestions or `get_schema` and ask again.
 
 > **Eventual consistency.** A read taken right after a large config push reflects
 > the fabric state *at that instant*. Counts and object sets can keep moving for
@@ -662,7 +947,8 @@ classes, about 20%.** The other 1189 are `explicit` and carry no `tn*Name`
 at all. (1531 classes inherit from `reln:To`; the 32-class difference is
 abstract bases that are never instantiated.) Reading
 `tnFvCtxName` off one of those returns nothing, which is easy to mistake for
-"not configured".
+"not configured". `get_schema` tells you which kind a relation is: its
+`kind` in `relationTo` is `named` or `explicit`.
 
 So: read `tDn`. Fall back to a `tn*Name` only when `tDn` is empty and you
 have confirmed the attribute exists in `get_schema().properties`. A handful
@@ -744,7 +1030,8 @@ echo '<json>' | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k: d
 # List all relation target classes from schema
 echo '<json>' | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(rel, info["targetClass"]) for rel, info in d.get("relationTo", {}).items()]'
 
-# Count objects per unique attribute value (tally over a fetched set)
+# Count objects per unique attribute value (tally over a fetched set) — when you
+# only need the tally, count(class, group_by=...) does this server-side (section 7)
 echo '<json>' | python3 -c '
 import json, sys
 from collections import Counter
@@ -775,7 +1062,9 @@ for r in d["results"]:
 ## 10. Common attribute values
 
 Attribute values in APIC are always strings. These are common enumerations
-to use in `filters` and `filter_expr` — guessing the wrong casing returns `[]` silently:
+to use in `filters` and `filter_expr`. Attribute *names* are checked before the
+request is sent (section 5), but *values* are not, so guessing the wrong casing
+still returns `[]` silently:
 
 | Class | Attribute | Values |
 |---|---|---|
@@ -829,19 +1118,25 @@ a sample object without filters to observe the actual values in context.
             → Use time_range="24h" / "1week" / date range
         - Large result set?
             → Use limit + page for pagination
+        - Wide class or many objects, but only a few attributes needed?
+            → Use fields=[...] — the answer stays small (section 5)
         - Aggregating over the WHOLE class (max/min/total/all)?
-            → Use fetch_all=True, and check truncated/complete before
-              concluding — see section 5's Pagination subsection and
-              section 7
+            → Use fetch_all=True, and check complete before concluding
+              (truncated is always false after fetch_all) — see section 5's
+              Pagination subsection and section 7
+        - "How many X per tenant / severity / state"?
+            → count(class, group_by=...) — no objects to fetch yourself
+              (section 7); if complete=false there is no breakdown
 
 4. query(class_name, ...)
         ↓ envelope: {"results": [...], "returned", "total_available",
-                     "truncated", "next_page", "complete", "note"}
+                     "truncated", "next_page", "complete", "note", "fields"}
           each result item: attribute dict + "_class"
           dn is always present and is a valid scope_dn for children
           _children present when include_children was set
           truncated=true → do not conclude a max/min/total/all-of answer;
           re-run with fetch_all=True or page to exhaustion first
+          complete=false (after fetch_all) → partial: narrow and combine
 
 5. Navigate further if needed:
         - Children: query child class with scope_dn = result dn
@@ -895,12 +1190,18 @@ a sample object without filters to observe the actual values in context.
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `query`/`count` raises "Unknown ACI class '...'" | Wrong or nonexistent class name | The class does not exist — this is a failed lookup, not a zero result. Retry with one of the suggested closest matches or a fresh `search_classes` call; never report a count or existence answer from this error. |
-| `query` returns `results: []`, class is valid | Object absent from backend OR wrong filter value — this applies even to an abstract class (`isAbstract: true`): querying one returns the union of its concrete subclasses' instances, not an automatic `[]` | Remove filters first to confirm objects exist, then re-add filters |
+| `query`/`count` raises "Unknown ACI class '...'" (`get_by_dn` too, for a class in `include_children`) | Wrong or nonexistent class name | The class does not exist — this is a failed lookup, not a zero result. Retry with one of the suggested closest matches or a fresh `search_classes` call; never report a count or existence answer from this error. |
+| `query`/`count`/`get_by_dn` raises "Unknown attribute '...' on ACI class '...'" (`UnknownAttributeError`) | The name is not a property of that class in the catalogue — a typo, wrong case, a property of another class, or (rarely) an attribute the catalogue's release lacks | Nothing was sent, so this is a failed lookup, not a zero result. Take one of the "Closest matches", or read `get_schema(class)` `properties`, correct the call and retry. Never report "none found" from this error |
+| `query`/`count` raises `SecretAttributeError`; `query`/`count`/`get_by_dn` raises `SecretDnError` | The request filters, orders or groups on a secret attribute, or names an object by its secret (an SNMP community, a session token, an API key in the DN). Refused on purpose, nothing was sent, whether or not the object exists | A failed lookup, not a zero. Do not rephrase to get round it. Drop that attribute or DN; to see which objects exist, `query` or `count` the class itself. Report the value as withheld by the server (section 5, Secrets) |
+| A value reads `"<redacted>"`, or `redacted` / `_redacted` is in the result | The server withheld a secret (credential, key, community, session token), or scrubbed one out of an audit or event record's text | Not an empty value and not a gap in the data: say the server withholds it. Never guess it, never report it as empty, set or unset, and never present a scrubbed record as proof that a secret was or was not configured |
+| `query` `note`, `count` `warnings` or a `get_by_dn` `_note` says "Sent anyway because strict attribute checking is off" | The operator relaxed attribute checking for a fabric on another release; the request went out with a name the catalogue does not know | An empty result (`[]`, or a count of `0`) next to it is not a zero — the name may be wrong. Verify it with `get_schema` or drop that filter before saying nothing matches |
+| `query` returns `results: []`, class is valid | Object absent from backend OR wrong filter *value* (names are validated, values are not) — this applies even to an abstract class (`isAbstract: true`): querying one returns the union of its concrete subclasses' instances, not an automatic `[]` | Remove filters first to confirm objects exist, then re-add filters |
 | `query` returns `truncated: true` | This call only returned part of the matching set (`returned < total_available`) | Partial data — do not conclude a maximum, minimum, total, or complete list from it. Re-run with `fetch_all=True`, or page with `page`/`limit` until `truncated` is `false` |
+| `query(..., fetch_all=True)` returns `complete: false` (`truncated` is `false`) | `fetch_all` holds at most 5,000 objects per call and hit that cap, or the APIC ended its pages before the count it reported | Partial data, same rule: no maximum, minimum, total, or complete list. Narrow the query (`scope_dn` per tenant, a filter) so each call matches fewer, and combine the results |
+| `count(..., group_by=...)` returns `complete: false` with `groups: null` | The objects could not be fetched whole to tally (5,000-object cap, APIC ended pages early, or the set changed while read) | There is no breakdown: do not report a partial or an inferred one. `count` is still the true total. Narrow (one tenant at a time, one value at a time) and group each narrower set, or retry |
 | `search_classes` returns no results | Keyword too specific | Try acronym, English label, or first 3 chars of the expected class name |
 | `get_schema` returns `{}` | No such class in the catalogue — lookup is exact and case-sensitive (`fvBd` is not `fvBD`) | Query without filters, inspect `properties` of a sample result |
-| `_children` is empty despite `include_children` | Children don't exist under that parent, or wrong child class name | Query child class directly with scope_dn to verify |
+| `_children` is empty despite `include_children` | The class name is valid (a misspelt one is refused with `UnknownClassError`, or flagged in `note`/`_note` when the operator relaxed checking), so there are no such children directly under that parent — `include_children` embeds one level only | Query the child class directly with `scope_dn` to verify, and check `get_schema` `containedBy` for where it really lives |
 | `get_by_dn` returns `{"found": false, ...}` | DN is stale, mistyped, or the object was deleted | Re-derive the DN from a fresh `query` result — never reconstruct it from memory |
 | `count` disagrees with a follow-up `query` | Read taken mid-materialisation after a config push | Wait for stabilisation and re-read (eventual consistency, section 7) |
 | An Rs relation is `missing-target` / `invalid-target` / `cardinality-violation` | The reference is configured but the APIC tried and failed to resolve it | Report the relation as unresolved. Do **not** resolve the name or DN and present the result as the object's target: a `missing-target` DN can still answer `get_by_dn` (section 8) |
@@ -919,7 +1220,8 @@ a sample object without filters to observe the actual values in context.
 
 2. get_schema("fvBD")
    → identifiedBy=["name"], containedBy=["fv:Tenant"],
-     relationTo={"fv:RsCtx": {"targetClass": "fv:Ctx", "cardinality": ""}}
+     relationTo={"fv:RsCtx": {"targetClass": "fv:Ctx", "cardinality": "n-to-1",
+                              "kind": "named"}}
      (colon notation on both — strip it to query: fv:RsCtx → fvRsCtx)
 
 3. query("fvTenant", filters={"name": "OT"})

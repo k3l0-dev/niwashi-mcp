@@ -30,10 +30,10 @@ thing the real APIC would receive.
 
 import pytest
 
-from niwashi_mcp.apic.client import ApicClient
-from niwashi_mcp.exceptions import FilterError
+from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
+from niwashi_mcp.exceptions import FilterError, UnknownAttributeError
 from tests.conftest import MINIMAL_DESCRIPTIONS, apic_response, make_ctx
-from tests.unit.test_client import FakeHTTPClient, _MockResponse
+from tests.unit.test_client import FakeHTTPClient, _bd_set, _MockResponse, _sent
 
 # ── Wiring helpers ────────────────────────────────────────────────────────────
 
@@ -188,6 +188,87 @@ async def test_query_clamped_limit_reaches_real_apic_request_as_page_size(catalo
     assert params.get("page-size") == "200"
 
 
+# ── query(fetch_all=True) → the real page loop ───────────────────────────────
+#
+# StubBackend answers fetch_all in one step and has no notion of a page size, so
+# it can never notice the tool and the client disagreeing about what `limit`
+# means during a walk. Through the real client it can be seen: fetch_all pages at
+# a fixed 200 and the caller's `limit` has no say, so the default call is no
+# longer capped at 25 x 20 = 500 objects.
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_with_the_default_limit_returns_600_complete(catalogue_index):
+    """The tool's default limit is 20; 600 objects used to come back as 500 with
+    complete=False and a note blaming a cap the set never reached."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(600))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, fetch_all=True)
+
+    assert envelope["returned"] == 600
+    assert envelope["total_available"] == 600
+    assert envelope["complete"] is True
+    assert envelope["truncated"] is False
+    assert envelope["note"] is None
+    assert [p["page"] for p in _sent(client)] == ["0", "1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_sends_page_size_200_whatever_limit_the_caller_gave(
+    catalogue_index,
+):
+    """`limit` is the caller's page size for a single page; a walk ignores it.
+    Asserted on the wire, where the APIC would see it."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(450))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, limit=5, fetch_all=True)
+
+    assert envelope["returned"] == 450
+    assert envelope["complete"] is True
+    assert {p["page-size"] for p in _sent(client)} == {"200"}
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_over_the_cap_tells_the_agent_the_real_numbers(catalogue_index):
+    """One object past the cap: the first 5,000 arrive, complete is False, and
+    the note carries both numbers so the agent can say how much it is missing."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(_MAX_OBJECTS + 1))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, fetch_all=True)
+
+    assert envelope["returned"] == _MAX_OBJECTS
+    assert envelope["total_available"] == _MAX_OBJECTS + 1
+    assert envelope["complete"] is False
+    assert envelope["truncated"] is False, "fetch_all never reports `truncated`; `complete` is the signal"
+    assert str(_MAX_OBJECTS + 1) in envelope["note"]
+    assert f"{_MAX_OBJECTS} objects per call" in envelope["note"]
+    assert "partial answer" in envelope["note"]
+
+
+@pytest.mark.asyncio
+async def test_query_fetch_all_exactly_at_the_cap_is_not_flagged(catalogue_index):
+    """A set of exactly 5,000 is whole; the envelope must not cry cap."""
+    from niwashi_mcp.main import query
+
+    client = _real_client(*_bd_set(_MAX_OBJECTS))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, fetch_all=True)
+
+    assert envelope["returned"] == _MAX_OBJECTS
+    assert envelope["complete"] is True
+    assert envelope["note"] is None
+
+
 # ── query() → FilterError propagation through the tool ───────────────────────
 
 
@@ -247,22 +328,59 @@ async def test_count_invalid_filter_attribute_raises_filter_error(catalogue_inde
 
 
 @pytest.mark.asyncio
-async def test_query_well_formed_but_nonexistent_attribute_does_not_raise(catalogue_index):
-    """Contrast case: a syntactically well-formed attribute name that simply
-    does not exist as a real fvBD property is NOT a FilterError — it builds
-    a valid eq() predicate and is sent to the APIC, which would silently
-    return no matches. build_filter() validates identifier syntax only, never
-    attribute existence; that distinction is exactly what the previous
-    FilterError tests must not blur."""
+async def test_query_well_formed_but_nonexistent_attribute_is_refused_before_any_request(
+    catalogue_index, monkeypatch
+):
+    """Contrast case: a syntactically well-formed attribute name that is not an
+    fvBD property is NOT a FilterError — `build_filter()` validates identifier
+    syntax only — but it is no longer sent either. The APIC answers it with an
+    empty 200, which reads as "there are none"; the catalogue knows better, so
+    the tool refuses with `UnknownAttributeError` and nothing reaches the
+    transport.
+
+    This test used to pin the opposite (the request *was* sent). It was
+    rewritten, not deleted: the FilterError/UnknownAttributeError distinction
+    it draws is still the thing it protects.
+    """
     from niwashi_mcp.main import query
 
+    monkeypatch.delenv("NIWASHI_MCP_STRICT_ATTRIBUTES", raising=False)
     client = _real_client(_MockResponse(200, apic_response([])))
     ctx = _tool_ctx(client, catalogue_index)
 
-    await query("fvBD", ctx, filters={"totallyNotARealProperty": "value"})
+    with pytest.raises(UnknownAttributeError) as excinfo:
+        await query("fvBD", ctx, filters={"totallyNotARealProperty": "value"})
+
+    assert excinfo.value.class_name == "fvBD"
+    assert excinfo.value.attribute == "totallyNotARealProperty"
+    # Not merely "no result": the transport itself was never touched.
+    assert client._client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_query_nonexistent_attribute_is_sent_and_flagged_when_not_strict(
+    catalogue_index, monkeypatch
+):
+    """The escape hatch: with NIWASHI_MCP_STRICT_ATTRIBUTES=false the same
+    request goes out exactly as it used to — the predicate reaches the APIC —
+    but the problem is surfaced in both places a caller can see it: the
+    result's `note` and `ctx.warning`. A relaxed check that stayed silent would
+    turn every typo back into an unexplained empty answer."""
+    from niwashi_mcp.main import query
+
+    monkeypatch.setenv("NIWASHI_MCP_STRICT_ATTRIBUTES", "false")
+    client = _real_client(_MockResponse(200, apic_response([])))
+    ctx = _tool_ctx(client, catalogue_index)
+
+    envelope = await query("fvBD", ctx, filters={"totallyNotARealProperty": "value"})
 
     params = client._client.requests[0]["params"]
     assert 'eq(fvBD.totallyNotARealProperty,"value")' in params["query-target-filter"]
+    assert "totallyNotARealProperty" in envelope["note"]
+    assert any(
+        "totallyNotARealProperty" in str(call.args[0])
+        for call in ctx.warning.await_args_list
+    )
 
 
 # ── get_by_dn() → ApicClient.get_by_dn() ──────────────────────────────────────
