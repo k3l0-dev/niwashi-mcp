@@ -109,10 +109,11 @@ from typing import Annotated, Any, NotRequired, TypedDict
 
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.lifespan import lifespan
 from mcp import MCPDeprecationWarning
 from mcp.types import ToolAnnotations
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, ConfigDict, TypeAdapter, ValidationError
 
 from niwashi_mcp import redact
 from niwashi_mcp.apic.client import _MAX_OBJECTS, ApicClient
@@ -1005,6 +1006,66 @@ class CountEnvelope(TypedDict):
     redacted: NotRequired[int]
 
 
+# ── Envelope guard ────────────────────────────────────────────────────────────
+#
+# FastMCP 3 validated a tool's return against its output schema before sending
+# it, so an envelope that broke its own contract became a tool error. FastMCP 4
+# does not: it serialises the return through the annotated type and sends what
+# comes out. A wrongly typed value goes out on the wire with only a serialiser
+# warning, and a key the TypedDict does not declare is dropped without a word —
+# the client never sees it, and nothing here notices.
+#
+# The guard puts the check back, where the data is built. It is not the
+# advertised schema: that stays open to unknown keys, so a key added by a newer
+# server never makes an older client's validator reject the whole answer. This
+# one forbids them, because here an unknown key means the code and the TypedDict
+# have drifted apart. Strict, because the wire is JSON and a client's validator
+# does not coerce: `"3"` for an integer, or `true` for one, is a refusal there
+# and must be one here.
+#
+# Built once, at import. A 5,000-object result validates in about 5 ms against
+# the ~13 ms FastMCP spends serialising the same envelope.
+
+
+class _QueryEnvelopeGuard(QueryEnvelope):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+
+
+class _CountEnvelopeGuard(CountEnvelope):
+    __pydantic_config__ = ConfigDict(extra="forbid")
+
+
+_QUERY_GUARD = TypeAdapter(_QueryEnvelopeGuard)
+_COUNT_GUARD = TypeAdapter(_CountEnvelopeGuard)
+
+# A broken envelope can carry thousands of identical problems, one per result.
+_GUARD_PROBLEMS_SHOWN = 5
+
+
+def _guarded[E](tool: str, guard: TypeAdapter[Any], envelope: E) -> E:
+    """Return ``envelope`` unchanged, or refuse it as a tool error.
+
+    The validated copy is discarded: only the verdict is wanted, and the original
+    is what the tool returns. The message names the keys at fault but never the
+    values, which for ``results`` would be the whole answer.
+    """
+    try:
+        guard.validate_python(envelope, strict=True)
+    except ValidationError as exc:
+        errors = exc.errors(include_input=False, include_url=False)
+        shown = "; ".join(
+            f"{'.'.join(map(str, e['loc'])) or 'envelope'}: {e['msg']}"
+            for e in errors[:_GUARD_PROBLEMS_SHOWN]
+        )
+        more = len(errors) - _GUARD_PROBLEMS_SHOWN
+        raise ToolError(
+            f"{tool} built a response that breaks its own schema — {shown}"
+            + (f" (and {more} more)" if more > 0 else "")
+            + ". This is a server defect, not a problem with the request."
+        ) from exc
+    return envelope
+
+
 # ── Field projection ──────────────────────────────────────────────────────────
 
 # What a projection never removes. `dn` is how the object is addressed again,
@@ -1533,7 +1594,7 @@ async def query(
     }
     if withheld:
         envelope["redacted"] = withheld
-    return envelope
+    return _guarded("query", _QUERY_GUARD, envelope)
 
 
 @mcp.tool(title="Fetch one ACI object by DN", annotations=_FABRIC_READ)
@@ -2160,7 +2221,7 @@ async def count(
     warnings = [*attribute_warnings, *warnings]
     if warnings:
         response["warnings"] = warnings
-    return response
+    return _guarded("count", _COUNT_GUARD, response)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
