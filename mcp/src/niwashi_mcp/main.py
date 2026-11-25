@@ -109,6 +109,7 @@ import logging
 import os
 import signal
 import warnings
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
@@ -483,8 +484,26 @@ async def app_lifespan(server: FastMCP):
 # read when the server is created, which is the next statement.
 settings.enable_subscriptions_listen = False
 
+
+def _own_version() -> str:
+    """This distribution's version, as installed — what `serverInfo.version` says.
+
+    Left unset, FastMCP reports *its own* version there, so every client saw
+    "4.2.6" next to the name "niwashi-mcp" and a bug report quoted the wrong
+    package. Read from the installed metadata so the single place a release is
+    numbered, `pyproject.toml`, stays the only one. A source tree that was never
+    installed has no metadata; that is reported as unknown rather than as
+    another package's version.
+    """
+    try:
+        return version("niwashi-mcp")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
 mcp = FastMCP(
     name="niwashi-mcp",
+    version=_own_version(),
     lifespan=app_lifespan,
     instructions="""
 You are an assistant for querying a Cisco ACI fabric through its APIC REST API.

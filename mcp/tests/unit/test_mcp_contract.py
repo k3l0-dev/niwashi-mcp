@@ -234,6 +234,57 @@ class TestServerIdentity:
         how it is identified in logs, configs and bug reports."""
         assert mcp.name == "niwashi-mcp"
 
+    @pytest.fixture
+    def served_info(self, monkeypatch):
+        import asyncio
+
+        from fastmcp import Client
+        from fastmcp.server.lifespan import lifespan
+
+        from niwashi_mcp import main
+
+        @lifespan
+        async def stub(server):
+            yield {}
+
+        monkeypatch.setattr(main.mcp, "_lifespan", stub)
+
+        async def read(mode: str):
+            async with Client(main.mcp, mode=mode) as client:
+                return client.server_info
+
+        return lambda mode: asyncio.run(read(mode))
+
+    @pytest.mark.parametrize("mode", ["auto", "legacy"])
+    def test_the_server_reports_its_own_version_not_fastmcps(self, served_info, mode):
+        """Left unset, `serverInfo.version` is FastMCP's own: a client saw the
+        name `niwashi-mcp` next to `4.2.6`, and a bug report quoted the wrong
+        package. Both protocol eras carry it."""
+        from importlib.metadata import version
+
+        import fastmcp
+
+        info = served_info(mode)
+
+        assert info.name == "niwashi-mcp"
+        assert info.version == version("niwashi-mcp")
+        assert info.version != fastmcp.__version__
+        assert info.version[0].isdigit(), info.version
+
+    def test_a_source_tree_that_was_never_installed_says_unknown(self, monkeypatch):
+        """No metadata is not a reason to fail startup, nor to borrow another
+        package's number."""
+        from importlib import metadata
+
+        from niwashi_mcp import main
+
+        def missing(name):
+            raise metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(main, "version", missing)
+
+        assert main._own_version() == "0+unknown"
+
     def test_instructions_are_shipped_and_carry_the_workflow(self):
         """The instructions block is the largest single artifact sent to an
         agent. Empty or truncated, tools still work and answers quietly get
