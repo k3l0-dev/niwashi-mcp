@@ -34,6 +34,19 @@ from niwashi_mcp.main import mcp
 
 _TOOLS = {"search_classes", "get_schema", "query", "get_by_dn", "count"}
 
+
+def _hint(tool, name: str):
+    """One annotation hint, read the way it travels on the wire.
+
+    `model_dump(by_alias=True)` yields the spec's camelCase keys (`readOnlyHint`)
+    whatever the attribute is called on the model. The MCP SDK renamed those
+    attributes to snake_case in v2 and keeps the old spelling only behind a
+    deprecation bridge, so reading `tool.annotations.readOnlyHint` asserts the
+    bridge rather than the contract — and stops working when the bridge goes. The
+    wire form is the contract, and it is the same on both SDK generations.
+    """
+    return tool.annotations.model_dump(by_alias=True)[name]
+
 # Tools that reach the fabric, and therefore interact with an open world.
 _FABRIC = {"query", "get_by_dn", "count"}
 
@@ -86,23 +99,22 @@ class TestTheAdvertisedSurface:
         for name, tool in advertised.items():
             ann = tool.annotations
             assert ann is not None, f"{name} carries no annotations"
-            assert ann.readOnlyHint is True, f"{name} does not declare itself read-only"
+            assert _hint(tool, "readOnlyHint") is True, f"{name} does not declare itself read-only"
 
     def test_open_world_separates_local_reads_from_fabric_reads(self, advertised):
         """`search_classes` and `get_schema` never leave the process."""
         for name, tool in advertised.items():
             expected = name in _FABRIC
-            assert tool.annotations.openWorldHint is expected, (
-                f"{name}: openWorldHint={tool.annotations.openWorldHint}, expected {expected}"
-            )
+            got = _hint(tool, "openWorldHint")
+            assert got is expected, f"{name}: openWorldHint={got}, expected {expected}"
 
     def test_hints_meaningless_under_read_only_are_absent(self, advertised):
         """The MCP spec defines `destructiveHint` and `idempotentHint` as
         meaningful only when `readOnlyHint` is false. Declaring them anyway is
         noise that reads as rigour."""
         for name, tool in advertised.items():
-            assert tool.annotations.destructiveHint is None, name
-            assert tool.annotations.idempotentHint is None, name
+            assert _hint(tool, "destructiveHint") is None, name
+            assert _hint(tool, "idempotentHint") is None, name
 
     def test_every_tool_has_a_human_title_and_a_description(self, advertised):
         """Both are what a client renders in a tool picker."""
