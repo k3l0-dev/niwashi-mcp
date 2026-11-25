@@ -145,6 +145,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
     skipped in CI and in every clean checkout. Measured on `git archive HEAD`:
     one skip, this test. The body never needed the directory.
 
+### Security
+
+- **Dependency floors raised to clear the 35 advisories `pip-audit` reports on
+  the lock.** fastmcp `>=3.4.10` (3.4.11 locked; the 2026-10-23 advisories),
+  and new direct floors for two transitive packages that sit on the `/mcp`
+  request path, so a `uvx`/`pip` install cannot resolve below them:
+  `mcp>=1.30.0` (GHSA-84m7-p3x7-pcfv, unbounded StreamableHTTP session
+  accumulation — 1.30 closes an idle stateful session after 30 minutes and caps
+  a server at 10,000) and `opentelemetry-api>=1.45.2` (GHSA-mf5v-w3w3-f6cg and
+  GHSA-xcq7-p3pf-p88h, trace-context parsing that fastmcp runs on every tool
+  call). Lock-only bumps for packages this server does not reach — authlib
+  1.9.10, joserfc 1.8.0 and pyjwt 2.15.1 (fastmcp's OAuth/JWT paths; niwashi
+  uses its own API-key middleware), dnspython 2.9.2 (only via email-validator),
+  certifi 2026.11.20. `pip-audit` on the exported lock now reports no known
+  vulnerabilities.
+
 ---
 
 ## [2.1.1] - 2026-08-09
