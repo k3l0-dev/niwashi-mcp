@@ -338,3 +338,224 @@ def test_the_attribute_validation_surface_is_documented_and_implemented():
     # query reports the same condition through its existing `note`, not a new key.
     assert "unchecked" in _doc("query")
     assert "attribute_warnings" in inspect.getsource(main_mod.query)
+
+
+# ── the fields / group_by / validation / fetch_all surface ───────────────────
+#
+# These pin what SKILL.md and the server instructions now teach about `fields`,
+# `count(group_by=...)`, attribute validation and fetch_all's real limits. Each
+# was a claim that went stale the moment the code changed: SKILL.md said "a
+# filter on an unknown attribute returns [] silently", "`fetch_all` uses `limit`
+# as the page size" and "`count` gives a scalar tally", and an agent reading
+# those would plan around behaviour the server no longer has.
+
+
+def _code_without_docstrings(*fns) -> str:
+    """The unparsed body of each function, docstring removed.
+
+    A docstring spells out the very `"key":` shapes the tests look for, so
+    scanning raw source would let the documentation satisfy an assertion about
+    the implementation (see test_the_envelope_keys_promised_are_the_keys_returned).
+    """
+    body = ""
+    for fn in fns:
+        node = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+        if isinstance(node.body[0], ast.Expr) and isinstance(
+            node.body[0].value, ast.Constant
+        ):
+            node.body = node.body[1:]
+        body += ast.unparse(node)
+    return body
+
+
+def test_skill_teaches_each_new_parameter_in_a_call_that_exists():
+    """`fields` and `group_by` are shown in a real call, on tools that take them.
+
+    `test_skill_invents_no_tool_parameter` proves every kwarg SKILL.md shows is
+    real; this is its converse for the new ones — the skill must actually show
+    them, or an agent never learns the parameter exists.
+    """
+    import re
+
+    text = _SKILL.read_text()
+    for tool, param in (
+        ("query", "fields"),
+        ("get_by_dn", "fields"),
+        ("count", "group_by"),
+    ):
+        assert param in inspect.signature(getattr(main_mod, tool)).parameters
+        assert re.search(rf"{tool}\([^)]*\b{param}=", text), (
+            f"SKILL.md never shows {tool}(..., {param}=...)"
+        )
+
+
+def test_skill_envelope_table_has_a_row_for_every_key_query_returns():
+    """The envelope table is how an agent learns what each key means.
+
+    `fields` was added to every envelope — a change to a result that did not
+    otherwise change — and a table that omits it leaves an agent reading an
+    unexplained key. Compared against the TypedDict the server advertises as its
+    `outputSchema`, so the next key added there fails here too.
+    """
+    import re
+
+    text = _SKILL.read_text()
+    keys = set(main_mod.QueryEnvelope.__annotations__)
+    assert "fields" in keys, "QueryEnvelope no longer has the key this test is about"
+    for key in sorted(keys):
+        assert re.search(rf"^\| `{key}` \|", text, re.MULTILINE), (
+            f"SKILL.md's envelope table has no row for {key!r}"
+        )
+        assert f'"{key}"' in text, f"SKILL.md's envelope example never shows {key!r}"
+
+
+def test_skill_names_every_key_count_can_return_and_the_code_sets_them():
+    """`count(group_by=...)` answers with keys an agent must read to be safe.
+
+    `complete` and a null `groups` are what stop a partial breakdown being
+    reported as a finding, so each has to be named in the skill *and* actually
+    set by the tool. The docstring is stripped before looking at the code, as in
+    the other envelope tests.
+    """
+    text = _SKILL.read_text()
+    for key in main_mod.CountEnvelope.__annotations__:
+        assert f'"{key}"' in text or f"`{key}`" in text, (
+            f"SKILL.md never mentions the {key!r} key count returns"
+        )
+
+    body = _code_without_docstrings(main_mod.count, main_mod._group_counts)
+    for key in ("group_by", "groups", "ungrouped", "complete", "note"):
+        assert f"'{key}':" in body, f"count documents {key!r} but never sets it"
+    # What the skill promises about a withheld breakdown must be what the code does.
+    assert "'groups': None" in body and "'ungrouped': None" in body, (
+        "SKILL.md says an incomplete breakdown has null groups and ungrouped"
+    )
+    assert f'"{main_mod._TENANT_KEY}"' in text, "SKILL.md never teaches group_by='tenant'"
+
+
+def test_every_exception_skill_names_exists():
+    """An error name in backticks is what the agent matches a failure against.
+
+    Lints the same way the ACI vocabulary is linted: a renamed or misspelt
+    exception in the skill is a tool error the agent cannot recognise. The two
+    named here are the ones it is told to act on.
+    """
+    import re
+
+    from niwashi_mcp import exceptions
+
+    named = set(re.findall(r"`([A-Z][A-Za-z]+Error)`", _SKILL.read_text()))
+    assert {"UnknownClassError", "UnknownAttributeError"} <= named
+    for name in sorted(named):
+        assert isinstance(getattr(exceptions, name, None), type), (
+            f"SKILL.md names {name!r}, which niwashi_mcp.exceptions does not define"
+        )
+
+
+def test_the_switch_skill_names_is_the_one_the_server_reads(monkeypatch):
+    """SKILL.md tells an agent the operator can set `NIWASHI_MCP_STRICT_ATTRIBUTES=false`.
+
+    The name must be the variable the code reads, and `false` must be a value it
+    treats as relaxed — otherwise the instruction sends an operator to a switch
+    that does nothing, and the agent keeps reporting refusals as release gaps.
+    """
+    import re
+
+    named = set(re.findall(r"NIWASHI_MCP_[A-Z_]+", _SKILL.read_text()))
+    assert named == {"NIWASHI_MCP_STRICT_ATTRIBUTES"}, named
+    (name,) = named
+    assert f'"{name}"' in inspect.getsource(main_mod._strict_attributes)
+    assert f"{name}=false" in _SKILL.read_text()
+    monkeypatch.setenv(name, "false")
+    assert main_mod._strict_attributes() is False
+    monkeypatch.delenv(name)
+    assert main_mod._strict_attributes() is True, "the default is no longer strict"
+
+
+def test_the_fetch_all_numbers_quoted_match_the_client_constants():
+    """The 200-per-page and 5,000-object limits are quoted in three places.
+
+    They are the only reason an agent can reason about whether a `fetch_all`
+    result is whole, and they used to be wrong in a way that mattered: the code
+    paged by `limit`, so the default capped a "fetch everything" call at 500.
+    """
+    import re
+
+    from niwashi_mcp.apic import client as client_mod
+
+    cap = f"{client_mod._MAX_OBJECTS:,}"
+    page = client_mod._FETCH_ALL_PAGE_SIZE
+    assert main_mod._MAX_OBJECTS == client_mod._MAX_OBJECTS
+
+    sources = {
+        "SKILL.md": _SKILL.read_text(),
+        "query docstring": _doc("query"),
+        "server instructions": main_mod.mcp.instructions,
+    }
+    for where, text in sources.items():
+        assert cap in text, f"{where} no longer states the {cap}-object cap"
+        assert re.search(rf"\b{page}\b[^.]*\bpage|\bpage[^.]*\b{page}\b", text), (
+            f"{where} no longer states the {page}-object page size"
+        )
+        for number in re.findall(r"(\d[\d,]*) objects per (?:call|page)", text):
+            assert number in {cap, str(page)}, (
+                f"{where} quotes {number!r} objects per call/page; the code has "
+                f"{cap} per call and {page} per page"
+            )
+
+
+def test_prompt_text_no_longer_makes_claims_the_code_stopped_keeping():
+    """Each phrase was true before this branch and is false now.
+
+    A negative lint is a weak instrument — it only catches the sentence it was
+    written for — so each entry is the exact stale claim found by grepping, and
+    says what replaced it.
+    """
+    import re
+
+    skill = _SKILL.read_text()
+    everywhere = skill + "\n" + _all_prompt_text()
+    stale_everywhere = {
+        r"(?:uses|using) `?limit`? as (?:the )?page[- ]size": (
+            "fetch_all pages at a fixed 200, whatever `limit` is"
+        ),
+        r"scalar tally": "count can break the tally down with group_by",
+    }
+    for pattern, replacement in stale_everywhere.items():
+        assert not re.search(pattern, everywhere), (
+            f"stale claim {pattern!r} is back; now: {replacement}"
+        )
+    assert not re.search(r"not in `properties` returns", skill), (
+        "SKILL.md again says an unknown attribute returns [] — the server refuses it"
+    )
+    assert "silently returns nothing" not in main_mod.mcp.instructions, (
+        "the instructions again say an unknown attribute silently returns nothing"
+    )
+
+
+def test_server_instructions_teach_the_new_behaviour():
+    """The instructions are what an agent reads when it has no skill file.
+
+    Every name is checked against the code that gives it meaning, so the lines
+    cannot survive a rename: `group_by` and `fields` must be real parameters, and
+    the keys the counting paragraph tells an agent to read must be ones `count`
+    sets.
+    """
+    text = main_mod.mcp.instructions
+    assert "group_by" in inspect.signature(main_mod.count).parameters
+    assert "fields" in inspect.signature(main_mod.query).parameters
+    for needle in (
+        "group_by",
+        '"ungrouped"',
+        "complete=false",
+        "UnknownAttributeError",
+        "fields=[...]",
+        '"fields"',  # the envelope key list
+    ):
+        assert needle in text, f"the server instructions no longer mention {needle!r}"
+    assert '"ungrouped"' in _code_without_docstrings(main_mod._group_counts).replace(
+        "'", '"'
+    )
+    # Every key of the query envelope is in the list FULL-FABRIC AGGREGATION gives.
+    for key in main_mod.QueryEnvelope.__annotations__:
+        assert f'"{key}"' in text, f"the instructions' envelope list lacks {key!r}"

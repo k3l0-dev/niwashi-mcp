@@ -9,6 +9,84 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Added
 
+- **`fields` projects `query` and `get_by_dn` results onto the attributes
+  asked for.** A class carries ~40 attributes per object and `fetch_all` can
+  hold 5,000 objects; an agent that needed a name and a state still received
+  everything, and the answer is what fills its context. `fields=["name",
+  "arpFlood"]` reduces each result — and each `_children` entry — to those, plus
+  `dn`, `_class` and `_children`, which are always kept: an object that cannot be
+  addressed or identified is no use to the next call. Names are validated
+  against the queried class or any `include_children` class, because a
+  misspelled field would return objects that merely lack the key, which reads as
+  "the attribute is empty". `fields=[]` keeps only the three fixed keys and the
+  `note` says so; it is not the same request as omitting `fields`.
+
+  Projection happens after the APIC answers, so it saves the response, not the
+  APIC's work, and changes neither `total_available`, `truncated` nor paging.
+  `get_by_dn` can only validate after the fetch — the class is not known before
+  it. In relaxed mode (see Changed) an unknown name is kept and the doubt is
+  said in the `note`, or in a `_note` key on `get_by_dn`'s object, which has no
+  envelope to carry one.
+
+- **`count(group_by=...)` answers "how many X per Y?" in one call.** `group_by`
+  takes any property of the class, or `"tenant"`, read from the DN's
+  `tn-<name>` segment because a tenant is not an attribute of the objects it
+  owns (20 classes, `pingExecTn` among them, carry a real `tenant` attribute,
+  and that one wins). The APIC cannot group, so the matching objects are fetched
+  and tallied in the server: it costs a full `fetch_all` where a plain count
+  costs one request, and the docs say so. The response gains `group_by`,
+  `groups` (largest first, ties by value), `ungrouped`, `complete` and `note`;
+  without `group_by` it is exactly what it was.
+
+  Objects with no value to group on are counted in `ungrouped`, never under a
+  `null` key: a JSON key is a string, and every string — `"null"`, `"None"`,
+  `""` — is a value some attribute can hold. An empty string *is* a value and
+  keeps its own group. Tenant derivation splits the DN only outside square
+  brackets, so an object under `uni/epp/fv-[uni/tn-A/ap-B/epg-C]/...`, which
+  merely *names* tenant A's EPG in a key and is not in A's subtree, stays
+  ungrouped instead of being credited to A.
+
+  **It never returns a partial breakdown.** If the fetch hits its cap, or
+  fetches a different number of objects from the total it was checked against,
+  `complete` is `false`, `groups` and `ungrouped` are `null`, `count` stays the
+  true total, and `note` says how to narrow. A partial list of groups reads as a
+  finding ("only two tenants have faults") when it is only where the fetch
+  stopped.
+
+- **The fabric's APIC release is compared with the catalogue's at startup.**
+  The log named only the release the catalogue was built from, which says
+  nothing about the fabric the server is connected to; an operator on another
+  train learned of the gap when a query came back empty, and an empty result
+  reads as "there are none". After the login the server now reads the
+  controller's running release (`firmwareCtrlrRunning`, filtered to
+  `type == "controller"`), normalises both strings — `apic-6.0(9c)`,
+  `APIC-6.0(9C)` and `6.0(9c)` are one release — and logs a `WARNING` naming
+  both and pointing to `SUPPORTED-APIC.md` when they differ.
+
+  It is advisory and never stops startup. A failed lookup, an empty answer, or a
+  string it cannot read is logged as *unknown* and leaves `fabric_version` `None`
+  in the lifespan context; a string the server merely failed to parse is never
+  reported as a different release, since claiming a mismatch it cannot establish
+  is the same kind of wrong answer the warning exists to prevent. Only the first
+  controller's release is read, so a rolling upgrade can briefly run mixed
+  releases the check does not see. The lookup is `ApicClient.controller_version()`.
+
+- **SKILL.md and the server instructions are pinned to the new surface.** Eight
+  tests tie what the agent reads to the code that gives it meaning: that
+  `fields` and `group_by` are shown in a call on a tool that takes them; that the
+  envelope table has a row for every key `QueryEnvelope` declares, and the
+  instructions' key list names them all; that every key
+  `count` can return is named and set; that every exception named in backticks
+  exists, and the switch an operator is told to set is the variable the code
+  reads, with `false` a value it honours; that the 200-per-page and 5,000-object
+  figures quoted in three places are the client's constants; and that the stale
+  sentences this change removed stay removed.
+
+  Mutation-tested: dropping the `fields` row, a 5,000 that disagrees with
+  `_MAX_OBJECTS` (in SKILL.md, and in the instructions), a mistyped switch name,
+  a renamed exception, `groups` withheld as `{}` instead of `null`, and each
+  stale sentence put back each fail the test written for it.
+
 - **SKILL.md's teaching vocabulary is linted against the catalogue.** Every
   backticked camelCase name in the skill file must be a real class, a real
   property, or a documented exception with a reason. A typo in a teaching
@@ -87,6 +165,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
 
 ### Changed
 
+- **An attribute the catalogue does not know is now refused instead of sent —
+  a behaviour change for every `query` and `count` caller.** Before,
+  `query("fvBD", filters={"arpFlod": "yes"})` went to the APIC, which answered
+  HTTP 200 and `[]`, and `count` answered `0`: an invented name was
+  indistinguishable from "there are none", the failure this server exists to
+  prevent. Now every name the caller supplies is checked against the catalogue
+  before the request is built — the keys of `filters`, the attribute of each
+  `order_by` term, every class in `include_children`, and the `Class.attr`
+  operands of `filter_expr`. The first unknown attribute raises the new
+  `UnknownAttributeError`, an unknown class `UnknownClassError`, nothing reaches
+  the backend, and the error carries the closest real names. For an abstract
+  class the accepted names are the union of its own and its concrete subclasses',
+  so `hostBasedRouting`, declared by `fvBD`, is valid on `fvABD`. In
+  `filter_expr`, quoted values are masked before looking, so a dot inside a
+  string literal is never read as `Class.attr`, and anything not recognisably
+  `Class.attr` passes through untouched.
+
+  The catalogue describes one APIC release, and a fabric on another may
+  legitimately carry a name it lacks, so there is an escape hatch:
+  `NIWASHI_MCP_STRICT_ATTRIBUTES=false` sends the request anyway and says so —
+  appended to `query`'s `note`, never replacing the truncation note, or as a
+  `warnings` list on `count` that exists only then — and logs each problem. An
+  empty result beside such a note is not a zero. The switch is read on every
+  call, and any value other than `false`/`0`/`no`/`off` keeps it strict, so a
+  typo cannot quietly disable the check. The class named by `class_name` is
+  outside it: that check is older, and a typo there has no legitimate reading.
+
+  Not done: a guard for the relation-class trap in SKILL.md section 8, where a
+  `filter_expr` on `state`, `stateQual` or `tDn` returns zero results. Those are
+  real properties, so this validation passes them, and the premise a dedicated
+  guard would rest on was not measured for this change.
+
+- **Every `query` envelope has a new key, `fields`, and `query` and `count`
+  advertise a typed `outputSchema`.** `fields` echoes the projection and is
+  `null` when none was asked for, so it is present on every result — the one
+  change a caller who never passes `fields` can see. Separately, both tools were
+  annotated `dict[str, Any]`, so FastMCP advertised
+  `{"type": "object", "additionalProperties": true}`: a client was told "an
+  object" and nothing about the keys an agent must read — `truncated`,
+  `complete`, `next_page`. They now return `QueryEnvelope` and `CountEnvelope`
+  typed dicts and the schema names the keys. `count`'s `group_by`, `groups`,
+  `ungrouped`, `complete`, `note` and `warnings` are declared optional, so a key
+  added later is an addition to the schema rather than a break of a client that
+  validates against it. `results` items stay free-form: which attributes an
+  object carries depends on its class.
+
 - **The rest of the audit's bogus-test list — deleted or rebuilt, none left as
   they were.** Two had no reason to exist; the other five were necessary and
   badly built.
@@ -144,6 +268,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
     a `data/schemas` directory that 2.0 deleted and `.gitignore` excludes, so it
     skipped in CI and in every clean checkout. Measured on `git archive HEAD`:
     one skip, this test. The body never needed the directory.
+
+### Fixed
+
+- **`fetch_all` capped a "fetch everything" call at 500 objects, not the 5,000
+  it advertised.** It paged by the caller's `limit` and stopped after 25 pages,
+  so the default `limit=20` ended a call at 25 x 20 = 500 objects and reported
+  `complete: false` on a 600-object set the cap was never meant to touch; a set
+  of exactly 25 x `limit` objects was reported incomplete too, because the loop
+  fell out of its `for` without a `break` on a page that had left nothing
+  behind. The page size is now fixed at 200 — the largest page `query` already
+  sends, so a full 5,000-object walk is 25 requests instead of 250 — and the cap
+  is 5,000 objects, which lands on a page boundary: nothing is fetched past it
+  and nothing trimmed. After each page the walk checks whether everything the
+  APIC's `totalCount` reported is in hand (`complete: true`, with no extra empty
+  request for an exact multiple of the page size) before asking for another.
+
+  Two behaviours differ for any caller of `fetch_all`. **`limit` no longer means
+  anything under it** — it is not the page size any more, and `page` was already
+  ignored. And **an early end is now an incomplete result**: a short or empty
+  page while `totalCount` says more is due — the APIC ran dry — used to be taken
+  as the natural end and reported `complete: true`; it is now `complete: false`
+  with a logged warning, and the `note` covers both ways a walk can stop short,
+  the cap and the APIC's pages ending first. With no `totalCount` at all a short
+  page is still trusted as the end, as before.
+
+### Security
+
+- `fastmcp` floor raised from 3.4.5 to 3.4.10 for the 2026-10-23 advisories, and
+  the lock now resolves 3.4.11 (`certifi` 2026.6.17 → 2026.11.20 came along in
+  the same `uv lock`). The floor moves, not only the lock, because an
+  installation from the published package resolves from `pyproject.toml` and
+  ignores `uv.lock` — a lock bump alone would leave `uvx niwashi-mcp` free to
+  resolve a release the advisories cover.
 
 ---
 

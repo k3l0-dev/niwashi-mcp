@@ -191,7 +191,7 @@ Three middleware layers wrap FastMCP, outermost first:
 | 6 | Tool | Reads the in-memory index or the catalogue, and calls the APIC when the tool needs live data |
 | 7 | `ApicClient` | Builds URL and query parameters, sends an HTTPS GET to the APIC |
 | 8 | APIC | Returns an `imdata` JSON array |
-| 9 | Tool | Shapes the response: `query` flattens objects, each gaining a `_class` key, into an envelope — `{"results", "returned", "total_available", "truncated", "next_page", "complete", "note"}`; `count` returns `{"class_name", "count", "scope_dn", "filters"}`; `get_by_dn` returns the flattened object, or a `{"found": false, …}` dict |
+| 9 | Tool | Shapes the response: `query` flattens objects, each gaining a `_class` key, into an envelope — `{"results", "returned", "total_available", "truncated", "next_page", "complete", "note", "fields"}` (`fields` echoes the projection, `null` when none was asked for); `count` returns `{"class_name", "count", "scope_dn", "filters"}`, plus `group_by`, `groups`, `ungrouped`, `complete` and `note` when `group_by` is set, and `warnings` only when attribute checking is relaxed; `get_by_dn` returns the flattened object, or a `{"found": false, …}` dict |
 | 10 | FastMCP | Serialises the response as an MCP JSON-RPC result |
 
 Steps 7 and 8 do not occur for `search_classes` and `get_schema`: both are answered entirely from process-local data.

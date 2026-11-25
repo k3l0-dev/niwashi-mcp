@@ -410,7 +410,12 @@ hold a verified class name and DN:
     classes it can hold (contains).  To learn valid values, types, defaults,
     and which properties are read-only before setting or filtering on them,
     call get_schema with properties_filter=[...] (or include_property_details).
-    Querying with an attribute that does not exist silently returns nothing.
+    The APIC answers an attribute that does not exist with an empty result,
+    not an error, so query() and count() check every attribute name against
+    the catalogue and refuse an unknown one (UnknownAttributeError, with the
+    closest real names) instead of sending it.  If the operator has relaxed
+    that check, a note or warning in the result lists the names sent
+    unchecked — an empty result beside one is not a zero.
 
   Step 3 — Only then call query(class_name, filters, scope_dn).
     Use the "dn" from any result as scope_dn to fetch child objects.
@@ -423,13 +428,16 @@ SHORTCUT — skip discovery when you already have an exact DN:
 
 COUNTING — to answer "how many X?" call count(class_name, filters, scope_dn).
     It returns a tally without transferring the objects — far cheaper than
-    fetching everything just to measure the result set.  count() only gives
-    a tally, never a ranking: "how many subnets in total" is count();
-    "which BD has the most subnets" is argmax and needs the actual objects —
-    call query(..., fetch_all=True) and aggregate locally over "results".
-    "How many X per tenant / severity / state" is count(..., group_by="tenant"
-    or an attribute of X); if it returns complete=false there is no breakdown
-    — narrow the query, never infer one.
+    fetching everything just to measure the result set.  "How many X per
+    tenant / severity / state" is count(..., group_by="tenant" or an
+    attribute of X): "groups" holds the tally per value, "ungrouped" the
+    objects with no value.  If it returns complete=false, "groups" and
+    "ungrouped" are null — there is no breakdown; narrow the query and
+    retry, never report or infer a partial one.  count() cannot rank
+    individual objects by something they contain: "how many subnets in
+    total" is count(); "which BD has the most subnets" is argmax and needs
+    the actual objects — call query(..., fetch_all=True) and aggregate
+    locally over "results".
     If count() or query() cannot run at all — an unknown class name, an
     unreachable object, a malformed filter — that is a failure to answer,
     not an answer of zero.  Never restate a tool error as a count or as
@@ -439,18 +447,21 @@ COUNTING — to answer "how many X?" call count(class_name, filters, scope_dn).
 
 FULL-FABRIC AGGREGATION — a single default query() page is NOT the whole
     fabric.  query() returns an envelope: {"results": [...], "returned",
-    "total_available", "truncated", "next_page", "complete", "note"}.  For
-    "which X has the most/least Y", "how many X in total", "list all X", or
-    "max/min across the fabric" questions, a response with truncated=true
-    must never be used to state a maximum, minimum, total, or complete list —
-    get the rest first.  Use count() for a pure tally; use
+    "total_available", "truncated", "next_page", "complete", "note",
+    "fields"}.  For "which X has the most/least Y", "how many X in total",
+    "list all X", or "max/min across the fabric" questions, a response with
+    truncated=true must never be used to state a maximum, minimum, total, or
+    complete list — get the rest first.  Use count() for a pure tally; use
     query(..., fetch_all=True) for ranking, argmax, or an exhaustive list,
     aggregating locally over "results".  total_available is the true size of
-    the matching set regardless of how much was fetched; fetch_all holds at
-    most 5,000 objects per call, and if complete=false even after
-    fetch_all=True the result is a partial answer (that cap was hit, or the
-    APIC ended its pages early) — narrow the query (e.g. by tenant scope_dn)
-    so each call matches fewer, and combine results across narrower calls.
+    the matching set regardless of how much was fetched; fetch_all pages at
+    200 whatever `limit` is and holds at most 5,000 objects per call.  After
+    fetch_all, truncated is always false: read complete.  complete=false is
+    a partial answer (that cap was hit, or the APIC ended its pages early) —
+    narrow the query (e.g. by tenant scope_dn) so each call matches fewer,
+    and combine results across narrower calls.
+    When objects are wide or many, pass fields=[...] (query and get_by_dn) to
+    keep only the attributes you will read; dn, _class and _children stay.
 
 RELATION INTEGRITY — never report what an object points to without reading
     the relation's `state`.
