@@ -411,6 +411,15 @@ Combined with `filters` via `and()` if both are provided.
 | `and` | `and(ne(fabricNode.role,"controller"),eq(fabricNode.fabricSt,"active"))` |
 | `or` | `or(eq(fvBD.arpFlood,"yes"),eq(fvBD.unicastRoute,"no"))` |
 
+**`eq`/`ne` values are checked against the attribute's allowed values.** On an
+attribute with a fixed set of values (an enum such as `unicastRoute`,
+`severity`, `faultInst.code`), a value outside that set is refused by the APIC
+and the tool raises an error naming it ("value 'F0526' is not valid"). That is
+a statement about the *value*, not about the fabric: it does not mean "none
+exist". To ask whether a fault code occurs, use
+`count("faultInst", group_by="code")` (every code present, with counts and rule
+names) or `wcard(faultInst.code,"F0526")`, which is not validated.
+
 ```python
 # All active non-controller nodes
 query("fabricNode",
