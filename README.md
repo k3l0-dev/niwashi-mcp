@@ -282,6 +282,7 @@ Per-tool reference with worked examples: [`docs/tools/`](docs/tools/).
 | `MCP_API_KEYS` | | — | Comma-separated bearer tokens. Unset means no authentication (development only) |
 | `MCP_HOST` | | `127.0.0.1` | Interface to bind. Loopback by default; a routable value requires `MCP_API_KEYS` |
 | `MCP_ALLOW_NO_AUTH` | | `false` | `true` accepts a routable bind with `MCP_API_KEYS` unset. Refused otherwise |
+| `MCP_ALLOWED_HOSTS` | | — | Comma-separated hostnames accepted in the `Host` header besides loopback names. Set it to your public name when a reverse proxy on the same machine forwards it, or every proxied request is answered `421` |
 | `NIWASHI_MCP_ENV_FILE` | | — | Explicit path to the `.env` file to load |
 
 **Hot reload:** send `SIGHUP` to the process to reload `MCP_API_KEYS` from the
@@ -303,6 +304,9 @@ Full reference: [`docs/configuration/settings.md`](docs/configuration/settings.m
   complete discovery before they hold a token
 - Loopback bind by default — a routable `MCP_HOST` without `MCP_API_KEYS` is
   refused at startup, not merely warned about
+- `Host` and `Origin` validation on requests that arrive on loopback, against
+  DNS rebinding — behind a reverse proxy on the same machine, list its public
+  name in `MCP_ALLOWED_HOSTS`
 - API keys reloadable via `SIGHUP`
 
 Vulnerability disclosure policy: [SECURITY.md](SECURITY.md).

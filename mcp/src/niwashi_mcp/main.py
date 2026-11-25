@@ -44,6 +44,11 @@ Environment variables (read from .env at startup)
   MCP_PORT         HTTP port the server listens on (default: 8000)
   MCP_ALLOW_NO_AUTH  "true" to permit a routable bind with MCP_API_KEYS unset.
                    Refused otherwise: this process holds APIC credentials.
+  MCP_ALLOWED_HOSTS  Comma-separated hostnames accepted in the Host header in
+                   addition to localhost, 127.0.0.1 and ::1 (patterns such as
+                   *.example.com work). Required when a reverse proxy on the
+                   same machine forwards its public name; without it such
+                   requests are answered 421. Unset by default.
   NIWASHI_MCP_STRICT_ATTRIBUTES
                    "false" to send a request even when its attribute names are
                    not in the catalogue, flagging them in the result instead of
@@ -2261,6 +2266,18 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
+def _allowed_hosts() -> list[str] | None:
+    """The hostnames ``MCP_ALLOWED_HOSTS`` adds to the Host header allowlist.
+
+    Comma-separated like ``MCP_API_KEYS``. ``None`` when unset or blank, which is
+    not the same as an empty list: FastMCP treats a list, even a useless one, as
+    an explicit allowlist and then validates the Host header on every bind,
+    where ``None`` leaves it to ``auto``.
+    """
+    names = [name.strip() for name in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",")]
+    return [name for name in names if name] or None
+
+
 async def _serve() -> None:
     load_dotenv(ENV_FILE)
     _port_raw = os.environ.get("MCP_PORT", "8000")
@@ -2356,12 +2373,35 @@ async def _serve() -> None:
         Middleware(ApiKeyMiddleware, key_store=key_store),
     ]
 
+    # DNS rebinding: a web page can make a victim's browser resolve its own name
+    # to 127.0.0.1 and then talk to this server as if it were same-origin, with
+    # no key to present when authentication is off (loopback allows that, and a
+    # SIGHUP reload can switch it off later). The only thing that gives it away
+    # is the Host header, which still names the attacker's domain. "auto" checks
+    # it, and Origin, on any request that arrives on a loopback address, and on
+    # every request once an allowlist is given; a server reached over a routable
+    # address is left alone. The Host must then be localhost, a loopback address
+    # or one of MCP_ALLOWED_HOSTS — which is what a reverse proxy on the same
+    # machine has to be told, since it forwards the public name.
+    allowed_hosts = _allowed_hosts()
+    if allowed_hosts:
+        logger.info("Host header allowlist: %s (plus loopback)", ", ".join(allowed_hosts))
+    elif _is_loopback(bind_host):
+        logger.info(
+            "Host header protection is on for loopback requests: only localhost, "
+            "127.0.0.1 and ::1 are accepted. Behind a reverse proxy that forwards "
+            "its public name, set MCP_ALLOWED_HOSTS to that name, or every proxied "
+            "request is answered 421 Misdirected Request."
+        )
+
     await mcp.run_http_async(
         host=bind_host,
         port=port,
         stateless_http=True,
         json_response=True,
         middleware=middleware,
+        host_origin_protection="auto",
+        allowed_hosts=allowed_hosts,
     )
 
 

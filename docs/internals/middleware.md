@@ -10,13 +10,21 @@ middleware = [
 ]
 
 await mcp.run_http_async(
-    host="0.0.0.0",
+    host=bind_host,
     port=port,
     stateless_http=True,
     json_response=True,
     middleware=middleware,
+    host_origin_protection="auto",
+    allowed_hosts=allowed_hosts,  # MCP_ALLOWED_HOSTS, or None
 )
 ```
+
+FastMCP adds a fourth layer of its own, **outside** these three: the Host/Origin
+guard that `host_origin_protection="auto"` turns on. It runs before
+`HealthMiddleware`, so `/health` is subject to it too. What it accepts, and what a
+reverse proxy has to configure, is in
+[Settings — The Host guard](../configuration/settings.md#the-host-guard).
 
 The stack is unchanged in 2.0 — none of these layers touches the ACI object model. Only the module paths moved, into the installable `niwashi_mcp` package.
 
