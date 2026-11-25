@@ -8,7 +8,7 @@ filter strings those two send over the wire.
 |---|---|
 | `catalog.py` | The data layer. Reads the ACI object model from the SQLite catalogue shipped inside the `niwaki` dependency |
 | `descriptions.py` | Scores `search_classes` against an in-memory index (see [search-algorithm.md](search-algorithm.md)) |
-| `filter.py` | Builds `query-target-filter` strings from a plain dict |
+| `filter.py` | Builds `query-target-filter` strings from a plain dict; extracts the `Class.attr` references from a raw `filter_expr` / `order_by` so they can be checked against the catalogue |
 
 ---
 
@@ -518,6 +518,31 @@ before use:
 
 An empty `filters` dict returns `""` — the APIC client omits the
 `query-target-filter` parameter entirely when the string is empty.
+
+### `filter_expr_attributes()`, `order_by_attributes()`, `is_identifier()`
+
+`build_filter` only ever sees dict keys. `filter_expr` and `order_by` are strings
+the caller composed, so the attributes in them have to be *found* before
+`query()` / `count()` can check them against `property_exists()`. These return
+the `(class, attribute)` pairs, in order of first appearance and deduplicated.
+
+- **`filter_expr_attributes(expr)`** masks every double-quoted string literal
+  first (escape-aware; a literal that never closes is dropped to the end of the
+  string), then takes the `Class.attr` that is the **first argument** of a
+  `<lower-case operator>(` — so `eq`, `wcard`, `bw`, `and(eq(...))` all work and
+  an operator the APIC adds later is covered. A dot inside a quoted value is
+  never a reference, and an unquoted later argument (`eq(fvBD.dn,uni.tn)`) is not
+  mistaken for one.
+- **`order_by_attributes(expr)`** splits on `,` and reads each `Class.attr` or
+  `Class.attr|asc|desc` term. A term without a class qualifier is skipped.
+- **`is_identifier(value)`** is `build_filter`'s own identifier test, exposed so a
+  `filters` key it will reject with `FilterError` is not first reported as an
+  unknown attribute.
+
+Both extractors are conservative on purpose: a reference they cannot place with
+certainty is left alone. A false positive refuses a request the APIC would have
+answered; a miss only leaves that one reference unchecked, which is where it
+stood before the check existed.
 
 Note what this check cannot do: it rejects malformed identifiers, not wrong ones.
 A snake_case readable name would fail it, but a single-word one like `subnet`

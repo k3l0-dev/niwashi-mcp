@@ -2,7 +2,7 @@
 
 Count objects of an ACI class **without transferring them**. Answers "how many BDs / EPGs / subnets?" in a single cheap request instead of fetching everything just to measure the set.
 
-**Verify the class name with `search_classes` first** — `count` raises the same `UnknownClassError` (with suggestions) as `query`.
+**Verify the class name with `search_classes` first** — `count` raises the same `UnknownClassError` (with suggestions) as `query`, and checks attribute names against the catalogue the same way (see [Attribute validation](#attribute-validation)).
 
 ---
 
@@ -20,9 +20,9 @@ count(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `class_name` | `str` | — | Exact ACI class name — **must** be verified with `search_classes()` first |
-| `filters` | `dict[str, str]` | `{}` | Attribute equality filters `{attr: value}`, same semantics as `query()` |
+| `filters` | `dict[str, str]` | `{}` | Attribute equality filters `{attr: value}`, same semantics as `query()`. An unknown key raises `UnknownAttributeError` |
 | `scope_dn` | `str` | — | DN of a parent object to scope the count to a subtree |
-| `filter_expr` | `str` | — | Raw APIC filter for predicates beyond equality; combined with `filters` via `and()` |
+| `filter_expr` | `str` | — | Raw APIC filter for predicates beyond equality; combined with `filters` via `and()`. Each `Class.attr` operand is checked, as in `query()` |
 
 ---
 
@@ -53,6 +53,29 @@ Because the tally is the very same `total_available` that `query` reports, the t
 | `count` | `int` | Number of matching objects |
 | `scope_dn` | `str \| null` | The scope DN, if one was supplied |
 | `filters` | `dict` | The filters that were applied |
+| `warnings` | `list[str]` | **Present only when [attribute checking is relaxed](#relaxing-the-check) and a name was sent unchecked** — one string per problem. Absent otherwise, so a default response is unchanged. |
+
+---
+
+## Attribute validation
+
+Exactly the checks `query` applies to `filters` and `filter_expr`, from the same code: the APIC answers a filter on an unknown attribute with a successful `0`, and a count of zero reads as an answer. So an attribute that the catalogue does not know for its class is refused **before the request is sent**, with the closest real names attached. A `Class.attr` operand in `filter_expr` whose `Class` is unknown raises `UnknownClassError`. Quoted values are never inspected; anything the extractor does not recognise passes through untouched. The rules and their edge cases — abstract classes, system attributes, comma-joined items — are documented once, in [`query`](query.md#attribute-validation).
+
+### Relaxing the check
+
+With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` nothing is raised: the request is sent and each problem is reported in a `warnings` list on the result (and as a `ctx.warning`).
+
+```json
+{
+  "class_name": "fvBD",
+  "count": 0,
+  "scope_dn": null,
+  "filters": {"newAttr": "x"},
+  "warnings": ["filters: Unknown attribute 'newAttr' on ACI class 'fvBD'. ... Sent anyway because strict attribute checking is off — an empty result may mean this name is wrong, not that nothing matches."]
+}
+```
+
+**A `count` of zero beside a warning is not an answer of zero.** Re-check the name with `get_schema()` before reporting it.
 
 ---
 
@@ -60,7 +83,8 @@ Because the tally is the very same `total_available` that `query` reports, the t
 
 | Exception | Condition |
 |---|---|
-| `UnknownClassError` | `class_name` is not in the catalogue (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index). The guard is identical to `query`'s, so the two tools can never disagree about whether a class is known. |
+| `UnknownClassError` | `class_name` is not in the catalogue (15,452 classes). Includes `.suggestions` (list, drawn from the search index) and `.registry_size` (int — the 15,239-entry search index). The guard is identical to `query`'s, so the two tools can never disagree about whether a class is known. Also raised when a `filter_expr` operand names an unknown class. |
+| `UnknownAttributeError` | An attribute in `filters` or `filter_expr` is not a property of its class in the catalogue. Carries `.class_name`, `.attribute`, `.suggestions` and `.catalogue_version`. Nothing has been sent to the APIC when it is raised. |
 | `FilterError` | `class_name` or a `filters` key contains characters outside the expected ACI identifier format. Filter values are always escaped, never rejected. |
 | `ApicRequestError` | APIC returned a non-2xx, non-auth response — e.g. 400 for a malformed `filter_expr`, or a transient 5xx that never recovered. Carries the HTTP status and, when present, the APIC error text. |
 
