@@ -702,6 +702,18 @@ count("fabricNode", group_by="role")      # nodes per role
   retry: one tenant at a time with `scope_dn="uni/tn-<name>"`, or one value at a
   time with `filters`, grouping each narrower set; for a set that changed,
   simply retry.
+- **`group_by="code"` also names the fault codes.** On a fault class
+  (`faultInst`, `faultRecord`, ...) the response gains `group_names`, a map from
+  each code the catalogue defines to its rule name, in the order of `groups`:
+  `{"F0467": "fltFvNwIssuesConfig-failed", "F0546": "fltEthpmIfPortDownNoInfra"}`.
+  Use those names, not your memory, to say what a code is. A code **missing**
+  from `group_names` is not named, not unnamed-by-accident: threshold-crossing
+  alerts (rules `tca-*`) mint their codes at runtime, and FSM faults (rules
+  `fsm-*`) are not defined in the schema either. For such a code say that it has no
+  catalogue entry, or `query` one object of it and read its own `rule` and
+  `descr` — never write a name or a meaning for it yourself. The key is absent
+  when no code resolves. Objects returned by `query` already carry `rule`, so
+  nothing is added to them.
 - **It costs more than a plain `count`.** A plain count is one request that
   transfers one object; a grouped count fetches every matching object, 200 per
   page, because the APIC cannot group. On a big class, scope or filter first.

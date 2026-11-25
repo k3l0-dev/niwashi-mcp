@@ -94,9 +94,10 @@ Tables the adapter reads:
 | `manifest` | 17 | Build metadata |
 | `relation` | 3 027 | One row per relation class, keyed by its Rs *and* its Rt class (field for field the same), plus a few abstract bases with no endpoints. Read for `cardinality` and `rel_type` (`kind`) by `annotate_relations()` |
 | `inherits` | 45 496 | Every ancestor of every class, in colon notation. Read for an abstract class's property union |
+| `fault` | 1 491 | One row per fault code: the class that raises it, the code and the rule name (`F0467` → `fltFvNwIssuesConfig-failed`). Read for `fault_names()`, which `count(group_by="code")` uses to name its groups |
 
-The catalogue also carries `subclass`, `fault`, `scopemeta`, `name_override` and
-an FTS index. None of them is read here — the relation *endpoints* still come
+The catalogue also carries `subclass`, `scopemeta`, `name_override` and an FTS
+index. None of them is read here — the relation *endpoints* still come
 from the `mo` residual blob, and ranking uses this server's own scorer.
 
 ### Connection and caches

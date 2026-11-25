@@ -39,7 +39,9 @@ _QUERY_KEYS = {
     "next_page", "complete", "note", "fields",
 }
 _COUNT_REQUIRED = {"class_name", "count", "scope_dn", "filters"}
-_COUNT_OPTIONAL = {"warnings", "group_by", "groups", "ungrouped", "complete", "note"}
+_COUNT_OPTIONAL = {
+    "warnings", "group_by", "groups", "ungrouped", "complete", "note", "group_names",
+}
 
 
 def _output_schema(name: str) -> dict:

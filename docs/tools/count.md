@@ -116,6 +116,7 @@ await count("fvAEPg", scope_dn="uni/tn-OT", group_by="descr")
 | `ungrouped` | `int \| null` | Objects with no value to group on (see below). `null` when `complete` is `false` |
 | `complete` | `bool` | `true` when the breakdown accounts for every object `count` reports |
 | `note` | `str \| null` | Why there is no breakdown, and how to narrow the query. `null` when `complete` is `true` |
+| `group_names` | `dict[str, str]` | Present only for `group_by="code"`, and only when the catalogue defines the rule behind at least one code: `{code: rule name}`, in the order of `groups`. See [Naming fault codes](#naming-fault-codes) |
 | `warnings` | `list[str]` | Present only when non-empty: `group_by` is not in the catalogue and attribute checking is off (below) |
 
 **The invariant.** When `complete` is `true`, `sum(groups.values()) + ungrouped == count`. The tests assert it.
@@ -127,6 +128,26 @@ await count("fvAEPg", scope_dn="uni/tn-OT", group_by="descr")
 **What it costs.** A plain count is one request that transfers one object. A grouped count fetches **every** matching object (same class, filters and scope, 200 per page) and tallies them in the server, because the APIC cannot group. On a big class, scope or filter first. The plain count it starts from decides two cases without fetching anything: a set of zero is answered at once (`groups` `{}`, `ungrouped` `0`, `complete` `true`), and a set larger than one `fetch_all` call can hold (5,000 objects) is withheld at once, as below — a capped fetch can only end that way, so walking 25 pages to reach it would only spend the APIC's time.
 
 **It never returns a partial breakdown.** If the fetch stops short — at its 5,000-object safety cap, or because the APIC ended its pages early — or fetches a different number of objects than `count` — the set changed while it was being read — the groups would not cover the whole set, and a partial breakdown reads as a finding ("only two tenants have faults") when it is only where the fetch stopped. So `complete` is `false`, `groups` and `ungrouped` are `null`, `note` says why, and `count` stays the true APIC total. Narrow the query (one tenant at a time with `scope_dn="uni/tn-<name>"`, or one value at a time with `filters`) and group each narrower set; for a changed set, retry.
+
+### Naming fault codes
+
+`await count("faultInst", group_by="code")` answers "which faults, how many of each" — and a bare `F0546: 60` leaves the reader to say what `F0546` is. So the response also carries the rule name the schema defines for each code it knows:
+
+```json
+{
+  "group_by": "code",
+  "groups": {"F1690": 188, "F0546": 60, "F0467": 11, "F110176": 8},
+  "group_names": {
+    "F1690": "fltVnsConfIssueConfIssue",
+    "F0546": "fltEthpmIfPortDownNoInfra",
+    "F0467": "fltFvNwIssuesConfig-failed"
+  }
+}
+```
+
+`F110176` has no entry, and that is information: it is a threshold-crossing alert (a `tca-*` rule), whose code is minted at runtime from the operator's threshold policy and is not defined in the class schemas the catalogue is built from. FSM faults (`fsm-*` rules, such as `F608163`) are not in the table either; none of its codes has more than four digits. A code that is not in `group_names` is left unnamed rather than guessed; to say what it is, `query` one object of that code and read its own `rule` and `descr`. The names come from the catalogue's `fault` table, 1,491 codes, and do not need the APIC.
+
+It is added here and nowhere else. Fault objects returned by `query`, `get_by_dn` and `rsp_subtree_include="faults"` already carry their own `rule` (`fv-nw-issues-config-failed` for `F0467`), so a second name on each would be redundant, and a key the APIC does not send would have no coherent answer under `fields`, which keeps only the attributes asked for. The key is absent for every other `group_by`, so those responses are byte-identical to what they were.
 
 **Non-strict attribute checking.** With `NIWASHI_MCP_STRICT_ATTRIBUTES=false` an unknown `group_by` is not refused: the request runs, a warning is logged and added to a `warnings` list in the result, and objects that lack the attribute are reported in `ungrouped`. It exists for a fabric on a release newer than the catalogue.
 

@@ -880,6 +880,8 @@ class CountEnvelope(TypedDict):
     ungrouped: NotRequired[int | None]
     complete: NotRequired[bool]
     note: NotRequired[str | None]
+    # only for group_by="code", and only the codes the catalogue defines
+    group_names: NotRequired[dict[str, str]]
 
 
 # ── Field projection ──────────────────────────────────────────────────────────
@@ -1448,6 +1450,10 @@ async def get_by_dn(
 # DN, so "per tenant" cannot be asked for by naming an attribute.
 _TENANT_KEY = "tenant"
 
+# The attribute whose values are fault codes on the fault classes (faultInst,
+# faultRecord, faultDelegate, ...). Grouping by it earns `group_names`.
+_CODE_KEY = "code"
+
 # Page size handed to the backend for the group_by fetch. Pinned at query()'s
 # own ceiling so the walk takes the fewest requests that ceiling allows; it is
 # deliberately not exposed, since a breakdown has no use for a smaller page.
@@ -1631,13 +1637,20 @@ async def _group_counts(
         f"count group_by={group_by!r} → {len(groups)} group(s), "
         f"{ungrouped} ungrouped"
     )
-    return {
+    breakdown: dict[str, Any] = {
         "group_by": group_by,
         "groups": groups,
         "ungrouped": ungrouped,
         "complete": True,
         "note": None,
     }
+    # A fault code on its own says little, and an agent that is handed only
+    # "F0546: 60" names it from memory. Where the catalogue defines the rule,
+    # say so. Only the codes it knows are listed, and only when there are any,
+    # so every other breakdown is exactly what it was.
+    if group_by == _CODE_KEY and (names := catalog.fault_names(groups)):
+        breakdown["group_names"] = names
+    return breakdown
 
 
 @mcp.tool(title="Count ACI objects", annotations=_FABRIC_READ)
@@ -1677,7 +1690,9 @@ async def count(
                      combined with `filters` via and() when both are provided.
                      Each Class.attr operand is checked, as in query().
         group_by:    Break the count down per value of this attribute, e.g.
-                     "severity" on faultInst. The special value "tenant"
+                     "severity" on faultInst, or "code" for faults per fault
+                     code (which also names the codes — see "group_names"
+                     below). The special value "tenant"
                      groups by the tenant in each object's DN (its `tn-<name>`
                      segment) — unless the class has a real attribute of that
                      name, which then wins. Unlike a plain count this fetches
@@ -1703,6 +1718,17 @@ async def count(
            "ungrouped": <int>,               # objects with no value to group on
            "complete": <bool>,
            "note": <str|None>}               # a string only when not complete
+        With group_by="code" the dict gains one more key when the catalogue
+        defines the rule behind at least one of the codes:
+          {"group_names": {<code>: <rule name>, ...}}  # "F0467":
+                                        # "fltFvNwIssuesConfig-failed"; same
+                                        # order as `groups`
+        It lists only the codes the catalogue knows. A code missing from it is
+        not named rather than guessed: threshold-crossing alerts (tca-* rules,
+        their codes are minted at runtime) and FSM faults (fsm-* rules) are not
+        defined in the schema. Do not supply a name for such a code from memory; query
+        one object of it and read its own `rule` and `descr`. The key is
+        absent when no code resolves and for any other group_by.
         When complete, sum(groups.values()) + ungrouped == count. Objects
         that carry no value for the attribute (for "tenant": a DN with no
         tenant segment, i.e. fabric-level objects) are counted in `ungrouped`,

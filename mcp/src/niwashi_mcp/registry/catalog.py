@@ -43,6 +43,7 @@ import json
 import sqlite3
 import threading
 import zlib
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -227,6 +228,11 @@ _REQUIRED_TABLES: dict[str, frozenset[str]] = {
     # failure if the key moved to colon notation: every lookup would miss and
     # `cardinality` would silently go back to empty.
     "relation": frozenset({"rs_class", "rel_type", "cardinality"}),
+    # `fault` maps a fault code to the rule name the schema defines for it
+    # (`F0467` -> `fltFvNwIssuesConfig-failed`). `fault_names` reads it. Quiet
+    # failure if it went empty or its columns were swapped: every code would
+    # silently come back unnamed.
+    "fault": frozenset({"code", "name"}),
 }
 
 _REQUIRED_MANIFEST_KEYS = frozenset({"prop_flags", "apic_version"})
@@ -249,6 +255,10 @@ _PROBE_ABSTRACT_CLASS = "fvABD"
 # relations in the model (n-to-1, named). Only that both fields come back
 # non-empty is asserted, not their values.
 _PROBE_RELATION = "fv:RsCtx"
+
+# Anchor for the fault names: the example niwaki itself documents for
+# `fault_name`, and a code that has been in the model for years.
+_PROBE_FAULT_CODE = "F0467"
 
 
 def verify_catalogue() -> None:
@@ -338,6 +348,13 @@ def verify_catalogue() -> None:
             f"niwaki {version}'s catalogue has no cardinality or kind for the "
             f"'{_PROBE_RELATION}' relation — the 'relation' table no longer answers "
             f"by wire-name class. Pin niwaki>=2.2,<2.3."
+        )
+
+    if not fault_names([_PROBE_FAULT_CODE]).get(_PROBE_FAULT_CODE):
+        raise DescriptionsLoadError(
+            f"niwaki {version}'s catalogue has no rule name for fault code "
+            f"'{_PROBE_FAULT_CODE}' — the 'fault' table is empty or no longer "
+            f"maps code to name. Pin niwaki>=2.2,<2.3."
         )
 
 
@@ -789,6 +806,31 @@ def annotate_relations(schema: dict[str, Any]) -> dict[str, Any]:
             if facts := found.get(name.replace(":", "")):
                 entry["cardinality"], entry["kind"] = facts
     return schema
+
+
+def fault_names(codes: Iterable[str]) -> dict[str, str]:
+    """The rule name the schema defines for each fault code in ``codes``.
+
+    ``F0467`` -> ``fltFvNwIssuesConfig-failed``. Only codes the catalogue knows
+    appear in the result, in the order given, each once; a code it does not know
+    is absent rather than mapped to a guess. That is the common case for some
+    families, not a gap in the table: the codes of threshold-crossing alerts
+    (``tca-*`` rules) are minted at runtime from an operator's threshold policy,
+    and FSM faults (``fsm-*`` rules, e.g. ``F608163``) are not in the table
+    either — its codes run F0020 to F4680 — so neither is defined in the class
+    schemas it is built from.
+
+    The table is read whole (1,491 rows, ~0.3 ms) and filtered here rather than
+    queried with one placeholder per code: a breakdown can hold more distinct
+    codes than SQLite's variable limit on an older build, and a failure there
+    would drop the names and nothing else. Codes are unique in the shipped
+    catalogue; were one ever to carry two names the alphabetically first wins,
+    as in niwaki's own ``fault_name``, so the answer does not depend on row order.
+    """
+    table: dict[str, str] = {}
+    for code, name in _query("SELECT code, name FROM fault ORDER BY name"):
+        table.setdefault(code, name)
+    return {code: table[code] for code in dict.fromkeys(codes) if code in table}
 
 
 # Labels that appear in virtually every ACI class and carry no discriminating

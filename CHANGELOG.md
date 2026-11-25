@@ -36,6 +36,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — versioning 
   `cardinality` would just go back to empty. SKILL.md, the tool docstring and
   the docs teach the two keys.
 
+- **`count(group_by="code")` names the fault codes.** `{"F0546": 60}` leaves the
+  reader to say what `F0546` is, and an agent that does so from memory is how a
+  fault table gets fabricated (the July inventory, in the entry further down, is
+  one). The catalogue's `fault` table maps each code to the rule name the schema
+  gives it, so the response now carries `group_names`, `{"F0546":
+  "fltEthpmIfPortDownNoInfra", "F0467": "fltFvNwIssuesConfig-failed"}`, in the
+  order of `groups`. Run against a lab fabric (616 faults, 39 distinct codes): 30
+  resolve and 9 do not — 8 threshold-crossing alerts (`tca-*`, whose codes are
+  minted at runtime) and one FSM fault (`F608163`); the table's codes run F0020
+  to F4680, and `sum(groups) + ungrouped == count` held.
+  Those are left out rather than guessed, and the docs say what a missing code
+  means and to read the object's own `rule` and `descr` instead.
+
+  Additive and narrow: the key exists only for `group_by="code"` and only when
+  at least one code resolves; every other response is byte-identical. It is the
+  one place a code appears without an object to explain it. `query` and
+  `get_by_dn` results are left alone on purpose: a fault object already carries
+  its own `rule` (`fv-nw-issues-config-failed` for `F0467`, present on all 616
+  faults read from the lab), so a second name would be redundant on every row of
+  a fetch of thousands, and a key the APIC does not send has no coherent answer
+  under `fields`, which keeps only the attributes asked for. `verify_catalogue()`
+  requires the `fault` table and checks that `F0467` resolves.
+
 - **`fields` projects `query` and `get_by_dn` results onto the attributes
   asked for.** A class carries ~40 attributes per object and `fetch_all` can
   hold 5,000 objects; an agent that needed a name and a state still received

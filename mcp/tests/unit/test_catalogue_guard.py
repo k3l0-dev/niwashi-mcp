@@ -235,6 +235,39 @@ class TestRelationDamage:
         catalog.verify_catalogue()
 
 
+class TestFaultDamage:
+    """`fault` feeds the rule names `count(group_by="code")` reports.
+
+    The quiet failure is an emptied or re-columned table: every query still
+    runs, and every fault code simply comes back unnamed — an agent then has
+    nothing to ground a code in and names it from memory.
+    """
+
+    def test_it_is_a_required_table(self):
+        assert catalog._REQUIRED_TABLES["fault"] == {"code", "name"}
+
+    def test_a_dropped_table_is_named(self, broken_catalogue):
+        broken_catalogue("DROP TABLE fault")
+        with pytest.raises(DescriptionsLoadError, match="no 'fault' table"):
+            catalog.verify_catalogue()
+
+    def test_a_renamed_column_is_named(self, broken_catalogue):
+        broken_catalogue("ALTER TABLE fault RENAME COLUMN name TO rule")
+        with pytest.raises(DescriptionsLoadError, match="name"):
+            catalog.verify_catalogue()
+
+    def test_an_emptied_table_is_caught(self, broken_catalogue):
+        broken_catalogue("DELETE FROM fault")
+        with pytest.raises(DescriptionsLoadError, match="fault"):
+            catalog.verify_catalogue()
+
+    def test_a_code_and_name_swapped_are_caught(self, broken_catalogue):
+        """Structurally intact; the code column now holds the names."""
+        broken_catalogue("UPDATE fault SET code = name")
+        with pytest.raises(DescriptionsLoadError, match="fault"):
+            catalog.verify_catalogue()
+
+
 class TestManifestDamage:
     def test_a_missing_manifest_key_is_named(self, broken_catalogue):
         broken_catalogue("DELETE FROM manifest WHERE key='apic_version'")
